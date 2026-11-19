@@ -1,0 +1,21 @@
+# Standalone tool crate. It has its own empty [workspace] table so it is not a
+# member of the kawan workspace: `cargo check -p kawan`, `cargo clippy -p kawan`
+# and the workspace fmt gate never build or lint it.
+[package]
+name = "ui-drive"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "ui-drive"
+path = "src/main.rs"
+
+[dependencies]
+wayland-client = "0.31"
+wayland-backend = "0.3"
+# Codegen for the two protocol XMLs; the macros run inside the binary crate.
+wayland-scanner = "0.31"
+xkbcommon = "0.8"

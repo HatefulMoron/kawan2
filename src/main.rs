@@ -18,7 +18,7 @@ fn main() {
     gpui_platform::application()
         .with_quit_mode(QuitMode::LastWindowClosed)
         .run(|cx: &mut App| {
-            let bounds = Bounds::centered(None, size(px(860.), px(560.)), cx);
+            let bounds = Bounds::centered(None, size(px(980.), px(640.)), cx);
             cx.open_window(
                 WindowOptions::default().window_bounds(WindowBounds::Windowed(bounds)),
                 |_window, cx| {
@@ -75,13 +75,13 @@ impl Dashboard {
     }
 
     fn start_auto_refresh(&mut self, cx: &mut Context<Self>) {
-        self.ticker = Some(cx.spawn(async move |this, cx| loop {
-            cx.background_executor().timer(REFRESH).await;
-            let alive = this
-                .update(cx, |this, cx| this.refresh(cx))
-                .is_ok();
-            if !alive {
-                break;
+        self.ticker = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(REFRESH).await;
+                let alive = this.update(cx, |this, cx| this.refresh(cx)).is_ok();
+                if !alive {
+                    break;
+                }
             }
         }));
     }
@@ -190,55 +190,51 @@ impl Render for Dashboard {
             Some(stats) => {
                 body = body
                     .child(
-                        div()
-                            .flex()
-                            .gap_4()
-                            .child(hero_card(&colors, stats))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_4()
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .gap_4()
-                                            .child(card(
-                                                &colors,
-                                                "hits",
-                                                format_number(stats.hits()),
-                                                format!(
-                                                    "{} local · {} remote",
-                                                    stats.local_hits + stats.readonly_hits,
-                                                    stats.remote_hits + stats.prefetch_hits
-                                                ),
-                                            ))
-                                            .child(card(
-                                                &colors,
-                                                "misses",
-                                                format_number(stats.misses),
-                                                format!("{} deduplicated", stats.dups),
-                                            )),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .gap_4()
-                                            .child(card(
-                                                &colors,
-                                                "entries",
-                                                format_number(stats.entries),
-                                                "cached compilations".to_string(),
-                                            ))
-                                            .child(card(
-                                                &colors,
-                                                "time saved",
-                                                format_duration(stats.time_saved_ms),
-                                                "across cache hits".to_string(),
-                                            )),
-                                    ),
-                            ),
+                        div().flex().gap_4().child(hero_card(&colors, stats)).child(
+                            div()
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .gap_4()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_4()
+                                        .child(card(
+                                            &colors,
+                                            "hits",
+                                            format_number(stats.hits()),
+                                            format!(
+                                                "{} local · {} remote",
+                                                stats.local_hits + stats.readonly_hits,
+                                                stats.remote_hits + stats.prefetch_hits
+                                            ),
+                                        ))
+                                        .child(card(
+                                            &colors,
+                                            "misses",
+                                            format_number(stats.misses),
+                                            format!("{} deduplicated", stats.dups),
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_4()
+                                        .child(card(
+                                            &colors,
+                                            "entries",
+                                            format_number(stats.entries),
+                                            "cached compilations".to_string(),
+                                        ))
+                                        .child(card(
+                                            &colors,
+                                            "time saved",
+                                            format_duration(stats.time_saved_ms),
+                                            "across cache hits".to_string(),
+                                        )),
+                                ),
+                        ),
                     )
                     .child(
                         div()
@@ -263,10 +259,24 @@ impl Render for Dashboard {
                     div()
                         .flex_1()
                         .flex()
+                        .flex_col()
                         .items_center()
                         .justify_center()
-                        .text_color(colors.disabled)
-                        .child("Loading kache stats…"),
+                        .gap_2()
+                        .child(div().text_lg().text_color(colors.disabled).child(
+                            if self.error.is_some() {
+                                "kache did not answer"
+                            } else {
+                                "Loading kache stats…"
+                            },
+                        ))
+                        .child(div().text_sm().text_color(colors.disabled).child(
+                            if self.error.is_some() {
+                                "Check that kache is installed and on PATH."
+                            } else {
+                                "The dashboard refreshes every 5 seconds."
+                            },
+                        )),
                 );
             }
         }
@@ -295,17 +305,14 @@ impl Render for Dashboard {
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child("kache"),
                             )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(colors.disabled)
-                                    .child(match &self.version {
-                                        Some(version) => {
-                                            format!("{version} · build cache dashboard")
-                                        }
-                                        None => "build cache dashboard".to_string(),
-                                    }),
-                            ),
+                            .child(div().text_sm().text_color(colors.disabled).child(
+                                match &self.version {
+                                    Some(version) => {
+                                        format!("{version} · build cache dashboard")
+                                    }
+                                    None => "build cache dashboard".to_string(),
+                                },
+                            )),
                     )
                     .child(
                         div()
@@ -325,9 +332,9 @@ impl Render for Dashboard {
                                     .hover(|style| style.opacity(0.9))
                                     .active(|style| style.opacity(0.8))
                                     .child("Refresh")
-                                    .on_click(cx.listener(|this, _event, _window, cx| {
-                                        this.refresh(cx)
-                                    })),
+                                    .on_click(
+                                        cx.listener(|this, _event, _window, cx| this.refresh(cx)),
+                                    ),
                             ),
                     ),
             )
@@ -358,16 +365,11 @@ fn hero_card(colors: &Colors, stats: &Stats) -> Div {
                 .font_weight(FontWeight::BOLD)
                 .child(format!("{:.1}%", stats.hit_rate_pct)),
         )
-        .child(
-            div()
-                .text_sm()
-                .text_color(colors.disabled)
-                .child(format!(
-                    "{} hits · {} misses",
-                    format_number(stats.hits()),
-                    format_number(stats.misses)
-                )),
-        )
+        .child(div().text_sm().text_color(colors.disabled).child(format!(
+            "{} hits · {} misses",
+            format_number(stats.hits()),
+            format_number(stats.misses)
+        )))
 }
 
 fn card(colors: &Colors, label: &str, value: String, hint: String) -> Div {
@@ -388,13 +390,13 @@ fn card(colors: &Colors, label: &str, value: String, hint: String) -> Div {
                 .text_color(colors.disabled)
                 .child(label.to_string()),
         )
-        .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child(value))
         .child(
             div()
-                .text_xs()
-                .text_color(colors.disabled)
-                .child(hint),
+                .text_xl()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(value),
         )
+        .child(div().text_xs().text_color(colors.disabled).child(hint))
 }
 
 fn format_number(value: u64) -> String {

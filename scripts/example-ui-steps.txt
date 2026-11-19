@@ -1,0 +1,7 @@
+# Template for scripts/uidrive.py --script. One step per line, '#' comments.
+# Coordinates are output pixels on a 1440x900 fullscreen window.
+sleep 1500
+shot empty.png
+click 1373 56
+sleep 800
+shot refreshed.png

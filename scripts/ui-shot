@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+#
+# ui-shot — render the Kawan UI on a private, off-screen Wayland compositor and
+# save a PNG. Nothing is drawn on the developer's real display, no window
+# manager is involved, and the run cannot touch a live daemon.
+#
+# This is a thin wrapper around scripts/uidrive.py, which also offers a step DSL
+# and a Python session object for clicking and typing. Run
+# `scripts/uidrive.py --help` for the full surface.
+set -euo pipefail
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+exec python3 -B "$here/uidrive.py" "$@"
