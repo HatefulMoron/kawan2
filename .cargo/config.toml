@@ -1,0 +1,5 @@
+# Route every rustc invocation in this project through kache.
+# kache must be on PATH (`cargo install kache --locked`, then `kache init`
+# for a machine-wide setup). It reads/writes its store under ~/.cache/kache.
+[build]
+rustc-wrapper = "kache"

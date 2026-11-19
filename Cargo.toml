@@ -1,0 +1,21 @@
+[package]
+name = "kawan"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+description = "A small GPUI dashboard for the kache compiler cache"
+
+[dependencies]
+gpui = { package = "gpui-ce", version = "0.3" }
+gpui_platform = { package = "gpui_ce_platform", version = "0.3" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.dev]
+# GPUI's dependency tree is large; keep dev builds reasonably fast while
+# dependencies stay optimized for a usable UI.
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
