@@ -1,3 +1,10 @@
 /target
 /kawan-ui*.png
 __pycache__/
+/dev.md
+/host/node_modules/
+/host/dist/
+*.db
+*.db-wal
+*.db-shm
+
