@@ -1229,6 +1229,17 @@ impl KawanApp {
             return;
         }
 
+        if (mods.control || mods.platform) && key == "v" {
+            if let Some(pasted) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                let sanitized = sanitize_paste(self.focus_target, &pasted);
+                if !sanitized.is_empty() {
+                    self.focused_string_mut().push_str(&sanitized);
+                    self.maybe_parse_invite_link();
+                }
+            }
+            return;
+        }
+
         if key == "enter" && !mods.shift {
             match self.focus_target {
                 FocusTarget::ConnectHost
@@ -1256,16 +1267,20 @@ impl KawanApp {
             && !ch_str.chars().any(|c| c.is_control())
         {
             self.focused_string_mut().push_str(ch_str);
-            if matches!(
-                self.focus_target,
-                FocusTarget::ConnectHost | FocusTarget::ConnectToken
-            ) {
-                let raw = self.focused_string_mut().clone();
-                if let Some((u, tok)) = parse_invite_link(&raw) {
-                    self.connect_host = u;
-                    self.connect_token = tok;
-                    self.auth_mode = AuthMode::Register;
-                }
+            self.maybe_parse_invite_link();
+        }
+    }
+
+    fn maybe_parse_invite_link(&mut self) {
+        if matches!(
+            self.focus_target,
+            FocusTarget::ConnectHost | FocusTarget::ConnectToken
+        ) {
+            let raw = self.focused_string_mut().clone();
+            if let Some((u, tok)) = parse_invite_link(&raw) {
+                self.connect_host = u;
+                self.connect_token = tok;
+                self.auth_mode = AuthMode::Register;
             }
         }
     }
@@ -1341,5 +1356,44 @@ impl KawanApp {
         } else if let Some(first) = group.first() {
             self.focus_target = *first;
         }
+    }
+}
+
+fn sanitize_paste(target: FocusTarget, text: &str) -> String {
+    match target {
+        FocusTarget::Composer | FocusTarget::ThreadComposer | FocusTarget::BotPersona => text
+            .trim_end_matches(['\r', '\n'])
+            .replace("\r\n", " ")
+            .replace(['\r', '\n'], " "),
+        _ => text.replace(['\r', '\n'], "").trim().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitizes_single_line_and_prose_pastes() {
+        assert_eq!(
+            sanitize_paste(FocusTarget::ProviderApiKey, "  sk-example-123\r\n "),
+            "sk-example-123"
+        );
+        assert_eq!(
+            sanitize_paste(FocusTarget::ConnectToken, "kawan://127.0.0.1:8787/tok\n"),
+            "kawan://127.0.0.1:8787/tok"
+        );
+        assert_eq!(
+            sanitize_paste(FocusTarget::RepoVerifyCmd, " cargo test --workspace\n"),
+            "cargo test --workspace"
+        );
+        assert_eq!(
+            sanitize_paste(FocusTarget::Composer, "line one\r\nline two\n"),
+            "line one line two"
+        );
+        assert_eq!(
+            sanitize_paste(FocusTarget::BotPersona, "First sentence.\nSecond.\r\n"),
+            "First sentence. Second."
+        );
     }
 }
