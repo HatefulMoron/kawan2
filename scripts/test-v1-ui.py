@@ -181,7 +181,7 @@ def main() -> int:
             ui.click(626, 105)  # @kawan pill in add-member strip
             ui.sleep(0.6)
 
-            # 8. Send prompt in composer and wait for APPROVE LAND button
+            # 8. Send prompt in composer and wait for APPROVE LAND button on the thread tray
             ui.click(700, 828)
             ui.sleep(0.2)
             ui.type("@kawan please create land_ok.txt containing ready, commit it, and request land")
@@ -191,7 +191,7 @@ def main() -> int:
             deadline = time.monotonic() + 45.0
             while time.monotonic() < deadline:
                 approve_pos = locate_optional(
-                    ui, "#102015", tolerance=12, region=(880, 120, 1250, 770), minimum=400
+                    ui, "#102015", tolerance=12, region=(820, 120, 1250, 770), minimum=400
                 )
                 if approve_pos:
                     break
@@ -199,10 +199,21 @@ def main() -> int:
 
             ui.shot("/tmp/v1-07-land-requested.png")
             if not approve_pos:
-                raise TimeoutError("Timed out waiting for APPROVE LAND button to appear")
+                raise TimeoutError("Timed out waiting for APPROVE LAND button on thread tray")
 
-            # 9. Click APPROVE LAND and verify git bare repo advances with signed commit
-            ui.click(*approve_pos)
+            # 9. Open the right-hand Thread Drawer via the Slack-style thread tray and inspect report.md card
+            ui.click(approve_pos[0] - 320, approve_pos[1])
+            ui.sleep(0.6)
+            ui.shot("/tmp/v1-07b-thread-drawer.png")
+
+            drawer_approve_pos = locate_optional(
+                ui, "#102015", tolerance=12, region=(1040, 120, 1430, 790), minimum=400
+            )
+            if not drawer_approve_pos:
+                raise TimeoutError("Timed out waiting for APPROVE LAND button inside Thread Drawer")
+
+            # 10. Click APPROVE LAND inside the drawer and verify git bare repo advances with signed commit
+            ui.click(*drawer_approve_pos)
 
             new_head = None
             land_deadline = time.monotonic() + 20.0

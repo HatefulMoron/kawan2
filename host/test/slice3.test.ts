@@ -198,6 +198,7 @@ test("Slice 3: orchestrator spawns worker, worker commits signed change and post
     if (!useLiveLlm) {
       const wrapMsg = await orchMsgWait;
       assert.equal(wrapMsg.message.artifact_id, artifactId);
+      assert.equal(wrapMsg.message.thread_id, sent.message.id);
     }
 
     // Wait until worker finishes running
@@ -401,6 +402,243 @@ test("Slice 3: worker question routes to orchestrator via message_session withou
       !msgs.some((m) => m.body.includes("Should config use JSON or YAML?")),
       "Worker internal question must go through orchestrator, not chat",
     );
+
+    admin.close();
+  } finally {
+    await host.close();
+    await stub.close();
+    repo.cleanup();
+    adminKey.cleanup();
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("Slice 3: orchestrator controls top-level vs threaded replies and report.md links to worker", async () => {
+  const stub = await startStubProvider();
+  const repo = await createFixtureBareRepo({ "README.md": "# Thread Control Test\n" });
+  const dataDir = mkdtempSync(join(tmpdir(), "kawan-slice3-threads-"));
+  const adminKey = await TestKeyPair.generate("admin@kawan");
+
+  stub.setHandler((reqBody) => {
+    const msgs = reqBody.messages ?? [];
+    const sysText = JSON.stringify(msgs[0] ?? "");
+    const lastMsg = msgs[msgs.length - 1];
+    const hasToolResult = lastMsg?.role === "tool";
+    const lastUserText = JSON.stringify(
+      [...msgs].reverse().find((m: any) => m.role === "user")?.content ?? "",
+    );
+
+    if (sysText.includes("AI engineering orchestrator")) {
+      // Case 1: casual top-level channel question -> no spawn_session, no in_thread -> top-level
+      if (lastUserText.includes("any tasks running?")) {
+        return { text: "No tasks running right now." };
+      }
+
+      // Case 2: explicit report(..., in_thread: true) on top-level message -> thread under trigger
+      if (lastUserText.includes("answer this in a thread")) {
+        if (!hasToolResult) {
+          return {
+            toolCalls: [
+              {
+                name: "report",
+                arguments: { text: "Replying inside a thread as asked.", in_thread: true },
+              },
+            ],
+          };
+        }
+        return { text: "NO_REPLY" };
+      }
+
+      // Worker wrap-up via report.md artifact
+      if (lastUserText.includes("[worker-report")) {
+        if (!hasToolResult) {
+          const isUnthreaded = lastUserText.includes("Unthreaded check");
+          return {
+            toolCalls: [
+              {
+                name: "report",
+                arguments: {
+                  text: isUnthreaded
+                    ? "Checked README top-level."
+                    : "Checked package config; details in report.",
+                  artifact: {
+                    filename: "report.md",
+                    mime_type: "text/markdown",
+                    content: "# Detailed Report\n\n- Verified cleanly.\n",
+                  },
+                },
+              },
+            ],
+          };
+        }
+        return { text: "NO_REPLY" };
+      }
+
+      // Case 4: spawn_session with in_thread: false -> top-level worker & wrap-up
+      if (lastUserText.includes("post top-level check")) {
+        if (!hasToolResult) {
+          return {
+            toolCalls: [
+              {
+                name: "spawn_session",
+                arguments: {
+                  title: "Unthreaded check",
+                  task: "Check README.md and report.",
+                  in_thread: false,
+                },
+              },
+            ],
+          };
+        }
+        return { text: "Checking README top-level." };
+      }
+
+      // Case 3: default channel spawn_session -> threaded under triggering message
+      if (!hasToolResult) {
+        return {
+          toolCalls: [
+            {
+              name: "spawn_session",
+              arguments: {
+                title: "Threaded inspection",
+                task: "Inspect repository and call report.",
+              },
+            },
+          ],
+        };
+      }
+      return { text: "On it." };
+    }
+
+    const toolMsgs = msgs.filter((m: any) => m.role === "tool");
+    if (toolMsgs.length === 0) {
+      return {
+        toolCalls: [{ name: "report", arguments: { text: "Inspection finished cleanly." } }],
+      };
+    }
+    return { text: "Done." };
+  });
+
+  const host = await startHost({
+    dataDir,
+    quiet: true,
+    disableSandbox: true,
+    decisionMode: "live",
+  });
+
+  try {
+    const admin = await WsTestClient.connect(host.url);
+    await admin.bootstrap(host.bootstrapToken!, "alice", adminKey);
+    await admin.request("settings.update", {
+      repo: { url: repo.barePath, default_branch: repo.defaultBranch },
+      verify_command: "true",
+      providers: {
+        stub: {
+          baseUrl: stub.baseUrl,
+          api: "openai-completions",
+          apiKey: "stub-key",
+          models: [{ id: "stub-model", name: "stub-model", reasoning: false, contextWindow: 128000, maxTokens: 16384 }],
+        },
+      },
+      roles: {
+        default: { provider: "stub", model: "stub-model", thinking_level: "off" },
+        decision: { provider: "stub", baseUrl: stub.systemOneBaseUrl, model: "stub-snap", apiKey: "stub-key" },
+      },
+    });
+
+    const created = await admin.request<{ bot: any }>("bot.create", {
+      name: "kawan",
+      persona: "Orchestrator",
+      sandbox_enabled: false,
+    });
+    const botId = created.bot.id;
+    const convs = await admin.request<{ conversations: Array<{ id: string; name: string }> }>("conversation.list");
+    const generalId = convs.conversations.find((c) => c.name === "general")!.id;
+    await admin.request("conversation.add_member", { conversation_id: generalId, user_id: botId });
+
+    // 1. Casual Q&A stays top-level
+    const casualReplyWait = admin.waitForNextFrame(
+      (f) => f.type === "message.new" && f.author?.kind === "bot" && f.message?.body === "No tasks running right now.",
+      15_000,
+    );
+    await admin.request("message.send", { conversation_id: generalId, body: "@kawan any tasks running?" });
+    const casualReply = await casualReplyWait;
+    assert.equal(casualReply.message.thread_id, null);
+
+    // 2. Explicit in_thread: true reply anchors on triggering message
+    const explicitReplyWait = admin.waitForNextFrame(
+      (f) =>
+        f.type === "message.new" &&
+        f.author?.kind === "bot" &&
+        f.message?.body === "Replying inside a thread as asked.",
+      15_000,
+    );
+    const trigger2 = await admin.request<{ message: { id: string } }>("message.send", {
+      conversation_id: generalId,
+      body: "@kawan please answer this in a thread",
+    });
+    const explicitReply = await explicitReplyWait;
+    assert.equal(explicitReply.message.thread_id, trigger2.message.id);
+
+    // 3. Default spawn_session threads ack + worker + report.md wrap-up and links artifact to worker
+    const worker3Wait = admin.waitForNextFrame(
+      (f) => f.type === "session.update" && f.session?.kind === "worker" && f.session?.title === "Threaded inspection",
+      15_000,
+    );
+    const ack3Wait = admin.waitForNextFrame(
+      (f) => f.type === "message.new" && f.author?.kind === "bot" && f.message?.body === "On it.",
+      15_000,
+    );
+    const wrap3Wait = admin.waitForNextFrame(
+      (f) =>
+        f.type === "message.new" &&
+        f.author?.kind === "bot" &&
+        f.message?.body === "Checked package config; details in report.",
+      20_000,
+    );
+    const trigger3 = await admin.request<{ message: { id: string } }>("message.send", {
+      conversation_id: generalId,
+      body: "@kawan inspect package config",
+    });
+    const worker3 = await worker3Wait;
+    const ack3 = await ack3Wait;
+    const wrap3 = await wrap3Wait;
+    assert.equal(worker3.session.thread_id, trigger3.message.id);
+    assert.equal(ack3.message.thread_id, trigger3.message.id);
+    assert.equal(wrap3.message.thread_id, trigger3.message.id);
+    assert.ok(wrap3.message.artifact_id, "Expected report.md artifact attached to wrap-up message");
+    const reportArt = host.db.getArtifact(wrap3.message.artifact_id)!;
+    assert.equal(reportArt.filename, "report.md");
+    assert.equal(reportArt.mime_type, "text/markdown");
+    assert.equal(reportArt.session_id, worker3.session.id);
+    assert.equal(reportArt.message_id, wrap3.message.id);
+
+    // Wait for orchestrator turn to finish before Case 4
+    const waitOrch = Date.now() + 15_000;
+    while (host.db.getActiveOrchestratorSession(botId)?.status === "running" && Date.now() < waitOrch) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
+    // 4. Explicit in_thread: false on spawn_session keeps worker and wrap-up top-level
+    const worker4Wait = admin.waitForNextFrame(
+      (f) => f.type === "session.update" && f.session?.kind === "worker" && f.session?.title === "Unthreaded check",
+      15_000,
+    );
+    const wrap4Wait = admin.waitForNextFrame(
+      (f) =>
+        f.type === "message.new" &&
+        f.author?.kind === "bot" &&
+        f.message?.body === "Checked README top-level.",
+      20_000,
+    );
+    await admin.request("message.send", {
+      conversation_id: generalId,
+      body: "@kawan post top-level check of README",
+    });
+    const worker4 = await worker4Wait;
+    const wrap4 = await wrap4Wait;
+    assert.equal(worker4.session.thread_id, null);
+    assert.equal(wrap4.message.thread_id, null);
 
     admin.close();
   } finally {

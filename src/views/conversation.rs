@@ -1,6 +1,8 @@
 //! Conversations Folio shell: 256px left rail, 780px stream (decision chips, redirect,
-//! artifact/land cards, composer), 36px bottom session strip, and 380px thread/session drawer.
+//! Slack-style thread trays, artifact/land cards, composer), 36px bottom session strip,
+//! and 420px thread/session drawer.
 
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::prelude::*;
@@ -44,7 +46,8 @@ fn session_display_title(sess: &SessionSummary) -> String {
 fn short_status_label(status: &str) -> &'static str {
     match status {
         "running" => "running",
-        "review_requested" => "review",
+        "verifying" => "verifying",
+        "review_requested" | "requested" => "review",
         "landed" => "landed",
         "failed" => "failed",
         "stopped" => "stopped",
@@ -456,14 +459,24 @@ fn main_stream_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -
     };
 
     let messages = app.active_messages();
-    let thread_count = messages
+    let all_ids: HashSet<&str> = messages.iter().map(|m| m.id.as_str()).collect();
+    let mut replies_by_parent: HashMap<&str, Vec<&Message>> = HashMap::new();
+    let mut top_level_messages: Vec<&Message> = Vec::new();
+    for m in messages {
+        if let Some(tid) = m.thread_id.as_deref()
+            && all_ids.contains(tid)
+        {
+            replies_by_parent.entry(tid).or_default().push(m);
+        } else {
+            top_level_messages.push(m);
+        }
+    }
+    let thread_count = replies_by_parent.len();
+    let latest_thread = replies_by_parent
         .iter()
-        .filter_map(|m| m.thread_id.as_ref())
-        .collect::<std::collections::HashSet<_>>()
-        .len();
-    let first_thread = messages
-        .iter()
-        .find_map(|m| m.thread_id.clone().or_else(|| Some(m.id.clone())));
+        .max_by_key(|(_, rs)| rs.last().map(|r| r.seq).unwrap_or(0))
+        .map(|(tid, _)| (*tid).to_string())
+        .or_else(|| top_level_messages.last().map(|m| m.id.clone()));
 
     let header = div()
         .w_full()
@@ -524,9 +537,11 @@ fn main_stream_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -
                                         theme,
                                     )
                                     .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            if let Some(tid) = first_thread.clone() {
+                                        move |this, _, window, cx| {
+                                            if let Some(tid) = latest_thread.clone() {
                                                 this.right_panel = RightPanel::Thread(tid);
+                                                this.focus_target = FocusTarget::ThreadComposer;
+                                                window.focus(&this.focus_handle, cx);
                                                 cx.notify();
                                             }
                                         },
@@ -612,7 +627,7 @@ fn main_stream_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -
                                 theme::hex(theme::CATEGORY_VALS),
                             ))
                     }))
-                    .children(if messages.is_empty() {
+                    .children(if top_level_messages.is_empty() {
                         vec![
                             div()
                                 .py(px(24.0))
@@ -624,11 +639,16 @@ fn main_stream_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -
                                 .into_any_element(),
                         ]
                     } else {
-                        messages
+                        top_level_messages
                             .iter()
                             .enumerate()
                             .map(|(mi, msg)| {
-                                message_row(app, msg, mi, theme, cx).into_any_element()
+                                let replies = replies_by_parent
+                                    .get(msg.id.as_str())
+                                    .map(Vec::as_slice)
+                                    .unwrap_or(&[]);
+                                message_row(app, msg, replies, is_channel, mi, theme, cx)
+                                    .into_any_element()
                             })
                             .collect()
                     }),
@@ -878,6 +898,8 @@ fn bot_tasks_panel(
 fn message_row(
     app: &KawanApp,
     msg: &Message,
+    replies: &[&Message],
+    is_channel: bool,
     mi: usize,
     theme: &Theme,
     cx: &mut Context<KawanApp>,
@@ -929,37 +951,8 @@ fn message_row(
                 .child(theme::body(msg.body.clone(), 13.5, theme.ink)),
         );
 
-    if let Some(art_id) = &msg.artifact_id
-        && let Some(artifact) = app.artifacts_by_id.get(art_id)
-    {
-        let sess = artifact
-            .session_id
-            .as_deref()
-            .and_then(|sid| app.sessions_by_id.get(sid));
-        let land = artifact
-            .session_id
-            .as_deref()
-            .and_then(|sid| app.land_for_session(sid));
-        content_col = content_col.child(artifact_card(
-            app,
-            artifact.id.clone(),
-            artifact.filename.clone(),
-            artifact.byte_size,
-            sess,
-            land,
-            mi,
-            theme,
-            cx,
-        ));
-    } else if is_bot {
-        let matching_land = app
-            .lands_by_id
-            .values()
-            .find(|l| l.message_id.as_deref() == Some(msg.id.as_str()));
-        if let Some(land) = matching_land {
-            let sess = app.sessions_by_id.get(&land.session_id);
-            content_col = content_col.child(land_card(land, sess, mi, theme, cx));
-        }
+    if let Some(attachment) = render_message_attachment(app, msg, is_bot, mi, theme, cx) {
+        content_col = content_col.child(attachment);
     }
 
     if let Some(tid) = &msg.thread_id {
@@ -975,8 +968,10 @@ fn message_row(
                 .hover(|s| s.opacity(0.75))
                 .child(kit::icon("kawan/thread.svg", 11.0, theme.dark))
                 .child(theme::numeric("thread →", 10.5, theme.dark))
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .on_click(cx.listener(move |this, _, window, cx| {
                     this.right_panel = RightPanel::Thread(tid_open.clone());
+                    this.focus_target = FocusTarget::ThreadComposer;
+                    window.focus(&this.focus_handle, cx);
                     cx.notify();
                 })),
         );
@@ -985,6 +980,34 @@ fn message_row(
     let decisions = app.decisions_for_message(&msg.id);
     for (di, dec) in decisions.into_iter().enumerate() {
         content_col = content_col.child(decision_chip_row(app, dec, mi * 10 + di, theme, cx));
+    }
+
+    if !replies.is_empty() {
+        content_col = content_col.child(thread_tray(app, &msg.id, replies, mi, theme, cx));
+    } else if is_channel && msg.thread_id.is_none() {
+        let tid_open = msg.id.clone();
+        content_col = content_col.child(
+            div().pt(px(1.0)).flex().items_center().child(
+                div()
+                    .id(("msg-start-thread", mi))
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .rounded(px(2.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.hover))
+                    .child(kit::icon("kawan/thread.svg", 10.5, theme.fg_tertiary))
+                    .child(theme::micro("Reply in thread", 8.5, theme.fg_tertiary))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.right_panel = RightPanel::Thread(tid_open.clone());
+                        this.focus_target = FocusTarget::ThreadComposer;
+                        window.focus(&this.focus_handle, cx);
+                        cx.notify();
+                    })),
+            ),
+        );
     }
 
     div()
@@ -997,6 +1020,181 @@ fn message_row(
         .gap(px(12.0))
         .child(div().pt(px(2.0)).child(avatar))
         .child(content_col)
+}
+
+fn thread_tray(
+    app: &KawanApp,
+    parent_msg_id: &str,
+    replies: &[&Message],
+    mi: usize,
+    theme: &Theme,
+    cx: &mut Context<KawanApp>,
+) -> Div {
+    let reply_count = replies.len();
+    let reply_label = if reply_count == 1 {
+        "1 reply".to_string()
+    } else {
+        format!("{reply_count} replies")
+    };
+    let last_reply = replies
+        .last()
+        .expect("thread_tray requires non-empty replies");
+    let last_is_bot = app.actor_is_bot(&last_reply.author_id);
+    let last_raw_name = app.actor_name(&last_reply.author_id);
+    let last_author = if last_is_bot {
+        format!("@{last_raw_name}")
+    } else {
+        last_raw_name.clone()
+    };
+    let last_avatar = if last_is_bot {
+        kit::bot_avatar(18.0, theme)
+    } else {
+        kit::human_avatar(&last_raw_name, 18.0, theme)
+    };
+
+    let has_report = replies.iter().any(|r| r.artifact_id.is_some());
+    let thread_running = app.sessions_by_id.values().any(|s| {
+        s.kind == "worker" && s.thread_id.as_deref() == Some(parent_msg_id) && s.status == "running"
+    });
+    let mut matching_lands: Vec<&Land> = app
+        .lands_by_id
+        .values()
+        .filter(|l| {
+            l.thread_id.as_deref() == Some(parent_msg_id)
+                || replies
+                    .iter()
+                    .any(|r| l.message_id.as_deref() == Some(r.id.as_str()))
+        })
+        .collect();
+    matching_lands.sort_by_key(|l| l.updated_at);
+    let thread_land = matching_lands.last().copied();
+
+    let status_badge: Option<(&'static str, u32)> = if thread_running {
+        Some(("WORKING", theme::CATEGORY_INDUSTRY))
+    } else if let Some(land) = thread_land {
+        match land.status.as_str() {
+            "requested" => Some(("REVIEW", theme::UMBER_VIVID)),
+            "verifying" => Some(("VERIFYING", theme::CATEGORY_INDUSTRY)),
+            "failed" => Some(("BLOCKED", theme::CATEGORY_VALS)),
+            "landed" => Some(("LANDED", status_color_hex("landed"))),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let accent_color = status_badge
+        .map(|(_, col)| theme::hex(col))
+        .unwrap_or(theme.vivid);
+    let is_open = app.right_panel == RightPanel::Thread(parent_msg_id.to_string());
+    let open_tid = parent_msg_id.to_string();
+    let single_line = last_reply
+        .body
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let left_btn = div()
+        .id(("thread-tray-open", mi))
+        .flex_1()
+        .min_w(px(0.0))
+        .cursor_pointer()
+        .hover(|s| s.opacity(0.82))
+        .flex()
+        .flex_col()
+        .gap(px(3.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap(px(6.0))
+                        .min_w(px(0.0))
+                        .child(last_avatar)
+                        .child(kit::icon("kawan/thread.svg", 11.0, theme.dark))
+                        .child(theme::label(reply_label, 11.5, theme.ink))
+                        .children(status_badge.map(|(lbl, col)| kit::status_tag(lbl, col, theme)))
+                        .children(has_report.then(|| {
+                            div()
+                                .px(px(5.0))
+                                .py(px(1.0))
+                                .rounded(px(2.0))
+                                .border_1()
+                                .border_color(theme.border_subtle)
+                                .bg(theme.surface)
+                                .child(theme::micro("REPORT", 8.0, theme.dark))
+                        })),
+                )
+                .child(theme::micro(
+                    if is_open {
+                        "VIEWING"
+                    } else {
+                        "VIEW THREAD →"
+                    },
+                    8.5,
+                    if is_open { theme.vivid } else { theme.dark },
+                )),
+        )
+        .child(theme::body(
+            format!("{last_author}: {}", truncate_chars(&single_line, 86)),
+            12.0,
+            theme.fg_secondary,
+        ))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.right_panel = RightPanel::Thread(open_tid.clone());
+            this.focus_target = FocusTarget::ThreadComposer;
+            window.focus(&this.focus_handle, cx);
+            cx.notify();
+        }));
+
+    let mut tray = div()
+        .mt(px(4.0))
+        .w_full()
+        .relative()
+        .overflow_hidden()
+        .rounded(px(2.0))
+        .border_1()
+        .border_color(if is_open {
+            theme.vivid
+        } else {
+            theme.border_subtle
+        })
+        .bg(if is_open {
+            theme::with_alpha(theme.palette.vivid, 0.06)
+        } else {
+            theme.strip
+        })
+        .pl(px(12.0))
+        .pr(px(10.0))
+        .py(px(7.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(10.0))
+        .child(kit::left_edge(accent_color))
+        .child(left_btn);
+
+    if let Some(land) = thread_land
+        && (land.status == "requested" || land.status == "failed")
+    {
+        let lid = land.id.clone();
+        tray = tray.child(
+            kit::small_primary_button(("tray-land-approve", mi), "Approve Land", theme).on_click(
+                cx.listener(move |this, _, _, cx| {
+                    this.approve_land(&lid);
+                    cx.notify();
+                }),
+            ),
+        );
+    }
+
+    tray
 }
 
 fn decision_chip_row(
@@ -1192,6 +1390,52 @@ fn decision_chip_row(
     wrapper
 }
 
+fn render_message_attachment(
+    app: &KawanApp,
+    msg: &Message,
+    is_bot: bool,
+    card_idx: usize,
+    theme: &Theme,
+    cx: &mut Context<KawanApp>,
+) -> Option<Div> {
+    if let Some(art_id) = &msg.artifact_id
+        && let Some(artifact) = app.artifacts_by_id.get(art_id)
+    {
+        let sess = artifact
+            .session_id
+            .as_deref()
+            .and_then(|sid| app.sessions_by_id.get(sid));
+        let land = artifact
+            .session_id
+            .as_deref()
+            .and_then(|sid| app.land_for_session(sid));
+        return Some(artifact_card(
+            app,
+            artifact.id.clone(),
+            artifact.filename.clone(),
+            artifact.byte_size,
+            sess,
+            land,
+            card_idx,
+            theme,
+            cx,
+        ));
+    }
+
+    if is_bot {
+        let matching_land = app
+            .lands_by_id
+            .values()
+            .find(|l| l.message_id.as_deref() == Some(msg.id.as_str()));
+        if let Some(land) = matching_land {
+            let sess = app.sessions_by_id.get(&land.session_id);
+            return Some(land_card(land, sess, card_idx, theme, cx));
+        }
+    }
+
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 fn artifact_card(
     app: &KawanApp,
@@ -1211,9 +1455,19 @@ fn artifact_card(
     let status_color = status_color_hex(status);
     let expanded = app.expanded_artifacts.contains(&artifact_id);
     let loaded = app.loaded_artifacts.get(&artifact_id);
+    let is_report = filename.as_deref().is_some_and(|name| {
+        let lower = name.to_ascii_lowercase();
+        lower.ends_with(".md") || lower.contains("report")
+    });
     let header_label = sess
-        .map(session_display_title)
-        .unwrap_or_else(|| "Artifact".to_string());
+        .map(|s| truncate_chars(&session_display_title(s), 28))
+        .unwrap_or_else(|| {
+            if is_report {
+                "Report".to_string()
+            } else {
+                "Artifact".to_string()
+            }
+        });
 
     let mut card = div()
         .mt(px(4.0))
@@ -1236,12 +1490,15 @@ fn artifact_card(
                 .flex()
                 .items_center()
                 .justify_between()
-                .gap(px(10.0))
+                .flex_wrap()
+                .gap(px(8.0))
                 .child(
                     div()
+                        .min_w(px(0.0))
                         .flex()
                         .items_center()
-                        .gap(px(10.0))
+                        .flex_wrap()
+                        .gap(px(8.0))
                         .child(theme::label(header_label, 12.0, theme.dark))
                         .child(kit::status_tag(
                             short_status_label(status).to_uppercase(),
@@ -1265,17 +1522,31 @@ fn artifact_card(
             if let Some(image) = &art.image {
                 img(image.clone()).max_h(px(240.0)).into_any_element()
             } else if let Some(txt) = &art.text_preview {
+                let all_lines: Vec<&str> = txt.lines().collect();
+                let shown = all_lines.len().min(80);
+                let remaining = all_lines.len().saturating_sub(shown);
                 div()
+                    .w_full()
+                    .min_w(px(0.0))
                     .flex()
                     .flex_col()
                     .gap(px(2.0))
-                    .children(txt.lines().take(24).map(|line| {
+                    .children(all_lines.into_iter().take(80).map(|line| {
                         div()
+                            .w_full()
+                            .min_w(px(0.0))
                             .font_family(theme::MONO)
                             .text_size(px(11.0))
                             .line_height(px(15.5))
                             .text_color(theme.ink)
                             .child(line.to_string())
+                    }))
+                    .children((remaining > 0).then(|| {
+                        theme::numeric(
+                            format!("… ({remaining} more lines)"),
+                            10.0,
+                            theme.fg_tertiary,
+                        )
                     }))
                     .into_any_element()
             } else {
@@ -1290,6 +1561,17 @@ fn artifact_card(
 
     let art_toggle = artifact_id.clone();
     let sess_open = sess.map(|s| s.id.clone());
+    let toggle_label = if expanded {
+        if is_report {
+            "Hide report"
+        } else {
+            "Hide artifact"
+        }
+    } else if is_report {
+        "View report"
+    } else {
+        "View artifact"
+    };
 
     card.child(
         div()
@@ -1302,6 +1584,7 @@ fn artifact_card(
             .flex()
             .items_center()
             .justify_between()
+            .flex_wrap()
             .gap(px(8.0))
             .child(
                 div()
@@ -1309,19 +1592,12 @@ fn artifact_card(
                     .items_center()
                     .gap(px(6.0))
                     .child(
-                        kit::ghost_button(
-                            ("art-toggle", mi),
-                            if expanded {
-                                "Hide artifact"
-                            } else {
-                                "View artifact"
-                            },
-                            theme,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.toggle_artifact_view(&art_toggle);
-                            cx.notify();
-                        })),
+                        kit::ghost_button(("art-toggle", mi), toggle_label, theme).on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.toggle_artifact_view(&art_toggle);
+                                cx.notify();
+                            }),
+                        ),
                     )
                     .children(sess_open.map(|sid| {
                         kit::ghost_button(("art-sess", mi), "Session", theme).on_click(cx.listener(
@@ -1542,8 +1818,28 @@ fn session_strip(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
 
 fn right_drawer(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> Div {
     let title = match &app.right_panel {
-        RightPanel::Thread(tid) => format!("THREAD · {}", short_id(tid)),
-        RightPanel::Session(sid) => format!("SESSION · {}", short_id(sid)),
+        RightPanel::Thread(tid) => {
+            let reply_count = app
+                .active_messages()
+                .iter()
+                .filter(|m| m.thread_id.as_deref() == Some(tid.as_str()))
+                .count();
+            if reply_count == 0 {
+                "THREAD".to_string()
+            } else if reply_count == 1 {
+                "THREAD · 1 REPLY".to_string()
+            } else {
+                format!("THREAD · {reply_count} REPLIES")
+            }
+        }
+        RightPanel::Session(sid) => {
+            let sess_title = app
+                .sessions_by_id
+                .get(sid)
+                .map(|s| truncate_chars(&session_display_title(s), 30))
+                .unwrap_or_else(|| "TASK".to_string());
+            format!("TASK · {sess_title}")
+        }
         RightPanel::None => String::new(),
     };
 
@@ -1554,7 +1850,7 @@ fn right_drawer(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> Di
     };
 
     div()
-        .w(px(380.0))
+        .w(px(420.0))
         .h_full()
         .flex_none()
         .border_l_1()
@@ -1605,21 +1901,86 @@ fn thread_drawer_body(
                 .p(px(16.0))
                 .flex()
                 .flex_col()
-                .gap(px(10.0))
-                .children(thread_msgs.into_iter().map(|m| {
-                    div()
-                        .pb(px(8.0))
+                .gap(px(12.0))
+                .children(thread_msgs.into_iter().enumerate().map(|(ti, m)| {
+                    let is_root = m.id == thread_id;
+                    let is_bot = app.actor_is_bot(&m.author_id);
+                    let raw_name = app.actor_name(&m.author_id);
+                    let author_label = if is_bot {
+                        format!("@{raw_name}")
+                    } else {
+                        raw_name.clone()
+                    };
+                    let avatar = if is_bot {
+                        kit::bot_avatar(22.0, theme)
+                    } else {
+                        kit::human_avatar(&raw_name, 22.0, theme)
+                    };
+                    let card_idx = 100_000 + ti;
+
+                    let mut msg_col = div()
+                        .pb(px(10.0))
                         .border_b_1()
                         .border_color(theme.border_subtle)
                         .flex()
                         .flex_col()
-                        .gap(px(3.0))
-                        .child(theme::micro(
-                            format!("{} · #{}", app.actor_name(&m.author_id), m.seq),
-                            9.0,
-                            theme.dark,
-                        ))
-                        .child(theme::body(m.body.clone(), 12.5, theme.ink))
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(7.0))
+                                        .child(avatar)
+                                        .child(theme::label(author_label, 12.0, theme.ink))
+                                        .child(theme::numeric(
+                                            format!("#{}", m.seq),
+                                            9.5,
+                                            theme::with_alpha(theme.palette.dark, 0.50),
+                                        )),
+                                )
+                                .children(is_root.then(|| {
+                                    div()
+                                        .px(px(5.0))
+                                        .py(px(1.0))
+                                        .rounded(px(2.0))
+                                        .border_1()
+                                        .border_color(theme.border_subtle)
+                                        .bg(theme.strip)
+                                        .child(theme::micro("ROOT", 8.0, theme.fg_tertiary))
+                                })),
+                        )
+                        .child(div().w_full().min_w(px(0.0)).child(theme::body(
+                            m.body.clone(),
+                            12.5,
+                            theme.ink,
+                        )));
+
+                    if let Some(attachment) =
+                        render_message_attachment(app, m, is_bot, card_idx, theme, cx)
+                    {
+                        msg_col = msg_col.child(attachment);
+                    }
+
+                    if !is_root {
+                        let decisions = app.decisions_for_message(&m.id);
+                        for (di, dec) in decisions.into_iter().enumerate() {
+                            msg_col = msg_col.child(decision_chip_row(
+                                app,
+                                dec,
+                                100_000 + ti * 10 + di,
+                                theme,
+                                cx,
+                            ));
+                        }
+                    }
+
+                    msg_col
                 })),
         )
         .child(

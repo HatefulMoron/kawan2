@@ -80,30 +80,51 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  const artifactParamSchema = Type.Optional(
+    Type.Object({
+      filename: Type.Optional(
+        Type.String({ description: "Filename for the artifact, e.g. report.md" }),
+      ),
+      mime_type: Type.Optional(
+        Type.String({ description: "MIME type, e.g. text/markdown, text/plain, or image/png" }),
+      ),
+      content: Type.Optional(Type.String({ description: "UTF-8 text content of the artifact" })),
+      base64: Type.Optional(
+        Type.String({ description: "Base64-encoded binary content of the artifact" }),
+      ),
+      path: Type.Optional(
+        Type.String({ description: "Relative or absolute path to an artifact file to attach" }),
+      ),
+    }),
+  );
+
+  const reportParameters =
+    role === "orchestrator"
+      ? Type.Object({
+          text: Type.String({ description: "Message to post into the conversation" }),
+          artifact: artifactParamSchema,
+          in_thread: Type.Optional(
+            Type.Boolean({
+              description:
+                "Post inside a thread under the triggering message (true) or top-level in the channel (false). Omit to follow current context.",
+            }),
+          ),
+        })
+      : Type.Object({
+          text: Type.String({
+            description: "Report, question, or result to send back to your orchestrator",
+          }),
+          artifact: artifactParamSchema,
+        });
+
   pi.registerTool({
     name: "report",
     label: "Report",
     description:
       role === "orchestrator"
-        ? "Post a message into the active conversation and optionally attach a text or image artifact."
+        ? "Post a message into the active conversation and optionally attach a text, markdown, or image artifact."
         : "Send a summary, progress note, blocking question, or artifact back to your orchestrator (never posted directly to humans).",
-    parameters: Type.Object({
-      text: Type.String({
-        description:
-          role === "orchestrator"
-            ? "Message to post into the conversation"
-            : "Report, question, or result to send back to your orchestrator",
-      }),
-      artifact: Type.Optional(
-        Type.Object({
-          filename: Type.Optional(Type.String({ description: "Filename for the artifact, e.g. summary.txt" })),
-          mime_type: Type.Optional(Type.String({ description: "MIME type, e.g. text/plain or image/png" })),
-          content: Type.Optional(Type.String({ description: "UTF-8 text content of the artifact" })),
-          base64: Type.Optional(Type.String({ description: "Base64-encoded binary content of the artifact" })),
-          path: Type.Optional(Type.String({ description: "Relative or absolute path to an artifact file to attach" })),
-        }),
-      ),
-    }),
+    parameters: reportParameters,
     async execute(_toolCallId, params) {
       try {
         let artifactPayload: Record<string, unknown> | undefined;
@@ -129,7 +150,9 @@ export default function (pi: ExtensionAPI) {
                 ? "image/jpeg"
                 : ext.endsWith(".webp")
                   ? "image/webp"
-                  : "text/plain";
+                  : ext.endsWith(".md") || ext.endsWith(".markdown")
+                    ? "text/markdown"
+                    : "text/plain";
             artifactPayload = {
               filename: a.filename ?? basename(abs),
               mime_type: a.mime_type ?? inferredMime,
@@ -142,16 +165,26 @@ export default function (pi: ExtensionAPI) {
               base64: a.base64,
             };
           } else if (typeof a.content === "string") {
+            const fname = a.filename ?? "report.txt";
+            const lowerName = fname.toLowerCase();
+            const inferredMime =
+              lowerName.endsWith(".md") || lowerName.endsWith(".markdown")
+                ? "text/markdown"
+                : "text/plain";
             artifactPayload = {
-              filename: a.filename ?? "report.txt",
-              mime_type: a.mime_type ?? "text/plain",
+              filename: fname,
+              mime_type: a.mime_type ?? inferredMime,
               base64: Buffer.from(a.content, "utf8").toString("base64"),
             };
           }
         }
+        const inThread = (params as { in_thread?: unknown }).in_thread;
         const res = await callHost("report", {
           text: params.text,
           ...(artifactPayload ? { artifact: artifactPayload } : {}),
+          ...(role === "orchestrator" && typeof inThread === "boolean"
+            ? { in_thread: inThread }
+            : {}),
         });
         return textResult(res);
       } catch (err) {
@@ -171,12 +204,19 @@ export default function (pi: ExtensionAPI) {
           Type.String({ description: "Short 3-6 word human-readable title shown in the Tasks UI" }),
         ),
         task: Type.String({ description: "Clear, self-contained task description for the worker session" }),
+        in_thread: Type.Optional(
+          Type.Boolean({
+            description:
+              "Whether updates and wrap-up for this task belong in a thread under the triggering message (defaults to true in channels, false in DMs).",
+          }),
+        ),
       }),
       async execute(_toolCallId, params) {
         try {
           const res = await callHost("spawn_session", {
             task: params.task,
             ...(params.title ? { title: params.title } : {}),
+            ...(typeof params.in_thread === "boolean" ? { in_thread: params.in_thread } : {}),
           });
           return textResult(res);
         } catch (err) {

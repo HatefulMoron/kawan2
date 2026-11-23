@@ -27,7 +27,25 @@ async function main() {
 
     if (sysText.includes("AI engineering orchestrator")) {
       if (lastUserText.includes("[worker-report")) {
-        return { text: "Added land_ok.txt and verified locally — ready for your approval." };
+        if (!hasToolResult) {
+          return {
+            toolCalls: [
+              {
+                name: "report",
+                arguments: {
+                  text: "Added land_ok.txt and verified locally — ready for your approval.",
+                  artifact: {
+                    filename: "report.md",
+                    mime_type: "text/markdown",
+                    content:
+                      "# Verification Report\n\n- Created `land_ok.txt` with `ready`.\n- Committed cleanly on worker branch.\n- Ready to land on `main`.\n",
+                  },
+                },
+              },
+            ],
+          };
+        }
+        return { text: "NO_REPLY" };
       }
       if (!hasToolResult) {
         return {

@@ -343,7 +343,14 @@ export class SessionManager {
   private orchQueues = new Map<string, Promise<void>>();
   private activeContexts = new Map<
     string,
-    { conversationId: string; threadId: string | null; reportedInTurn: boolean; sourceWorkerId?: string | null }
+    {
+      conversationId: string;
+      threadId: string | null;
+      triggerMessageId?: string | null;
+      spawnedThreadId?: string | null;
+      reportedInTurn: boolean;
+      sourceWorkerId?: string | null;
+    }
   >();
   private workerRuns = new Map<string, Promise<void>>();
 
@@ -484,7 +491,8 @@ export class SessionManager {
         const task = typeof params.task === "string" ? params.task.trim() : "";
         if (!task) throw new Error("task is required");
         const title = typeof params.title === "string" ? params.title.trim() : undefined;
-        return await this.spawnWorker(session, task, title);
+        const inThread = typeof params.in_thread === "boolean" ? params.in_thread : undefined;
+        return await this.spawnWorker(session, task, title, inThread);
       }
 
       case "message_session": {
@@ -525,7 +533,8 @@ export class SessionManager {
           params.artifact && typeof params.artifact === "object"
             ? (params.artifact as { filename?: string; mime_type?: string; base64?: string })
             : undefined;
-        return await this.handleReport(session, text, artifactParam);
+        const inThread = typeof params.in_thread === "boolean" ? params.in_thread : undefined;
+        return await this.handleReport(session, text, artifactParam, inThread);
       }
 
       case "land_request": {
@@ -572,11 +581,15 @@ export class SessionManager {
       bot.persona ? `Persona: ${bot.persona}` : "Persona: Helpful, concise software engineer.",
       `Only you speak in chat for ${bot.name}. Worker sessions run quietly in isolated clones and never post directly to humans.`,
       "Host tools:",
-      "- spawn_session(title?, task): delegate repository inspection, coding, tests, and git commits to a worker session. Pass a short 3-6 word `title` for the Tasks UI. Each worker already has its own clone, dedicated branch, bash/file tools, report(), and land_request(). Do NOT tell workers to create a new branch or push to origin.",
+      "- spawn_session(title?, task, in_thread?): delegate repository inspection, coding, tests, and git commits to a worker session. Pass a short 3-6 word `title` for the Tasks UI. Each worker already has its own clone, dedicated branch, bash/file tools, report(), and land_request(). Do NOT tell workers to create a new branch or push to origin.",
       "- message_session(session_id, message): answer a worker's question or steer an existing worker directly.",
       "- session_status(): inspect your child worker sessions.",
-      "- report(text, artifact?): post a message or attach evidence into the active conversation.",
+      "- report(text, artifact?, in_thread?): post a message or attach evidence/reports into the active conversation.",
       "- soul_replace(anchor, text) and soul_write(document): maintain durable project knowledge in your soul (injected each turn at kawan://soul.md).",
+      "Thread & formatting guidance:",
+      "- Casual top-level channel Q&A defaults to a regular top-level channel reply. Use a thread (`in_thread: true` on `report()`, or the default on `spawn_session` in channels) when delegating a task or having a multi-turn discussion that belongs grouped under the triggering message, or pass `in_thread: false` to reply top-level in the channel. When a human writes inside a thread, stay in that thread.",
+      "- Prefer concise plain prose in chat (usually 1-3 sentences) rather than long markdown walls or nested bullet lists.",
+      "- When a task produces detailed multi-file breakdowns, verification logs, or lengthy technical notes, prefer attaching those details as an expandable `report.md` artifact via `report(short_summary, { filename: 'report.md', mime_type: 'text/markdown', content: full_details })` while keeping the chat message brief. For simple tasks or quick answers, a brief reply alone is fine.",
       "Workflow rules:",
       "- Do not pretend to inspect or edit files directly — delegate repository work via spawn_session().",
       "- When delegating, reply with at most one brief acknowledgement (e.g. 'On it.') or output NO_REPLY — live task status is already shown in the Tasks UI.",
@@ -739,12 +752,14 @@ export class SessionManager {
 
         const proc = await this.ensureOrchestratorProcess(freshBot, runningOrch);
 
-        const targetThreadId =
-          threadId ?? (conversation.kind === "channel" && messages.length > 0 ? messages[messages.length - 1].id : null);
+        const triggerMessageId = messages.length > 0 ? messages[messages.length - 1].id : null;
+        const targetThreadId = threadId ?? null;
 
         this.activeContexts.set(orch.id, {
           conversationId: conversation.id,
           threadId: targetThreadId,
+          triggerMessageId,
+          spawnedThreadId: null,
           reportedInTurn: false,
           sourceWorkerId: sourceWorkerId ?? null,
         });
@@ -784,7 +799,7 @@ export class SessionManager {
             this.publishOrchestratorMessage({
               bot: freshBot,
               conversation,
-              threadId: targetThreadId,
+              threadId: ctx?.spawnedThreadId ?? targetThreadId,
               body: turn.assistantText.trim(),
               sourceWorkerId: ctx?.sourceWorkerId,
             });
@@ -816,12 +831,18 @@ export class SessionManager {
   ): string {
     const label =
       conversation.kind === "dm" ? "DM" : `#${conversation.name ?? "channel"}`;
+    const scope =
+      conversation.kind === "dm"
+        ? ""
+        : threadId
+          ? `, in thread ${threadId}`
+          : ", top-level";
     const lines = messages.map((m) => {
       const author = this.db.getUser(m.author_id);
       return `${author?.name ?? "human"}: ${m.body}`;
     });
     return [
-      `[Conversation: ${label} (${conversation.id})${threadId ? `, thread ${threadId}` : ""}]`,
+      `[Conversation: ${label} (${conversation.id})${scope}]`,
       ...lines,
     ].join("\n");
   }
@@ -830,10 +851,12 @@ export class SessionManager {
     orchSession: SessionRow,
     task: string,
     explicitTitle?: string,
+    inThread?: boolean,
   ): Promise<{
     session_id: string;
     title: string;
     status: string;
+    thread_id: string | null;
   }> {
     const bot = this.db.getUser(orchSession.bot_id);
     if (!bot || bot.kind !== "bot") {
@@ -849,6 +872,21 @@ export class SessionManager {
     }
     if (!bot.signing_key_path) {
       throw new Error("Bot is missing SSH signing key");
+    }
+
+    const conv = this.db.getConversation(ctx.conversationId);
+    const workerThreadId =
+      inThread === false
+        ? null
+        : ctx.threadId
+          ? ctx.threadId
+          : inThread === true
+            ? (ctx.triggerMessageId ?? null)
+            : conv?.kind === "channel"
+              ? (ctx.triggerMessageId ?? null)
+              : null;
+    if (workerThreadId) {
+      ctx.spawnedThreadId = workerThreadId;
     }
 
     const sessionId = randomUUID();
@@ -880,7 +918,7 @@ export class SessionManager {
       parentSessionId: orchSession.id,
       kind: "worker",
       conversationId: ctx.conversationId,
-      threadId: ctx.threadId,
+      threadId: workerThreadId,
       title,
       task,
       status: "running",
@@ -921,7 +959,7 @@ export class SessionManager {
     const runPromise = this.runWorkerTurn(proc, workerSession, bot, task);
     this.workerRuns.set(workerSession.id, runPromise);
 
-    return { session_id: workerSession.id, title, status: "running" };
+    return { session_id: workerSession.id, title, status: "running", thread_id: workerThreadId };
   }
 
   private async runWorkerTurn(
@@ -1012,7 +1050,7 @@ export class SessionManager {
             "Remember: ONLY you represent the bot in chat (this report was not shown to humans).",
             "- If the worker asked a question you can answer from conversation context or kawan://soul.md, call `message_session(session_id, answer)` and output NO_REPLY.",
             "- If you need human input to unblock the worker, ask concisely in chat.",
-            "- If the worker completed the task or requested landing (`land_approval=pending`), post ONE clear summary for humans explaining what changed and how it was verified (and mention it is ready for review/approval if pending). Omit internal session IDs, branch names, commit hashes, and git plumbing.",
+            "- If the worker completed the task or requested landing (`land_approval=pending`), share ONE concise human-friendly summary (prefer 1-3 sentences of plain prose; mention it is ready for review/approval if pending). If there are detailed multi-file changes or verification logs worth inspecting, you can attach them via `report(summary, { filename: 'report.md', mime_type: 'text/markdown', content: details })` so they open in an expandable report card. Omit internal session IDs, branch names, commit hashes, and git plumbing.",
             "- If a durable project fact, agreement, or decision was uncovered, save it via `soul_replace` or `soul_write`.",
           ].join("\n"),
           session.id,
@@ -1117,13 +1155,21 @@ export class SessionManager {
     session: SessionRow,
     text: string,
     artifactInput?: { filename?: string; mime_type?: string; base64?: string },
+    inThread?: boolean,
   ): Promise<{ message_id: string | null; artifact_id: string | null }> {
     const bot = this.db.getUser(session.bot_id);
     if (!bot) throw new Error("Bot not found");
 
     const ctx = this.activeContexts.get(session.id);
     const conversationId = ctx?.conversationId || session.conversation_id;
-    const threadId = ctx ? ctx.threadId : session.thread_id;
+    const effectiveThreadId =
+      session.kind === "worker"
+        ? (ctx ? ctx.threadId : session.thread_id)
+        : inThread === true
+          ? (ctx?.threadId ?? ctx?.spawnedThreadId ?? ctx?.triggerMessageId ?? null)
+          : inThread === false
+            ? null
+            : (ctx?.spawnedThreadId ?? ctx?.threadId ?? null);
     if (!conversationId) {
       throw new Error("No target conversation for report");
     }
@@ -1151,13 +1197,18 @@ export class SessionManager {
         mimeType: artifactInput.mime_type || "text/plain",
         byteSize: bytes.byteLength,
         filename: artifactInput.filename ?? null,
-        sessionId: session.id,
+        sessionId:
+          session.kind === "orchestrator"
+            ? (ctx?.sourceWorkerId ?? session.id)
+            : session.id,
         conversationId: conv.id,
       });
-      this.wsServer.broadcastToConversation(conv, {
-        type: "artifact.new",
-        artifact: artifactRow,
-      });
+      if (session.kind === "worker") {
+        this.wsServer.broadcastToConversation(conv, {
+          type: "artifact.new",
+          artifact: artifactRow,
+        });
+      }
     }
 
     const updatedSession = this.db.updateSession(session.id, { last_report: text })!;
@@ -1173,7 +1224,7 @@ export class SessionManager {
     const msg = this.publishOrchestratorMessage({
       bot,
       conversation: conv,
-      threadId,
+      threadId: effectiveThreadId,
       body: text,
       artifactRow,
       sourceWorkerId: ctx?.sourceWorkerId,
