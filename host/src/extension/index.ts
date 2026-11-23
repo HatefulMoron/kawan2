@@ -298,6 +298,77 @@ export default function (pi: ExtensionAPI) {
         }
       },
     });
+
+    pi.registerTool({
+      name: "create_issue",
+      label: "Create Issue",
+      description: "Create a new durable markdown Issue (#N) with its own conversation room.",
+      parameters: Type.Object({
+        title: Type.String({ description: "Short issue title" }),
+        body_md: Type.Optional(Type.String({ description: "Markdown specification and acceptance notes" })),
+        implementer_bot_id: Type.Optional(Type.String({ description: "Optional implementer bot ID" })),
+        parent_issue_id: Type.Optional(Type.String({ description: "Optional parent epic issue ID or #N" })),
+      }),
+      async execute(_toolCallId, params) {
+        try {
+          const res = await callHost("create_issue", {
+            title: params.title,
+            ...(params.body_md !== undefined ? { body_md: params.body_md } : {}),
+            ...(params.implementer_bot_id ? { implementer_bot_id: params.implementer_bot_id } : {}),
+            ...(params.parent_issue_id ? { parent_issue_id: params.parent_issue_id } : {}),
+          });
+          return textResult(res);
+        } catch (err) {
+          return textResult(err instanceof Error ? err.message : String(err), true);
+        }
+      },
+    });
+
+    pi.registerTool({
+      name: "update_issue",
+      label: "Update Issue",
+      description: "Update an existing issue's title, markdown spec, or settings.",
+      parameters: Type.Object({
+        issue_ref: Type.String({ description: "Issue ID or #number (e.g. '#1')" }),
+        title: Type.Optional(Type.String({ description: "Updated title" })),
+        body_md: Type.Optional(Type.String({ description: "Updated markdown specification" })),
+        implementer_bot_id: Type.Optional(Type.String({ description: "Implementer bot ID" })),
+      }),
+      async execute(_toolCallId, params) {
+        try {
+          const res = await callHost("update_issue", {
+            issue_ref: params.issue_ref,
+            ...(params.title !== undefined ? { title: params.title } : {}),
+            ...(params.body_md !== undefined ? { body_md: params.body_md } : {}),
+            ...(params.implementer_bot_id !== undefined
+              ? { implementer_bot_id: params.implementer_bot_id }
+              : {}),
+          });
+          return textResult(res);
+        } catch (err) {
+          return textResult(err instanceof Error ? err.message : String(err), true);
+        }
+      },
+    });
+
+    pi.registerTool({
+      name: "list_issues",
+      label: "List Issues",
+      description: "List repository issues and their current workflow statuses.",
+      parameters: Type.Object({
+        status: Type.Optional(Type.String({ description: "Optional status filter" })),
+      }),
+      async execute(_toolCallId, params) {
+        try {
+          const res = await callHost("list_issues", {
+            ...(params.status ? { status: params.status } : {}),
+          });
+          return textResult(res);
+        } catch (err) {
+          return textResult(err instanceof Error ? err.message : String(err), true);
+        }
+      },
+    });
   } else if (role === "queue") {
     pi.registerTool({
       name: "resume_and_land",
@@ -348,6 +419,63 @@ export default function (pi: ExtensionAPI) {
       async execute(_toolCallId, params) {
         try {
           const res = await callHost("land_request", { summary: params.summary ?? "" });
+          return textResult(res);
+        } catch (err) {
+          return textResult(err instanceof Error ? err.message : String(err), true);
+        }
+      },
+    });
+
+    pi.registerTool({
+      name: "ask_owner",
+      label: "Ask Issue Owner",
+      description:
+        "Pause this issue session in needs_input status and ping the issue owner directly with a question.",
+      parameters: Type.Object({
+        question: Type.String({ description: "Clear question for the issue owner" }),
+      }),
+      async execute(_toolCallId, params) {
+        try {
+          const res = await callHost("ask_owner", { question: params.question });
+          return textResult(res);
+        } catch (err) {
+          return textResult(err instanceof Error ? err.message : String(err), true);
+        }
+      },
+    });
+
+    pi.registerTool({
+      name: "sync_with_main",
+      label: "Sync With Main",
+      description:
+        "Fetch the latest default branch from origin bare repo and rebase committed changes onto it cleanly.",
+      parameters: Type.Object({}),
+      async execute() {
+        try {
+          const res = await callHost("sync_with_main", {});
+          return textResult(res);
+        } catch (err) {
+          return textResult(err instanceof Error ? err.message : String(err), true);
+        }
+      },
+    });
+
+    pi.registerTool({
+      name: "update_issue",
+      label: "Update Issue Spec",
+      description: "Update the markdown specification or title for the active issue (#N).",
+      parameters: Type.Object({
+        issue_ref: Type.Optional(Type.String({ description: "Issue ID or #number (defaults to current issue)" })),
+        title: Type.Optional(Type.String({ description: "Updated title" })),
+        body_md: Type.Optional(Type.String({ description: "Updated markdown specification" })),
+      }),
+      async execute(_toolCallId, params) {
+        try {
+          const res = await callHost("update_issue", {
+            ...(params.issue_ref ? { issue_ref: params.issue_ref } : {}),
+            ...(params.title !== undefined ? { title: params.title } : {}),
+            ...(params.body_md !== undefined ? { body_md: params.body_md } : {}),
+          });
           return textResult(res);
         } catch (err) {
           return textResult(err instanceof Error ? err.message : String(err), true);

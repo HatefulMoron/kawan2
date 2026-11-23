@@ -406,6 +406,123 @@ pub struct StatusRepoInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueReviewer {
+    pub id: String,
+    pub issue_id: String,
+    pub bot_id: String,
+    #[serde(default)]
+    pub focus: Option<String>,
+    #[serde(default)]
+    pub order_index: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueReview {
+    pub id: String,
+    pub issue_id: String,
+    pub round: u64,
+    pub reviewer_slot_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub verdict: String,
+    pub summary: String,
+    #[serde(default)]
+    pub notes_artifact_id: Option<String>,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueSummary {
+    pub id: String,
+    pub number: u64,
+    pub conversation_id: String,
+    pub title: String,
+    #[serde(default)]
+    pub body_md: String,
+    pub status: String,
+    pub owner_id: String,
+    #[serde(default)]
+    pub implementer_bot_id: Option<String>,
+    #[serde(default)]
+    pub auto_start_review: bool,
+    #[serde(default)]
+    pub landing_mode: String,
+    #[serde(default)]
+    pub max_rounds: u64,
+    #[serde(default)]
+    pub current_round: u64,
+    #[serde(default)]
+    pub active_session_id: Option<String>,
+    #[serde(default)]
+    pub parent_issue_id: Option<String>,
+    #[serde(default)]
+    pub needs_input_question: Option<String>,
+    #[serde(default)]
+    pub behind_main: u64,
+    #[serde(default)]
+    pub reviewers: Vec<IssueReviewer>,
+    #[serde(default)]
+    pub reviews: Vec<IssueReview>,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueListData {
+    pub issues: Vec<IssueSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueActionData {
+    pub issue: IssueSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueAssignData {
+    pub issue: IssueSummary,
+    pub session: SessionSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuePromoteData {
+    pub issue: IssueSummary,
+    pub conversation: Conversation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueSyncData {
+    pub ok: bool,
+    pub behind_before: u64,
+    pub behind_after: u64,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub issue: IssueSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueStartReviewData {
+    pub issue: IssueSummary,
+    pub ok: bool,
+    #[serde(default)]
+    pub checks: Vec<CheckRunItem>,
+    #[serde(default)]
+    pub land: Option<Land>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IssueOpenData {
+    pub issue: IssueSummary,
+    pub conversation: Conversation,
+    pub members: Vec<Member>,
+    pub messages: Vec<Message>,
+    #[serde(default)]
+    pub decisions: Vec<Decision>,
+    pub sessions: Vec<SessionSummary>,
+    pub artifacts: Vec<Artifact>,
+    pub lands: Vec<Land>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusReadData {
     pub repo: Option<StatusRepoInfo>,
     #[serde(default)]
@@ -414,6 +531,8 @@ pub struct StatusReadData {
     pub lands: Vec<Land>,
     #[serde(default)]
     pub artifacts: Vec<Artifact>,
+    #[serde(default)]
+    pub issues: Vec<IssueSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -504,6 +623,8 @@ pub enum ServerFrame {
     LandUpdate { land: Land },
     #[serde(rename = "merge_queue.update")]
     MergeQueueUpdate { queue: Box<MergeQueueSnapshot> },
+    #[serde(rename = "issue.update")]
+    IssueUpdate { issue: Box<IssueSummary> },
     #[serde(rename = "read_cursor.update")]
     ReadCursorUpdate {
         conversation_id: String,

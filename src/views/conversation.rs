@@ -49,6 +49,12 @@ pub(crate) fn short_status_label(status: &str) -> &'static str {
     match status {
         "running" => "running",
         "pending_approval" => "proposed",
+        "backlog" => "backlog",
+        "implementing" => "implementing",
+        "reviewing" => "reviewing",
+        "needs_input" => "needs input",
+        "ready_to_land" => "ready",
+        "closed" => "closed",
         "queued" => "queued",
         "rebasing" => "rebasing",
         "verifying" => "verifying",
@@ -92,6 +98,10 @@ pub fn left_rail(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
         .filter(|c| c.kind == "dm")
         .collect();
     let status_active = matches!(app.screen, Screen::Workspace(WorkspacePage::Status));
+    let issues_active = matches!(
+        app.screen,
+        Screen::Workspace(WorkspacePage::Issues | WorkspacePage::IssueDetail(_))
+    );
     let mq_active = matches!(app.screen, Screen::Workspace(WorkspacePage::MergeQueue));
     let conv_page_active = matches!(app.screen, Screen::Workspace(WorkspacePage::Conversation));
     let settings_active = matches!(app.screen, Screen::Workspace(WorkspacePage::Settings(_)));
@@ -242,6 +252,91 @@ pub fn left_rail(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
             cx.notify();
         }));
 
+    let open_issues_count = app
+        .issues_by_id
+        .values()
+        .filter(|i| !matches!(i.status.as_str(), "landed" | "closed"))
+        .count();
+    let needs_input_issues_count = app
+        .issues_by_id
+        .values()
+        .filter(|i| i.status == "needs_input")
+        .count();
+    let issues_unread = app.issues_by_id.values().any(|i| {
+        let open_here = matches!(
+            &app.screen,
+            Screen::Workspace(WorkspacePage::IssueDetail(open_id)) if open_id == &i.id
+        );
+        !open_here
+            && app
+                .conversations
+                .iter()
+                .find(|c| c.id == i.conversation_id)
+                .is_some_and(|c| c.unread_count > 0)
+    });
+    let (issues_badge_label, issues_badge_color) = if needs_input_issues_count > 0 {
+        (
+            format!("{needs_input_issues_count} input"),
+            theme::hex(theme::CATEGORY_VALS),
+        )
+    } else if open_issues_count > 0 {
+        (
+            format!("{open_issues_count} open"),
+            theme::hex(theme::CATEGORY_ACADEMIC),
+        )
+    } else {
+        (String::new(), theme.fg_tertiary)
+    };
+
+    let mut issues_row = div()
+        .id("rail-issues")
+        .h(px(30.0))
+        .px(px(8.0))
+        .rounded(px(2.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(8.0))
+        .cursor_pointer();
+    issues_row = if issues_active {
+        issues_row
+            .relative()
+            .overflow_hidden()
+            .bg(theme::with_alpha(theme.palette.vivid, 0.09))
+            .child(kit::left_edge(theme.dark))
+    } else {
+        issues_row.hover(|s| s.bg(theme.hover))
+    };
+    let issues_row = issues_row
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(kit::icon("kawan/issue.svg", 13.0, theme.dark))
+                .child(theme::label("Issues", 13.0, theme.ink)),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .children(issues_unread.then(|| kit::swatch(theme.vivid, px(5.0))))
+                .children((!issues_badge_label.is_empty()).then(|| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .child(kit::swatch(issues_badge_color, px(5.0)))
+                        .child(theme::micro(issues_badge_label, 8.0, theme.fg_tertiary))
+                })),
+        )
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.open_issues();
+            window.focus(&this.focus_handle, cx);
+            cx.notify();
+        }));
+
     let nav_section = div()
         .flex()
         .flex_col()
@@ -252,7 +347,8 @@ pub fn left_rail(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
             theme.fg_tertiary,
         )))
         .child(status_row)
-        .child(merge_queue_row);
+        .child(merge_queue_row)
+        .child(issues_row);
 
     let mut ch_section = div().flex().flex_col().gap(px(3.0)).child(
         div()
@@ -1168,6 +1264,10 @@ fn bot_tasks_panel(
                 let sid_confirm = sess.id.clone();
                 let sid_dismiss = sess.id.clone();
                 let sid_stop = sess.id.clone();
+                let sid_promote = sess.id.clone();
+                let linked_issue = app
+                    .issue_for_session(&sess.id)
+                    .map(|i| (i.id.clone(), i.number));
                 let title = session_display_title(sess);
                 let origin = sess
                     .conversation_id
@@ -1221,6 +1321,30 @@ fn bot_tasks_panel(
                             .flex()
                             .items_center()
                             .gap(px(6.0))
+                            .children(match linked_issue {
+                                Some((iid, num)) => Some(
+                                    kit::ghost_button(
+                                        ("dm-task-issue", ti),
+                                        format!("#{num}"),
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_issue(&iid);
+                                        window.focus(&this.focus_handle, cx);
+                                        cx.notify();
+                                    }))
+                                    .into_any_element(),
+                                ),
+                                None if !is_pending => Some(
+                                    kit::ghost_button(("dm-task-promote", ti), "Promote", theme)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.promote_session_to_issue(&sid_promote);
+                                            cx.notify();
+                                        }))
+                                        .into_any_element(),
+                                ),
+                                None => None,
+                            })
                             .child(
                                 kit::ghost_button(("dm-task-inspect", ti), "Inspect", theme)
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1484,6 +1608,13 @@ fn thread_tray(
     let thread_running_sess = app.sessions_by_id.values().find(|s| {
         s.kind == "worker" && s.thread_id.as_deref() == Some(parent_msg_id) && s.status == "running"
     });
+    let mut thread_workers: Vec<&SessionSummary> = app
+        .sessions_by_id
+        .values()
+        .filter(|s| s.kind == "worker" && s.thread_id.as_deref() == Some(parent_msg_id))
+        .collect();
+    thread_workers.sort_by_key(|s| s.updated_at);
+    let thread_worker_sess = thread_workers.last().copied();
     let thread_running = thread_running_sess.is_some();
     let thread_pending = app.sessions_by_id.values().any(|s| {
         s.kind == "worker"
@@ -1629,6 +1760,30 @@ fn thread_tray(
                 },
             )),
         );
+    }
+
+    if let Some(ws) = thread_worker_sess {
+        if let Some(issue) = app.issue_for_session(&ws.id) {
+            let iid = issue.id.clone();
+            tray = tray.child(
+                kit::ghost_button(("tray-issue", mi), format!("#{}", issue.number), theme)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_issue(&iid);
+                        window.focus(&this.focus_handle, cx);
+                        cx.notify();
+                    })),
+            );
+        } else if ws.status != "pending_approval" {
+            let sid_promote = ws.id.clone();
+            tray = tray.child(
+                kit::ghost_button(("tray-promote", mi), "Promote", theme).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.promote_session_to_issue(&sid_promote);
+                        cx.notify();
+                    },
+                )),
+            );
+        }
     }
 
     if let Some(land) = thread_land {
@@ -2674,6 +2829,10 @@ fn session_drawer_body(
     let sid_confirm = session_id.to_string();
     let sid_dismiss = session_id.to_string();
     let sid_stop = session_id.to_string();
+    let sid_promote = session_id.to_string();
+    let linked_issue = app
+        .issue_for_session(session_id)
+        .map(|i| (i.id.clone(), i.number));
     let mut container = div()
         .id("drawer-session-scroll")
         .flex_1()
@@ -2695,35 +2854,77 @@ fn session_drawer_body(
                     status_color_hex(&sess.status),
                     theme,
                 ))
-                .children((sess.status == "running").then(|| {
-                    kit::ghost_button("drawer-sess-stop", "Stop", theme).on_click(cx.listener(
-                        move |this, _, _, cx| {
-                            this.stop_session(&sid_stop);
-                            cx.notify();
-                        },
-                    ))
-                }))
-                .children((sess.status == "pending_approval").then(|| {
+                .child(
                     div()
                         .flex()
                         .items_center()
                         .gap(px(6.0))
-                        .child(
-                            kit::ghost_button("drawer-sess-dismiss", "Dismiss", theme).on_click(
+                        .children(
+                            (sess.kind == "worker")
+                                .then(|| {
+                                    if let Some((iid, num)) = linked_issue.clone() {
+                                        Some(
+                                            kit::ghost_button(
+                                                "drawer-sess-issue",
+                                                format!("Issue #{num}"),
+                                                theme,
+                                            )
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.open_issue(&iid);
+                                                window.focus(&this.focus_handle, cx);
+                                                cx.notify();
+                                            }))
+                                            .into_any_element(),
+                                        )
+                                    } else if sess.status != "pending_approval" {
+                                        let sid_p = sid_promote.clone();
+                                        Some(
+                                            kit::ghost_button(
+                                                "drawer-sess-promote",
+                                                "Promote to Issue",
+                                                theme,
+                                            )
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.promote_session_to_issue(&sid_p);
+                                                cx.notify();
+                                            }))
+                                            .into_any_element(),
+                                        )
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .flatten(),
+                        )
+                        .children((sess.status == "running").then(|| {
+                            kit::ghost_button("drawer-sess-stop", "Stop", theme).on_click(
                                 cx.listener(move |this, _, _, cx| {
-                                    this.dismiss_session(&sid_dismiss);
+                                    this.stop_session(&sid_stop);
                                     cx.notify();
                                 }),
-                            ),
-                        )
-                        .child(
-                            kit::small_primary_button("drawer-sess-start", "Start", theme)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.confirm_session(&sid_confirm);
-                                    cx.notify();
-                                })),
-                        )
-                })),
+                            )
+                        }))
+                        .children((sess.status == "pending_approval").then(|| {
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    kit::ghost_button("drawer-sess-dismiss", "Dismiss", theme)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.dismiss_session(&sid_dismiss);
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    kit::small_primary_button("drawer-sess-start", "Start", theme)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.confirm_session(&sid_confirm);
+                                            cx.notify();
+                                        })),
+                                )
+                        })),
+                ),
         )
         .child(tab_bar);
 

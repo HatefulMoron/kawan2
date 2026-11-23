@@ -24,6 +24,17 @@ export type LandStatus =
   | "removed";
 export type MergeConflictPolicy = "pause_on_issue" | "auto_resolve_trivial";
 export type LandingMode = "manual" | "auto";
+export type IssueStatus =
+  | "backlog"
+  | "implementing"
+  | "verifying"
+  | "reviewing"
+  | "needs_input"
+  | "ready_to_land"
+  | "queued"
+  | "landed"
+  | "closed";
+export type ReviewVerdict = "approve" | "request_changes" | "needs_owner";
 
 export interface UserRow {
   id: string;
@@ -323,4 +334,51 @@ export interface SessionDiffSummary {
   truncated: boolean;
   files: SessionDiffFile[];
   note?: string;
+}
+
+export interface IssueRow {
+  id: string;
+  number: number;
+  conversation_id: string;
+  title: string;
+  body_md: string;
+  status: IssueStatus;
+  owner_id: string;
+  implementer_bot_id: string | null;
+  auto_start_review: number;
+  landing_mode: LandingMode;
+  max_rounds: number;
+  current_round: number;
+  active_session_id: string | null;
+  parent_issue_id: string | null;
+  needs_input_question: string | null;
+  behind_main: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface IssueReviewerRow {
+  id: string;
+  issue_id: string;
+  bot_id: string;
+  focus: string | null;
+  order_index: number;
+}
+
+export interface IssueReviewRow {
+  id: string;
+  issue_id: string;
+  round: number;
+  reviewer_slot_id: string;
+  session_id: string | null;
+  verdict: ReviewVerdict;
+  summary: string;
+  notes_artifact_id: string | null;
+  created_at: number;
+}
+
+export interface SerializedIssue extends Omit<IssueRow, "auto_start_review"> {
+  auto_start_review: boolean;
+  reviewers: IssueReviewerRow[];
+  reviews: IssueReviewRow[];
 }

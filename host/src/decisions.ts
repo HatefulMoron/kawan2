@@ -330,15 +330,24 @@ export function buildRouteMessagePayload(input: {
     },
   };
 
+  const convLabel =
+    input.conversation.kind === "dm"
+      ? "a direct message with the bot"
+      : input.conversation.kind === "issue"
+        ? `issue room ${input.conversation.name ?? "#issue"}`
+        : `#${input.conversation.name ?? "channel"}`;
+  const issueRoutingHint =
+    input.conversation.kind === "issue" && input.activeSessions.length > 0
+      ? " In an issue room with an active implementer session, implementation feedback or steering for the bot belongs to that session:<id>, while human-to-human discussion stays none."
+      : "";
+
   const questions = {
     destination: {
       type: "choice",
       instructions:
-        `Decide whether incoming_message (from ${input.incomingAuthor.name} in ${
-          input.conversation.kind === "dm" ? "a direct message with the bot" : `#${input.conversation.name ?? "channel"}`
-        }) belongs to no one (none), the bot's orchestrator (orchestrator), or a specific active worker session (session:<id>). ` +
+        `Decide whether incoming_message (from ${input.incomingAuthor.name} in ${convLabel}) belongs to no one (none), the bot's orchestrator (orchestrator), or a specific active worker session (session:<id>). ` +
         `Note: in a DM with the bot, messages are normally for the bot unless purely social closing remarks like 'thanks'. ` +
-        `If held_messages_waiting_for_completion is non-empty and incoming_message completes the thought, route to the bot.`,
+        `If held_messages_waiting_for_completion is non-empty and incoming_message completes the thought, route to the bot.${issueRoutingHint}`,
       criteria: destinationCriteria,
     },
     readiness: {

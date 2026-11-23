@@ -43,6 +43,7 @@ export class MergeQueueManager {
   private loopRunning = false;
   private closed = false;
   private settlementWaiters = new Map<string, Array<(land: LandRow) => void>>();
+  private onIssueLandSync?: (land: LandRow) => void;
 
   constructor(opts: {
     dataDir: string;
@@ -62,6 +63,17 @@ export class MergeQueueManager {
       ejectToImplementer: (queueSession, reason) =>
         this.handleBotEjectToImplementer(queueSession, reason),
     });
+  }
+
+  setIssueSyncCallback(cb: (land: LandRow) => void): void {
+    this.onIssueLandSync = cb;
+  }
+
+  private emitLandUpdate(land: LandRow): void {
+    this.wsServer.broadcast({ type: "land.update", land: serializeLand(land) });
+    if (this.onIssueLandSync) {
+      this.onIssueLandSync(land);
+    }
   }
 
   async close(): Promise<void> {
@@ -235,7 +247,7 @@ export class MergeQueueManager {
         pause_reason: null,
         error: null,
       })!;
-      this.wsServer.broadcast({ type: "land.update", land: serializeLand(updated) });
+      this.emitLandUpdate(updated);
     }
     this.setPausedFlag(false);
     this.broadcastSnapshot();
@@ -300,7 +312,7 @@ export class MergeQueueManager {
       pause_reason: null,
       error: null,
     })!;
-    this.wsServer.broadcast({ type: "land.update", land: serializeLand(queuedLand) });
+    this.emitLandUpdate(queuedLand);
     this.broadcastSnapshot();
 
     const waitForSettlement = params.waitForSettlement ?? false;
@@ -379,7 +391,7 @@ export class MergeQueueManager {
       pause_reason: null,
       error: null,
     })!;
-    this.wsServer.broadcast({ type: "land.update", land: serializeLand(rebasing) });
+    this.emitLandUpdate(rebasing);
     this.broadcastSnapshot();
 
     let prep;
@@ -427,7 +439,7 @@ export class MergeQueueManager {
       base_sha: prep.baseSha,
       touches_kawan: prep.touchesKawan ? 1 : 0,
     })!;
-    this.wsServer.broadcast({ type: "land.update", land: serializeLand(verifying) });
+    this.emitLandUpdate(verifying);
     this.broadcastSnapshot();
 
     const checkRes = await runRepoChecks({
@@ -534,7 +546,7 @@ export class MergeQueueManager {
       }
     }
     this.setPausedFlag(false);
-    this.wsServer.broadcast({ type: "land.update", land: serializeLand(landed) });
+    this.emitLandUpdate(landed);
     this.wsServer.broadcast({
       type: "session.update",
       session: this.sessionManager.serializePublicSession(updatedSession),
@@ -650,7 +662,7 @@ export class MergeQueueManager {
       queue_thread_id: incidentMsgId ?? null,
     })!;
 
-    this.wsServer.broadcast({ type: "land.update", land: serializeLand(pausedLand) });
+    this.emitLandUpdate(pausedLand);
     this.resolveWaiters(pausedLand);
     this.resolveAllPendingWaiters();
     this.broadcastSnapshot();
@@ -666,7 +678,7 @@ export class MergeQueueManager {
         taskTitle: params.taskTitle,
       });
       pausedLand = this.db.updateLand(pausedLand.id, { queue_session_id: qSess.id })!;
-      this.wsServer.broadcast({ type: "land.update", land: serializeLand(pausedLand) });
+      this.emitLandUpdate(pausedLand);
       this.broadcastSnapshot();
 
       const diagnosticPrompt = [
@@ -744,7 +756,7 @@ export class MergeQueueManager {
       }
 
       const verifying = this.db.updateLand(land.id, { status: "verifying" })!;
-      this.wsServer.broadcast({ type: "land.update", land: serializeLand(verifying) });
+      this.emitLandUpdate(verifying);
       this.broadcastSnapshot();
 
       const checkRes = await runRepoChecks({
@@ -763,7 +775,7 @@ export class MergeQueueManager {
           verify_output: checkRes.combined_output,
           checks_json: JSON.stringify(checks),
         })!;
-        this.wsServer.broadcast({ type: "land.update", land: serializeLand(pausedAgain) });
+        this.emitLandUpdate(pausedAgain);
         this.broadcastSnapshot();
         throw new Error(`Checks failed (${checkRes.summary}):\n${checkRes.combined_output}`);
       }
@@ -837,7 +849,7 @@ export class MergeQueueManager {
         pause_reason: null,
         error: null,
       })!;
-      this.wsServer.broadcast({ type: "land.update", land: serializeLand(requeued) });
+      this.emitLandUpdate(requeued);
       this.setPausedFlag(false);
       this.broadcastSnapshot();
       setImmediate(() => {
@@ -872,7 +884,7 @@ export class MergeQueueManager {
         pause_reason: null,
         error: reason,
       })!;
-      this.wsServer.broadcast({ type: "land.update", land: serializeLand(updated) });
+      this.emitLandUpdate(updated);
 
       const worker = this.db.getSession(land.session_id);
       if (worker && worker.status !== "landed") {
@@ -948,7 +960,7 @@ export class MergeQueueManager {
         pause_reason: null,
         error: null,
       })!;
-      this.wsServer.broadcast({ type: "land.update", land: serializeLand(restored) });
+      this.emitLandUpdate(restored);
 
       const worker = this.db.getSession(land.session_id);
       if (worker && worker.status !== "landed") {

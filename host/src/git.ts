@@ -716,3 +716,80 @@ export async function getSessionDiff(params: {
   };
 }
 
+export async function commitsBehindMain(
+  barePath: string,
+  clonePath: string,
+  defaultBranch: string,
+): Promise<number> {
+  if (!existsSync(clonePath)) return 0;
+  try {
+    await runGit(["-C", clonePath, "fetch", barePath, defaultBranch]);
+    const { stdout } = await runGit(["-C", clonePath, "rev-list", "--count", "HEAD..FETCH_HEAD"]);
+    return Number.parseInt(stdout.trim(), 10) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+export async function syncBranchWithMain(params: {
+  barePath: string;
+  clonePath: string;
+  defaultBranch: string;
+}): Promise<{
+  ok: boolean;
+  behindBefore: number;
+  behindAfter: number;
+  headSha?: string;
+  conflicted?: boolean;
+  error?: string;
+}> {
+  if (!existsSync(params.clonePath)) {
+    return {
+      ok: false,
+      behindBefore: 0,
+      behindAfter: 0,
+      error: "Worker clone directory is missing",
+    };
+  }
+  const clean = await isWorkingTreeClean(params.clonePath);
+  if (!clean) {
+    return {
+      ok: false,
+      behindBefore: 0,
+      behindAfter: 0,
+      error: "Working tree has uncommitted changes; commit or discard before syncing with main.",
+    };
+  }
+  await runGit(["-C", params.clonePath, "fetch", params.barePath, params.defaultBranch]);
+  const { stdout: countOut } = await runGit([
+    "-C",
+    params.clonePath,
+    "rev-list",
+    "--count",
+    "HEAD..FETCH_HEAD",
+  ]);
+  const behindBefore = Number.parseInt(countOut.trim(), 10) || 0;
+  if (behindBefore === 0) {
+    const headSha = await getBranchHead(params.clonePath, "HEAD");
+    return { ok: true, behindBefore: 0, behindAfter: 0, headSha };
+  }
+  try {
+    await runGit(["-C", params.clonePath, "rebase", "FETCH_HEAD"]);
+    const headSha = await getBranchHead(params.clonePath, "HEAD");
+    return { ok: true, behindBefore, behindAfter: 0, headSha };
+  } catch (err) {
+    try {
+      await runGit(["-C", params.clonePath, "rebase", "--abort"]);
+    } catch {
+      // ignore if rebase already aborted
+    }
+    return {
+      ok: false,
+      behindBefore,
+      behindAfter: behindBefore,
+      conflicted: true,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+

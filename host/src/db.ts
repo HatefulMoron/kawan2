@@ -8,11 +8,18 @@ import type {
   DecisionRow,
   HostSettings,
   InviteRow,
+  IssueReviewRow,
+  IssueReviewerRow,
+  IssueRow,
+  IssueStatus,
   KeyRow,
   LandRow,
   LandStatus,
+  LandingMode,
   MessageRow,
   ReadCursorRow,
+  ReviewVerdict,
+  SerializedIssue,
   SessionKind,
   SessionRow,
   SessionStatus,
@@ -389,6 +396,47 @@ export class KawanDb {
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (user_id, conversation_id)
       );
+
+      CREATE TABLE IF NOT EXISTS issues (
+        id TEXT PRIMARY KEY,
+        number INTEGER NOT NULL UNIQUE,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        body_md TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL CHECK(status IN ('backlog', 'implementing', 'verifying', 'reviewing', 'needs_input', 'ready_to_land', 'queued', 'landed', 'closed')),
+        owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        implementer_bot_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        auto_start_review INTEGER NOT NULL DEFAULT 0,
+        landing_mode TEXT NOT NULL DEFAULT 'manual',
+        max_rounds INTEGER NOT NULL DEFAULT 3,
+        current_round INTEGER NOT NULL DEFAULT 0,
+        active_session_id TEXT,
+        parent_issue_id TEXT REFERENCES issues(id) ON DELETE SET NULL,
+        needs_input_question TEXT,
+        behind_main INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS issue_reviewers (
+        id TEXT PRIMARY KEY,
+        issue_id TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+        bot_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        focus TEXT,
+        order_index INTEGER NOT NULL DEFAULT 0
+      );
+
+      CREATE TABLE IF NOT EXISTS issue_reviews (
+        id TEXT PRIMARY KEY,
+        issue_id TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+        round INTEGER NOT NULL,
+        reviewer_slot_id TEXT NOT NULL,
+        session_id TEXT,
+        verdict TEXT NOT NULL CHECK(verdict IN ('approve', 'request_changes', 'needs_owner')),
+        summary TEXT NOT NULL,
+        notes_artifact_id TEXT,
+        created_at INTEGER NOT NULL
+      );
     `);
   }
 
@@ -623,6 +671,10 @@ export class KawanDb {
         .prepare("SELECT * FROM conversations WHERE kind = 'channel' AND name = ?")
         .get(name) as ConversationRow | undefined) ?? null
     );
+  }
+
+  updateConversationTopic(conversationId: string, topic: string | null): void {
+    this.sqlite.prepare("UPDATE conversations SET topic = ? WHERE id = ?").run(topic, conversationId);
   }
 
   findDmBetween(userA: string, userB: string): ConversationRow | null {
@@ -1268,6 +1320,7 @@ export class KawanDb {
     id: string,
     patch: Partial<{
       status: LandStatus;
+      conversation_id: string;
       thread_id: string | null;
       message_id: string | null;
       approved_by: string | null;
@@ -1290,7 +1343,7 @@ export class KawanDb {
     this.sqlite
       .prepare(
         `UPDATE lands SET
-          status = ?, thread_id = ?, message_id = ?, approved_by = ?, base_sha = ?, landed_sha = ?,
+          status = ?, conversation_id = ?, thread_id = ?, message_id = ?, approved_by = ?, base_sha = ?, landed_sha = ?,
           verify_output = ?, error = ?, queue_position = ?, issue_id = ?, pause_reason = ?,
           queue_session_id = ?, queue_thread_id = ?, trigger = ?, checks_json = ?, touches_kawan = ?,
           updated_at = ?
@@ -1298,6 +1351,7 @@ export class KawanDb {
       )
       .run(
         patch.status ?? existing.status,
+        patch.conversation_id !== undefined ? patch.conversation_id : existing.conversation_id,
         patch.thread_id !== undefined ? patch.thread_id : existing.thread_id,
         patch.message_id !== undefined ? patch.message_id : existing.message_id,
         patch.approved_by !== undefined ? patch.approved_by : existing.approved_by,
@@ -1353,5 +1407,240 @@ export class KawanDb {
     return this.sqlite
       .prepare("SELECT * FROM read_cursors WHERE user_id = ? AND conversation_id = ?")
       .get(userId, conversationId) as unknown as ReadCursorRow;
+  }
+
+  // ---- Issues ----
+  nextIssueNumber(): number {
+    const row = this.sqlite
+      .prepare("SELECT COALESCE(MAX(number), 0) + 1 AS next_num FROM issues")
+      .get() as { next_num: number };
+    return row.next_num;
+  }
+
+  createIssue(input: {
+    id?: string;
+    number?: number;
+    conversationId: string;
+    title: string;
+    bodyMd?: string;
+    status?: IssueStatus;
+    ownerId: string;
+    implementerBotId?: string | null;
+    autoStartReview?: boolean;
+    landingMode?: LandingMode;
+    maxRounds?: number;
+    currentRound?: number;
+    activeSessionId?: string | null;
+    parentIssueId?: string | null;
+    needsInputQuestion?: string | null;
+    behindMain?: number;
+  }): IssueRow {
+    const id = input.id ?? randomUUID();
+    const num = input.number ?? this.nextIssueNumber();
+    const now = Date.now();
+    this.sqlite
+      .prepare(
+        `INSERT INTO issues (
+          id, number, conversation_id, title, body_md, status, owner_id,
+          implementer_bot_id, auto_start_review, landing_mode, max_rounds, current_round,
+          active_session_id, parent_issue_id, needs_input_question, behind_main,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        id,
+        num,
+        input.conversationId,
+        input.title,
+        input.bodyMd ?? "",
+        input.status ?? "backlog",
+        input.ownerId,
+        input.implementerBotId ?? null,
+        input.autoStartReview ? 1 : 0,
+        input.landingMode ?? "manual",
+        input.maxRounds ?? 3,
+        input.currentRound ?? 0,
+        input.activeSessionId ?? null,
+        input.parentIssueId ?? null,
+        input.needsInputQuestion ?? null,
+        input.behindMain ?? 0,
+        now,
+        now,
+      );
+    return this.getIssue(id)!;
+  }
+
+  getIssue(id: string): IssueRow | null {
+    return (
+      (this.sqlite.prepare("SELECT * FROM issues WHERE id = ?").get(id) as IssueRow | undefined) ?? null
+    );
+  }
+
+  getIssueByNumber(num: number): IssueRow | null {
+    return (
+      (this.sqlite.prepare("SELECT * FROM issues WHERE number = ?").get(num) as IssueRow | undefined) ??
+      null
+    );
+  }
+
+  getIssueByConversationId(conversationId: string): IssueRow | null {
+    return (
+      (this.sqlite
+        .prepare("SELECT * FROM issues WHERE conversation_id = ?")
+        .get(conversationId) as IssueRow | undefined) ?? null
+    );
+  }
+
+  getIssueBySessionId(sessionId: string): IssueRow | null {
+    return (
+      (this.sqlite
+        .prepare("SELECT * FROM issues WHERE active_session_id = ?")
+        .get(sessionId) as IssueRow | undefined) ?? null
+    );
+  }
+
+  listIssues(filter?: { status?: IssueStatus; ownerId?: string }): IssueRow[] {
+    const clauses: string[] = [];
+    const params: Array<string> = [];
+    if (filter?.status) {
+      clauses.push("status = ?");
+      params.push(filter.status);
+    }
+    if (filter?.ownerId) {
+      clauses.push("owner_id = ?");
+      params.push(filter.ownerId);
+    }
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+    return this.sqlite
+      .prepare(`SELECT * FROM issues ${where} ORDER BY number DESC`)
+      .all(...params) as unknown as IssueRow[];
+  }
+
+  updateIssue(
+    id: string,
+    patch: Partial<{
+      title: string;
+      body_md: string;
+      status: IssueStatus;
+      owner_id: string;
+      implementer_bot_id: string | null;
+      auto_start_review: boolean | number;
+      landing_mode: LandingMode;
+      max_rounds: number;
+      current_round: number;
+      active_session_id: string | null;
+      parent_issue_id: string | null;
+      needs_input_question: string | null;
+      behind_main: number;
+    }>,
+  ): IssueRow | null {
+    const existing = this.getIssue(id);
+    if (!existing) return null;
+    const autoStart =
+      patch.auto_start_review !== undefined
+        ? patch.auto_start_review
+          ? 1
+          : 0
+        : existing.auto_start_review;
+    this.sqlite
+      .prepare(
+        `UPDATE issues SET
+          title = ?, body_md = ?, status = ?, owner_id = ?, implementer_bot_id = ?,
+          auto_start_review = ?, landing_mode = ?, max_rounds = ?, current_round = ?,
+          active_session_id = ?, parent_issue_id = ?, needs_input_question = ?,
+          behind_main = ?, updated_at = ?
+        WHERE id = ?`,
+      )
+      .run(
+        patch.title !== undefined ? patch.title : existing.title,
+        patch.body_md !== undefined ? patch.body_md : existing.body_md,
+        patch.status !== undefined ? patch.status : existing.status,
+        patch.owner_id !== undefined ? patch.owner_id : existing.owner_id,
+        patch.implementer_bot_id !== undefined ? patch.implementer_bot_id : existing.implementer_bot_id,
+        autoStart,
+        patch.landing_mode !== undefined ? patch.landing_mode : existing.landing_mode,
+        patch.max_rounds !== undefined ? patch.max_rounds : existing.max_rounds,
+        patch.current_round !== undefined ? patch.current_round : existing.current_round,
+        patch.active_session_id !== undefined ? patch.active_session_id : existing.active_session_id,
+        patch.parent_issue_id !== undefined ? patch.parent_issue_id : existing.parent_issue_id,
+        patch.needs_input_question !== undefined
+          ? patch.needs_input_question
+          : existing.needs_input_question,
+        patch.behind_main !== undefined ? patch.behind_main : existing.behind_main,
+        Date.now(),
+        id,
+      );
+    return this.getIssue(id);
+  }
+
+  setIssueReviewers(
+    issueId: string,
+    reviewers: Array<{ botId: string; focus?: string | null }>,
+  ): IssueReviewerRow[] {
+    return this.transaction(() => {
+      this.sqlite.prepare("DELETE FROM issue_reviewers WHERE issue_id = ?").run(issueId);
+      const stmt = this.sqlite.prepare(
+        `INSERT INTO issue_reviewers (id, issue_id, bot_id, focus, order_index)
+         VALUES (?, ?, ?, ?, ?)`,
+      );
+      for (let i = 0; i < reviewers.length; i += 1) {
+        const r = reviewers[i];
+        stmt.run(randomUUID(), issueId, r.botId, r.focus ?? null, i);
+      }
+      return this.listIssueReviewers(issueId);
+    });
+  }
+
+  listIssueReviewers(issueId: string): IssueReviewerRow[] {
+    return this.sqlite
+      .prepare("SELECT * FROM issue_reviewers WHERE issue_id = ? ORDER BY order_index ASC")
+      .all(issueId) as unknown as IssueReviewerRow[];
+  }
+
+  createIssueReview(input: {
+    id?: string;
+    issueId: string;
+    round: number;
+    reviewerSlotId: string;
+    sessionId?: string | null;
+    verdict: ReviewVerdict;
+    summary: string;
+    notesArtifactId?: string | null;
+  }): IssueReviewRow {
+    const id = input.id ?? randomUUID();
+    const now = Date.now();
+    this.sqlite
+      .prepare(
+        `INSERT INTO issue_reviews (
+          id, issue_id, round, reviewer_slot_id, session_id, verdict, summary, notes_artifact_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        id,
+        input.issueId,
+        input.round,
+        input.reviewerSlotId,
+        input.sessionId ?? null,
+        input.verdict,
+        input.summary,
+        input.notesArtifactId ?? null,
+        now,
+      );
+    return this.sqlite.prepare("SELECT * FROM issue_reviews WHERE id = ?").get(id) as unknown as IssueReviewRow;
+  }
+
+  listIssueReviews(issueId: string): IssueReviewRow[] {
+    return this.sqlite
+      .prepare("SELECT * FROM issue_reviews WHERE issue_id = ? ORDER BY round ASC, created_at ASC")
+      .all(issueId) as unknown as IssueReviewRow[];
+  }
+
+  serializeIssue(issue: IssueRow): SerializedIssue {
+    return {
+      ...issue,
+      auto_start_review: Boolean(issue.auto_start_review),
+      reviewers: this.listIssueReviewers(issue.id),
+      reviews: this.listIssueReviews(issue.id),
+    };
   }
 }

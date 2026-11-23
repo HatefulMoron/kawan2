@@ -26,6 +26,10 @@ static SVG_ASSETS: &[(&str, &[u8])] = &[
         br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#000" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="4.5" cy="3.5" r="1.5"/><circle cx="4.5" cy="12.5" r="1.5"/><circle cx="11.5" cy="9" r="1.5"/><path d="M4.5 5v6"/><path d="M4.5 5.5c0 2.5 2 3.5 5.5 3.5"/></svg>"##,
     ),
     (
+        "kawan/issue.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#000" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.5"/><circle cx="8" cy="8" r="1.3" fill="#000"/></svg>"##,
+    ),
+    (
         "kawan/send.svg",
         br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#000" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 13V3.5L13.5 8 3 12.5"/><path d="M3 8h5.5"/></svg>"##,
     ),

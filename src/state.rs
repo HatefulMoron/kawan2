@@ -12,10 +12,12 @@ use crate::mock;
 use crate::protocol::{
     Artifact, ArtifactGetData, BotCreateData, BotListData, BotSummary, Conversation,
     ConversationCreateData, ConversationListData, ConversationMarkReadData, ConversationOpenData,
-    Decision, InviteCreateData, Land, LandApproveData, Member, MergeQueueReadData,
-    MergeQueueSnapshot, Message, ModelsTestData, ServerFrame, SessionActionData, SessionDiffData,
-    SessionDiffSummary, SessionListData, SessionOpenData, SessionSummary, SettingsView,
-    SetupStatus, StatusReadData, StatusRepoInfo, UserListData, UserSummary, parse_invite_link,
+    Decision, InviteCreateData, IssueActionData, IssueAssignData, IssueListData, IssueOpenData,
+    IssuePromoteData, IssueStartReviewData, IssueSummary, IssueSyncData, Land, LandApproveData,
+    Member, MergeQueueReadData, MergeQueueSnapshot, Message, ModelsTestData, ServerFrame,
+    SessionActionData, SessionDiffData, SessionDiffSummary, SessionListData, SessionOpenData,
+    SessionSummary, SettingsView, SetupStatus, StatusReadData, StatusRepoInfo, UserListData,
+    UserSummary, parse_invite_link,
 };
 use crate::ssh::default_ssh_key_path;
 use crate::ws_client::{AuthMode, ConnectConfig, WsEvent, WsHandle};
@@ -27,10 +29,12 @@ pub enum Screen {
     Workspace(WorkspacePage),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspacePage {
     Status,
     MergeQueue,
+    Issues,
+    IssueDetail(String),
     Conversation,
     Settings(SettingsTab),
 }
@@ -79,6 +83,10 @@ pub enum FocusTarget {
     BotModel,
     BotThinking,
     InviteNote,
+    IssueTitle,
+    IssueBody,
+    IssueEditTitle,
+    IssueEditBody,
 }
 
 #[derive(Clone)]
@@ -130,6 +138,7 @@ pub struct KawanApp {
     pub artifacts_by_id: HashMap<String, Artifact>,
     pub lands_by_id: HashMap<String, Land>,
     pub merge_queue: Option<MergeQueueSnapshot>,
+    pub issues_by_id: HashMap<String, IssueSummary>,
     pub conv_errors: HashMap<String, Vec<ConversationError>>,
     pub loaded_artifacts: HashMap<String, LoadedArtifact>,
     pub expanded_artifacts: HashSet<String>,
@@ -148,6 +157,20 @@ pub struct KawanApp {
     pub show_add_member: bool,
     pub show_new_channel: bool,
     pub new_channel_name: String,
+
+    // Issues view state
+    pub issue_filter: String,
+    pub show_new_issue_form: bool,
+    pub new_issue_title: String,
+    pub new_issue_body: String,
+    pub editing_issue_id: Option<String>,
+    pub edit_issue_title: String,
+    pub edit_issue_body: String,
+    pub show_assign_panel: bool,
+    pub assign_bot_id: Option<String>,
+    pub assign_landing_mode: String,
+    pub assign_auto_review: bool,
+    pub expanded_issue_specs: HashSet<String>,
 
     // Settings form state
     pub repo_url_input: String,
@@ -239,6 +262,7 @@ impl KawanApp {
             artifacts_by_id: HashMap::new(),
             lands_by_id: HashMap::new(),
             merge_queue: None,
+            issues_by_id: HashMap::new(),
             conv_errors: HashMap::new(),
             loaded_artifacts: HashMap::new(),
             expanded_artifacts: HashSet::new(),
@@ -256,6 +280,19 @@ impl KawanApp {
             show_add_member: false,
             show_new_channel: false,
             new_channel_name: String::new(),
+
+            issue_filter: "all".to_string(),
+            show_new_issue_form: false,
+            new_issue_title: String::new(),
+            new_issue_body: String::new(),
+            editing_issue_id: None,
+            edit_issue_title: String::new(),
+            edit_issue_body: String::new(),
+            show_assign_panel: false,
+            assign_bot_id: None,
+            assign_landing_mode: "manual".to_string(),
+            assign_auto_review: false,
+            expanded_issue_specs: HashSet::new(),
 
             repo_url_input: String::new(),
             repo_branch_input: "main".to_string(),
@@ -493,8 +530,12 @@ impl KawanApp {
                     list.sort_by_key(|m| m.seq);
                 }
                 let viewing_active = matches!(
-                    self.screen,
-                    Screen::Workspace(WorkspacePage::Conversation | WorkspacePage::MergeQueue)
+                    &self.screen,
+                    Screen::Workspace(
+                        WorkspacePage::Conversation
+                            | WorkspacePage::MergeQueue
+                            | WorkspacePage::IssueDetail(_)
+                    )
                 ) && self.active_conversation_id.as_deref()
                     == Some(conv_id.as_str());
                 if let Some(conv) = self.conversations.iter_mut().find(|c| c.id == conv_id) {
@@ -563,6 +604,9 @@ impl KawanApp {
             }
             ServerFrame::MergeQueueUpdate { queue } => {
                 self.apply_merge_queue_snapshot(*queue);
+            }
+            ServerFrame::IssueUpdate { issue } => {
+                self.issues_by_id.insert(issue.id.clone(), *issue);
             }
             ServerFrame::ReadCursorUpdate {
                 conversation_id,
@@ -815,6 +859,96 @@ impl KawanApp {
                             self.send_cmd("artifact.get", json!({ "artifact_id": aid }));
                         }
                     }
+                    for issue in res.issues {
+                        self.issues_by_id.insert(issue.id.clone(), issue);
+                    }
+                }
+            }
+            "issue.list" => {
+                if let Ok(res) = serde_json::from_value::<IssueListData>(val) {
+                    for issue in res.issues {
+                        self.issues_by_id.insert(issue.id.clone(), issue);
+                    }
+                }
+            }
+            "issue.create" => {
+                if let Ok(res) = serde_json::from_value::<IssueActionData>(val) {
+                    let iid = res.issue.id.clone();
+                    self.issues_by_id.insert(iid.clone(), res.issue);
+                    self.show_new_issue_form = false;
+                    self.new_issue_title.clear();
+                    self.new_issue_body.clear();
+                    self.error_banner = None;
+                    self.open_issue(&iid);
+                }
+            }
+            "issue.promote" => {
+                if let Ok(res) = serde_json::from_value::<IssuePromoteData>(val) {
+                    let iid = res.issue.id.clone();
+                    self.upsert_conversation(res.conversation);
+                    self.issues_by_id.insert(iid.clone(), res.issue);
+                    self.error_banner = None;
+                    self.open_issue(&iid);
+                }
+            }
+            "issue.open" => {
+                if let Ok(res) = serde_json::from_value::<IssueOpenData>(val) {
+                    let cid = res.conversation.id.clone();
+                    self.issues_by_id.insert(res.issue.id.clone(), res.issue);
+                    self.upsert_conversation(res.conversation);
+                    self.members_by_conv.insert(cid.clone(), res.members);
+                    self.messages_by_conv.insert(cid.clone(), res.messages);
+                    self.decisions_by_conv.insert(cid, res.decisions);
+                    for sess in res.sessions {
+                        self.sessions_by_id.insert(sess.id.clone(), sess);
+                    }
+                    for art in res.artifacts {
+                        let aid = art.id.clone();
+                        self.artifacts_by_id.insert(aid.clone(), art);
+                        if !self.loaded_artifacts.contains_key(&aid) {
+                            self.send_cmd("artifact.get", json!({ "artifact_id": aid }));
+                        }
+                    }
+                    for land in res.lands {
+                        self.lands_by_id.insert(land.id.clone(), land);
+                    }
+                }
+            }
+            "issue.assign" => {
+                if let Ok(res) = serde_json::from_value::<IssueAssignData>(val) {
+                    self.issues_by_id.insert(res.issue.id.clone(), res.issue);
+                    self.sessions_by_id
+                        .insert(res.session.id.clone(), res.session);
+                    self.show_assign_panel = false;
+                    self.error_banner = None;
+                }
+            }
+            "issue.update" | "issue.return_to_collaborate" | "issue.stop" | "issue.close" => {
+                if let Ok(res) = serde_json::from_value::<IssueActionData>(val) {
+                    if command == "issue.update" {
+                        self.editing_issue_id = None;
+                    }
+                    self.issues_by_id.insert(res.issue.id.clone(), res.issue);
+                    self.error_banner = None;
+                }
+            }
+            "issue.sync_main" => {
+                if let Ok(res) = serde_json::from_value::<IssueSyncData>(val) {
+                    self.issues_by_id.insert(res.issue.id.clone(), res.issue);
+                    if !res.ok {
+                        self.error_banner = res.error;
+                    } else {
+                        self.error_banner = None;
+                    }
+                }
+            }
+            "issue.start_review" => {
+                if let Ok(res) = serde_json::from_value::<IssueStartReviewData>(val) {
+                    self.issues_by_id.insert(res.issue.id.clone(), res.issue);
+                    if let Some(land) = res.land {
+                        self.lands_by_id.insert(land.id.clone(), land);
+                    }
+                    self.error_banner = None;
                 }
             }
             "conversation.mark_read" => {
@@ -916,7 +1050,7 @@ impl KawanApp {
         } else {
             self.conversations.push(conv);
         }
-        if self.active_conversation_id.is_none() && kind != "merge_queue" {
+        if self.active_conversation_id.is_none() && kind != "merge_queue" && kind != "issue" {
             self.active_conversation_id = Some(cid.clone());
             self.send_cmd("conversation.open", json!({ "conversation_id": cid }));
         }
@@ -930,6 +1064,7 @@ impl KawanApp {
         self.send_cmd("session.list", json!({}));
         self.send_cmd("status.read", json!({}));
         self.send_cmd("merge_queue.read", json!({}));
+        self.send_cmd("issue.list", json!({}));
     }
 
     pub fn open_conversation(&mut self, conv_id: &str) {
@@ -1023,6 +1158,308 @@ impl KawanApp {
             SettingsTab::Models => FocusTarget::ProviderName,
             SettingsTab::Bots => FocusTarget::BotName,
         };
+    }
+
+    pub fn issue_for_session(&self, session_id: &str) -> Option<&IssueSummary> {
+        self.issues_by_id
+            .values()
+            .find(|i| i.active_session_id.as_deref() == Some(session_id))
+    }
+
+    pub fn issue_by_conv(&self, conv_id: &str) -> Option<&IssueSummary> {
+        self.issues_by_id
+            .values()
+            .find(|i| i.conversation_id == conv_id)
+    }
+
+    pub fn open_issues(&mut self) {
+        self.screen = Screen::Workspace(WorkspacePage::Issues);
+        self.right_panel = RightPanel::None;
+        self.redirect_menu_decision_id = None;
+        self.show_add_member = false;
+        self.editing_issue_id = None;
+        self.show_assign_panel = false;
+        if !self.is_mock {
+            self.send_cmd("issue.list", json!({}));
+        }
+    }
+
+    pub fn open_issue(&mut self, issue_id: &str) {
+        self.screen = Screen::Workspace(WorkspacePage::IssueDetail(issue_id.to_string()));
+        self.right_panel = RightPanel::None;
+        self.redirect_menu_decision_id = None;
+        self.show_add_member = false;
+        self.editing_issue_id = None;
+        self.show_assign_panel = false;
+        self.focus_target = FocusTarget::Composer;
+        if let Some(issue) = self.issues_by_id.get(issue_id).cloned() {
+            self.active_conversation_id = Some(issue.conversation_id.clone());
+            if let Some(conv) = self
+                .conversations
+                .iter_mut()
+                .find(|c| c.id == issue.conversation_id)
+            {
+                conv.last_read_seq = conv.last_read_seq.max(conv.last_seq);
+                conv.unread_count = 0;
+            }
+            if !self.is_mock {
+                self.send_cmd("issue.open", json!({ "issue_id": issue_id }));
+            }
+        }
+    }
+
+    pub fn create_issue(&mut self) {
+        let title = self.new_issue_title.trim().to_string();
+        let body = self.new_issue_body.trim().to_string();
+        if title.is_empty() {
+            self.error_banner = Some("Issue title is required.".to_string());
+            return;
+        }
+        self.error_banner = None;
+        if self.is_mock {
+            let num = self
+                .issues_by_id
+                .values()
+                .map(|i| i.number)
+                .max()
+                .unwrap_or(0)
+                + 1;
+            let iid = format!("mock-issue-{num}");
+            let cid = format!("mock-conv-issue-{num}");
+            self.upsert_conversation(Conversation {
+                id: cid.clone(),
+                kind: "issue".to_string(),
+                name: Some(format!("issue-{num}")),
+                topic: Some(title.clone()),
+                next_seq: 1,
+                created_at: 300,
+                last_seq: 0,
+                last_read_seq: 0,
+                unread_count: 0,
+                members: Vec::new(),
+            });
+            self.issues_by_id.insert(
+                iid.clone(),
+                IssueSummary {
+                    id: iid.clone(),
+                    number: num,
+                    conversation_id: cid,
+                    title,
+                    body_md: body,
+                    status: "backlog".to_string(),
+                    owner_id: self.current_user_id.clone(),
+                    implementer_bot_id: None,
+                    auto_start_review: false,
+                    landing_mode: "manual".to_string(),
+                    max_rounds: 3,
+                    current_round: 0,
+                    active_session_id: None,
+                    parent_issue_id: None,
+                    needs_input_question: None,
+                    behind_main: 0,
+                    reviewers: Vec::new(),
+                    reviews: Vec::new(),
+                    created_at: 300,
+                    updated_at: 300,
+                },
+            );
+            self.show_new_issue_form = false;
+            self.new_issue_title.clear();
+            self.new_issue_body.clear();
+            self.open_issue(&iid);
+            return;
+        }
+        self.send_cmd("issue.create", json!({ "title": title, "body_md": body }));
+    }
+
+    pub fn begin_edit_issue(&mut self, issue_id: &str) {
+        if let Some(issue) = self.issues_by_id.get(issue_id) {
+            self.editing_issue_id = Some(issue.id.clone());
+            self.edit_issue_title = issue.title.clone();
+            self.edit_issue_body = issue.body_md.clone();
+            self.focus_target = FocusTarget::IssueEditTitle;
+        }
+    }
+
+    pub fn save_edit_issue(&mut self, issue_id: &str) {
+        let title = self.edit_issue_title.trim().to_string();
+        let body = self.edit_issue_body.clone();
+        if title.is_empty() {
+            self.error_banner = Some("Issue title cannot be empty.".to_string());
+            return;
+        }
+        self.error_banner = None;
+        if self.is_mock {
+            if let Some(issue) = self.issues_by_id.get_mut(issue_id) {
+                issue.title = title;
+                issue.body_md = body;
+            }
+            self.editing_issue_id = None;
+            return;
+        }
+        self.send_cmd(
+            "issue.update",
+            json!({ "issue_id": issue_id, "title": title, "body_md": body }),
+        );
+    }
+
+    pub fn assign_and_run_issue(&mut self, issue_id: &str) {
+        let bot_id = self
+            .assign_bot_id
+            .clone()
+            .or_else(|| self.bots.first().map(|b| b.id.clone()));
+        let Some(bot_id) = bot_id else {
+            self.error_banner = Some("Create a bot before assigning an issue.".to_string());
+            return;
+        };
+        if self.is_mock {
+            if let Some(issue) = self.issues_by_id.get_mut(issue_id) {
+                issue.implementer_bot_id = Some(bot_id);
+                issue.landing_mode = self.assign_landing_mode.clone();
+                issue.auto_start_review = self.assign_auto_review;
+                issue.status = "implementing".to_string();
+                issue.needs_input_question = None;
+            }
+            self.show_assign_panel = false;
+            return;
+        }
+        self.send_cmd(
+            "issue.assign",
+            json!({
+                "issue_id": issue_id,
+                "implementer_bot_id": bot_id,
+                "landing_mode": self.assign_landing_mode,
+                "auto_start_review": self.assign_auto_review,
+            }),
+        );
+    }
+
+    pub fn promote_session_to_issue(&mut self, session_id: &str) {
+        if self.is_mock {
+            if let Some(existing) = self.issue_for_session(session_id).map(|i| i.id.clone()) {
+                self.open_issue(&existing);
+                return;
+            }
+            if let Some(sess) = self.sessions_by_id.get(session_id).cloned() {
+                let num = self
+                    .issues_by_id
+                    .values()
+                    .map(|i| i.number)
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
+                let iid = format!("mock-issue-{num}");
+                let cid = format!("mock-conv-issue-{num}");
+                let title = sess
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| format!("Promoted task #{num}"));
+                let body = sess.task.clone().unwrap_or_default();
+                self.upsert_conversation(Conversation {
+                    id: cid.clone(),
+                    kind: "issue".to_string(),
+                    name: Some(format!("issue-{num}")),
+                    topic: Some(title.clone()),
+                    next_seq: 1,
+                    created_at: 300,
+                    last_seq: 0,
+                    last_read_seq: 0,
+                    unread_count: 0,
+                    members: Vec::new(),
+                });
+                self.issues_by_id.insert(
+                    iid.clone(),
+                    IssueSummary {
+                        id: iid.clone(),
+                        number: num,
+                        conversation_id: cid,
+                        title,
+                        body_md: body,
+                        status: "implementing".to_string(),
+                        owner_id: self.current_user_id.clone(),
+                        implementer_bot_id: Some(sess.bot_id),
+                        auto_start_review: false,
+                        landing_mode: "manual".to_string(),
+                        max_rounds: 3,
+                        current_round: 0,
+                        active_session_id: Some(session_id.to_string()),
+                        parent_issue_id: None,
+                        needs_input_question: None,
+                        behind_main: 0,
+                        reviewers: Vec::new(),
+                        reviews: Vec::new(),
+                        created_at: 300,
+                        updated_at: 300,
+                    },
+                );
+                self.open_issue(&iid);
+            }
+            return;
+        }
+        self.send_cmd("issue.promote", json!({ "session_id": session_id }));
+    }
+
+    pub fn sync_issue_with_main(&mut self, issue_id: &str) {
+        if self.is_mock {
+            if let Some(issue) = self.issues_by_id.get_mut(issue_id) {
+                issue.behind_main = 0;
+            }
+            return;
+        }
+        self.send_cmd("issue.sync_main", json!({ "issue_id": issue_id }));
+    }
+
+    pub fn start_issue_review(&mut self, issue_id: &str) {
+        if self.is_mock {
+            if let Some(issue) = self.issues_by_id.get_mut(issue_id) {
+                issue.status = "ready_to_land".to_string();
+            }
+            return;
+        }
+        self.send_cmd("issue.start_review", json!({ "issue_id": issue_id }));
+    }
+
+    pub fn return_issue_to_collaborate(&mut self, issue_id: &str) {
+        if self.is_mock {
+            if let Some(issue) = self.issues_by_id.get_mut(issue_id) {
+                issue.status = "implementing".to_string();
+                issue.needs_input_question = None;
+            }
+            return;
+        }
+        self.send_cmd(
+            "issue.return_to_collaborate",
+            json!({ "issue_id": issue_id }),
+        );
+    }
+
+    pub fn stop_issue(&mut self, issue_id: &str) {
+        if self.is_mock {
+            if let Some(sid) = self
+                .issues_by_id
+                .get(issue_id)
+                .and_then(|i| i.active_session_id.clone())
+                && let Some(sess) = self.sessions_by_id.get_mut(&sid)
+            {
+                sess.status = "stopped".to_string();
+            }
+            return;
+        }
+        self.send_cmd("issue.stop", json!({ "issue_id": issue_id }));
+    }
+
+    pub fn close_issue(&mut self, issue_id: &str, abandon: bool) {
+        if self.is_mock {
+            if let Some(issue) = self.issues_by_id.get_mut(issue_id) {
+                issue.status = "closed".to_string();
+                issue.needs_input_question = None;
+            }
+            return;
+        }
+        self.send_cmd(
+            "issue.close",
+            json!({ "issue_id": issue_id, "abandon": abandon }),
+        );
     }
 
     pub fn open_workspace(&mut self) {
@@ -1674,6 +2111,12 @@ impl KawanApp {
             if conv.kind == "merge_queue" {
                 return "#merge-queue".to_string();
             }
+            if conv.kind == "issue" {
+                if let Some(issue) = self.issue_by_conv(conv_id) {
+                    return format!("#{}", issue.number);
+                }
+                return format!("#{}", conv.name.as_deref().unwrap_or("issue"));
+            }
             if conv.kind == "channel" {
                 return format!("#{}", conv.name.as_deref().unwrap_or("channel"));
             }
@@ -1705,6 +2148,7 @@ impl KawanApp {
         let mut needs_you = 0usize;
         let mut waiting = 0usize;
         let mut in_flight = 0usize;
+        let mut counted_needs_sessions = HashSet::new();
         for sess in self.all_worker_sessions() {
             let land_status = self.land_for_session(&sess.id).map(|l| l.status.as_str());
             if matches!(land_status, Some("failed" | "paused"))
@@ -1712,6 +2156,7 @@ impl KawanApp {
                 || sess.status == "pending_approval"
             {
                 needs_you += 1;
+                counted_needs_sessions.insert(sess.id.as_str());
             } else if matches!(
                 land_status,
                 Some("requested" | "queued" | "rebasing" | "verifying")
@@ -1722,6 +2167,16 @@ impl KawanApp {
                 && land_status != Some("landed")
             {
                 in_flight += 1;
+            }
+        }
+        for issue in self.issues_by_id.values() {
+            if issue.status == "needs_input"
+                && !issue
+                    .active_session_id
+                    .as_deref()
+                    .is_some_and(|sid| counted_needs_sessions.contains(sid))
+            {
+                needs_you += 1;
             }
         }
         (needs_you, waiting, in_flight)
@@ -1764,6 +2219,9 @@ impl KawanApp {
             self.redirect_menu_decision_id = None;
             self.show_add_member = false;
             self.show_new_channel = false;
+            self.show_new_issue_form = false;
+            self.editing_issue_id = None;
+            self.show_assign_panel = false;
             return;
         }
 
@@ -1788,6 +2246,16 @@ impl KawanApp {
             return;
         }
 
+        if key == "enter" && mods.shift {
+            if matches!(
+                self.focus_target,
+                FocusTarget::IssueBody | FocusTarget::IssueEditBody
+            ) {
+                self.focused_string_mut().push('\n');
+            }
+            return;
+        }
+
         if key == "enter" && !mods.shift {
             match self.focus_target {
                 FocusTarget::ConnectHost
@@ -1797,6 +2265,19 @@ impl KawanApp {
                 FocusTarget::Composer => self.send_composer_message(),
                 FocusTarget::ThreadComposer => self.send_thread_reply(),
                 FocusTarget::NewChannelName => self.create_channel(),
+                FocusTarget::IssueTitle => {
+                    if !self.new_issue_title.trim().is_empty() {
+                        self.focus_target = FocusTarget::IssueBody;
+                    }
+                }
+                FocusTarget::IssueEditTitle => {
+                    if let Some(iid) = self.editing_issue_id.clone() {
+                        self.save_edit_issue(&iid);
+                    }
+                }
+                FocusTarget::IssueBody | FocusTarget::IssueEditBody => {
+                    self.focused_string_mut().push('\n');
+                }
                 _ => {}
             }
             return;
@@ -1857,11 +2338,15 @@ impl KawanApp {
             FocusTarget::BotModel => &mut self.bot_model_input,
             FocusTarget::BotThinking => &mut self.bot_thinking_input,
             FocusTarget::InviteNote => &mut self.invite_note_input,
+            FocusTarget::IssueTitle => &mut self.new_issue_title,
+            FocusTarget::IssueBody => &mut self.new_issue_body,
+            FocusTarget::IssueEditTitle => &mut self.edit_issue_title,
+            FocusTarget::IssueEditBody => &mut self.edit_issue_body,
         }
     }
 
     fn cycle_focus_target(&mut self, reverse: bool) {
-        let group: &[FocusTarget] = match self.screen {
+        let group: &[FocusTarget] = match &self.screen {
             Screen::Connect => match self.auth_mode {
                 AuthMode::Login => &[FocusTarget::ConnectHost, FocusTarget::ConnectKeyPath],
                 AuthMode::Bootstrap | AuthMode::Register => &[
@@ -1871,6 +2356,12 @@ impl KawanApp {
                     FocusTarget::ConnectKeyPath,
                 ],
             },
+            Screen::Workspace(WorkspacePage::Issues) if self.show_new_issue_form => {
+                &[FocusTarget::IssueTitle, FocusTarget::IssueBody]
+            }
+            Screen::Workspace(WorkspacePage::IssueDetail(_)) if self.editing_issue_id.is_some() => {
+                &[FocusTarget::IssueEditTitle, FocusTarget::IssueEditBody]
+            }
             Screen::Workspace(WorkspacePage::Settings(SettingsTab::Repository)) => &[
                 FocusTarget::RepoUrl,
                 FocusTarget::RepoBranch,
@@ -1909,6 +2400,11 @@ impl KawanApp {
 
 fn sanitize_paste(target: FocusTarget, text: &str) -> String {
     match target {
+        FocusTarget::IssueBody | FocusTarget::IssueEditBody => text
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .trim_end_matches('\n')
+            .to_string(),
         FocusTarget::Composer | FocusTarget::ThreadComposer | FocusTarget::BotPersona => text
             .trim_end_matches(['\r', '\n'])
             .replace("\r\n", " ")

@@ -14,6 +14,7 @@ import {
   type DecisionMode,
 } from "./decisions.js";
 import { attachRepository, ensureHostSshKey, generateBotKeypair, getBranchHead } from "./git.js";
+import { IssueManager } from "./issues.js";
 import { MergeQueueManager } from "./merge-queue.js";
 import { serializeSession, SessionManager, type SoulHandlers } from "./sessions.js";
 import { createSoulHandlers, INITIAL_SOUL_DOCUMENT } from "./soul.js";
@@ -21,6 +22,7 @@ import type {
   ConversationRow,
   DecisionRow,
   HostSettings,
+  IssueStatus,
   LandingMode,
   MergeConflictPolicy,
   MessageRow,
@@ -273,6 +275,7 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
   let wsServer!: KawanWsServer;
   let sessionManager!: SessionManager;
   let mergeQueue!: MergeQueueManager;
+  let issueManager!: IssueManager;
 
   const dispatchEvent = async (ev: DispatchEvent): Promise<void> => {
     if (opts.onDispatch) {
@@ -828,6 +831,7 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
         sessions: db.listSessions({ kind: "worker" }).map(serializeSession),
         lands: db.listLands().map(serializeLand),
         artifacts: db.listArtifacts(),
+        issues: issueManager.listIssues(),
       };
     },
 
@@ -836,6 +840,133 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
       if (!sessionId) throw new Error("session_id is required");
       const diff = await sessionManager.getSessionDiff(sessionId);
       return { session_id: sessionId, diff };
+    },
+
+    "issue.list": (req) => {
+      const status = typeof req.status === "string" && req.status.trim() ? (req.status.trim() as IssueStatus) : undefined;
+      const ownerId = typeof req.owner_id === "string" && req.owner_id.trim() ? req.owner_id.trim() : undefined;
+      return { issues: issueManager.listIssues({ status, ownerId }) };
+    },
+
+    "issue.create": (req, client) => {
+      const title = String(req.title ?? "").trim();
+      if (!title) throw new Error("title is required");
+      const reviewers = Array.isArray(req.reviewers)
+        ? (req.reviewers as Array<{ bot_id: string; focus?: string | null }>)
+        : undefined;
+      return issueManager.createIssue({
+        title,
+        bodyMd: typeof req.body_md === "string" ? req.body_md : "",
+        ownerId: typeof req.owner_id === "string" ? req.owner_id : client.user.id,
+        implementerBotId:
+          typeof req.implementer_bot_id === "string" ? req.implementer_bot_id : null,
+        parentIssueId: typeof req.parent_issue_id === "string" ? req.parent_issue_id : null,
+        autoStartReview: Boolean(req.auto_start_review),
+        landingMode:
+          req.landing_mode === "auto" || req.landing_mode === "manual"
+            ? req.landing_mode
+            : undefined,
+        maxRounds: typeof req.max_rounds === "number" ? req.max_rounds : undefined,
+        reviewers,
+      });
+    },
+
+    "issue.open": async (req, client) => {
+      const ref = (req.issue_id ?? req.number ?? "") as string | number;
+      if (!ref) throw new Error("issue_id or number is required");
+      return await issueManager.openIssue(ref, client.user.id);
+    },
+
+    "issue.update": (req) => {
+      const ref = (req.issue_id ?? req.number ?? "") as string | number;
+      if (!ref) throw new Error("issue_id or number is required");
+      const reviewers = Array.isArray(req.reviewers)
+        ? (req.reviewers as Array<{ bot_id: string; focus?: string | null }>)
+        : undefined;
+      const issue = issueManager.updateIssue(ref, {
+        title: typeof req.title === "string" ? req.title : undefined,
+        body_md: typeof req.body_md === "string" ? req.body_md : undefined,
+        owner_id: typeof req.owner_id === "string" ? req.owner_id : undefined,
+        implementer_bot_id:
+          req.implementer_bot_id === undefined
+            ? undefined
+            : (req.implementer_bot_id as string | null),
+        parent_issue_id:
+          req.parent_issue_id === undefined ? undefined : (req.parent_issue_id as string | null),
+        auto_start_review:
+          typeof req.auto_start_review === "boolean" ? req.auto_start_review : undefined,
+        landing_mode:
+          req.landing_mode === "auto" || req.landing_mode === "manual"
+            ? req.landing_mode
+            : undefined,
+        max_rounds: typeof req.max_rounds === "number" ? req.max_rounds : undefined,
+        reviewers,
+      });
+      return { issue };
+    },
+
+    "issue.assign": async (req, client) => {
+      const ref = (req.issue_id ?? req.number ?? "") as string | number;
+      if (!ref) throw new Error("issue_id or number is required");
+      const reviewers = Array.isArray(req.reviewers)
+        ? (req.reviewers as Array<{ bot_id: string; focus?: string | null }>)
+        : undefined;
+      return await issueManager.assignAndRun({
+        issueRef: ref,
+        implementerBotId:
+          typeof req.implementer_bot_id === "string" ? req.implementer_bot_id : undefined,
+        ownerId: typeof req.owner_id === "string" ? req.owner_id : client.user.id,
+        autoStartReview:
+          typeof req.auto_start_review === "boolean" ? req.auto_start_review : undefined,
+        landingMode:
+          req.landing_mode === "auto" || req.landing_mode === "manual"
+            ? req.landing_mode
+            : undefined,
+        maxRounds: typeof req.max_rounds === "number" ? req.max_rounds : undefined,
+        reviewers,
+        prompt: typeof req.prompt === "string" ? req.prompt : undefined,
+      });
+    },
+
+    "issue.promote": async (req, client) => {
+      const sessionId = String(req.session_id ?? "").trim();
+      if (!sessionId) throw new Error("session_id is required");
+      return await issueManager.promoteSessionToIssue({
+        sessionId,
+        title: typeof req.title === "string" ? req.title : undefined,
+        bodyMd: typeof req.body_md === "string" ? req.body_md : undefined,
+        ownerId: typeof req.owner_id === "string" ? req.owner_id : client.user.id,
+      });
+    },
+
+    "issue.sync_main": async (req) => {
+      const ref = (req.issue_id ?? req.number ?? "") as string | number;
+      if (!ref) throw new Error("issue_id or number is required");
+      return await issueManager.syncWithMain(ref);
+    },
+
+    "issue.start_review": async (req) => {
+      const ref = (req.issue_id ?? req.number ?? "") as string | number;
+      if (!ref) throw new Error("issue_id or number is required");
+      return await issueManager.startReviewCycle(ref);
+    },
+
+    "issue.return_to_collaborate": (req) => {
+      const ref = (req.issue_id ?? req.number ?? "") as string | number;
+      if (!ref) throw new Error("issue_id or number is required");
+      return { issue: issueManager.returnToCollaborate(ref) };
+    },
+
+    "issue.stop": async (req) => {
+      const ref = (req.issue_id ?? req.number ?? "") as string | number;
+      if (!ref) throw new Error("issue_id or number is required");
+      return { issue: await issueManager.stopIssue(ref) };
+    },
+
+    "issue.close": async (req) => {
+      const ref = (req.issue_id ?? req.number ?? "") as string | number;
+      if (!ref) throw new Error("issue_id or number is required");
+      return { issue: await issueManager.closeIssue(ref, Boolean(req.abandon)) };
     },
   };
 
@@ -848,6 +979,9 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
     onMessageCreated: async ({ conversation, message, author }) => {
       if (author.kind !== "human") return;
       if (conversation.kind === "merge_queue" && mergeQueue.tryRouteIncidentMessage(conversation, message, author)) {
+        return;
+      }
+      if (conversation.kind === "issue" && issueManager.tryRouteNeedsInputReply(conversation, message, author)) {
         return;
       }
       const members = db.listMembers(conversation.id);
@@ -998,6 +1132,14 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
     db,
     wsServer,
     sessionManager,
+    disableSandbox: opts.disableSandbox,
+  });
+  issueManager = new IssueManager({
+    dataDir: opts.dataDir,
+    db,
+    wsServer,
+    sessionManager,
+    mergeQueue,
     disableSandbox: opts.disableSandbox,
   });
   mergeQueue.ensureConversation();

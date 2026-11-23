@@ -5,7 +5,7 @@ use gpui::prelude::*;
 use gpui::{AnyElement, Context, Div, div, px, relative};
 
 use crate::kit;
-use crate::protocol::{Artifact, Land, SessionSummary};
+use crate::protocol::{Artifact, IssueSummary, Land, SessionSummary};
 use crate::state::{KawanApp, RightPanel};
 use crate::theme::{self, Theme};
 use crate::views::conversation::{
@@ -109,6 +109,13 @@ fn main_status_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -
     needs_you.sort_by_key(|(s, _)| std::cmp::Reverse(s.updated_at));
     waiting.sort_by_key(|(s, _)| std::cmp::Reverse(s.updated_at));
     in_flight.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+
+    let mut needs_input_issues: Vec<&IssueSummary> = app
+        .issues_by_id
+        .values()
+        .filter(|i| i.status == "needs_input")
+        .collect();
+    needs_input_issues.sort_by_key(|i| std::cmp::Reverse(i.updated_at));
 
     let mut shipped: Vec<&Land> = app
         .lands_by_id
@@ -273,18 +280,23 @@ fn main_status_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -
             ),
     );
 
-    if !needs_you.is_empty() {
+    let needs_count = needs_you.len() + needs_input_issues.len();
+    if needs_count > 0 {
+        let mut cards: Vec<AnyElement> = needs_input_issues
+            .into_iter()
+            .enumerate()
+            .map(|(i, issue)| status_issue_needs_input_card(app, i, issue, theme, cx))
+            .collect();
+        cards.extend(
+            needs_you.into_iter().enumerate().map(|(i, (sess, land))| {
+                status_task_card(app, "st-needs", i, sess, land, theme, cx)
+            }),
+        );
         inner = inner.child(status_section(
             "NEEDS YOU",
-            needs_you.len(),
+            needs_count,
             theme::CATEGORY_VALS,
-            needs_you
-                .into_iter()
-                .enumerate()
-                .map(|(i, (sess, land))| {
-                    status_task_card(app, "st-needs", i, sess, land, theme, cx)
-                })
-                .collect(),
+            cards,
             None,
             theme,
         ));
@@ -456,6 +468,92 @@ fn expandable_report_block(app: &KawanApp, artifact: &Artifact, theme: &Theme) -
     )
 }
 
+fn status_issue_needs_input_card(
+    app: &KawanApp,
+    idx: usize,
+    issue: &IssueSummary,
+    theme: &Theme,
+    cx: &mut Context<KawanApp>,
+) -> AnyElement {
+    let iid = issue.id.clone();
+    let bot_name = issue
+        .implementer_bot_id
+        .as_deref()
+        .map(|bid| format!("@{}", app.actor_name(bid)))
+        .unwrap_or_else(|| format!("@{}", app.actor_name(&issue.owner_id)));
+    let question = issue
+        .needs_input_question
+        .clone()
+        .unwrap_or_else(|| "Worker asked for clarification in the issue room.".to_string());
+
+    div()
+        .w_full()
+        .relative()
+        .rounded(px(2.0))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.surface)
+        .overflow_hidden()
+        .child(kit::left_edge(theme::hex(theme::CATEGORY_VALS)))
+        .child(
+            div()
+                .px(px(14.0))
+                .py(px(10.0))
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(10.0))
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(theme::numeric(
+                                    format!("#{}", issue.number),
+                                    11.5,
+                                    theme.vivid,
+                                ))
+                                .child(theme::label(issue.title.clone(), 13.5, theme.ink))
+                                .child(kit::status_tag("NEEDS INPUT", theme::CATEGORY_VALS, theme)),
+                        )
+                        .child(theme::micro(bot_name, 8.5, theme.fg_tertiary)),
+                )
+                .child(theme::body(question, 12.5, theme.fg_secondary)),
+        )
+        .child(
+            div()
+                .min_h(px(34.0))
+                .px(px(14.0))
+                .py(px(5.0))
+                .bg(theme.strip)
+                .border_t_1()
+                .border_color(theme.border_subtle)
+                .flex()
+                .items_center()
+                .justify_end()
+                .child(
+                    kit::small_primary_button(
+                        ("st-issue-reply", idx),
+                        format!("Reply in #{} →", issue.number),
+                        theme,
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_issue(&iid);
+                        window.focus(&this.focus_handle, cx);
+                        cx.notify();
+                    })),
+                ),
+        )
+        .into_any_element()
+}
+
 fn status_task_card(
     app: &KawanApp,
     prefix: &'static str,
@@ -480,6 +578,10 @@ fn status_task_card(
     let report_art = find_report_artifact(app, sess, land);
     let sid_changes = sess.id.clone();
     let sid_inspect = sess.id.clone();
+    let sid_promote = sess.id.clone();
+    let linked_issue = app
+        .issue_for_session(&sess.id)
+        .map(|i| (i.id.clone(), i.number));
 
     let mut card = div()
         .w_full()
@@ -574,9 +676,40 @@ fn status_task_card(
         ("st-wait-approve", idx)
     };
 
+    let issue_btn_id = if prefix == "st-needs" {
+        ("st-needs-issue", idx)
+    } else {
+        ("st-wait-issue", idx)
+    };
+    let promote_btn_id = if prefix == "st-needs" {
+        ("st-needs-promote", idx)
+    } else {
+        ("st-wait-promote", idx)
+    };
+
     let mut left_actions = div().flex().items_center().gap(px(6.0));
     if let Some(chip) = origin_chip(origin_btn_id, conv_id, thread_id, app, theme, cx) {
         left_actions = left_actions.child(chip);
+    }
+    if let Some((iid, num)) = linked_issue {
+        left_actions = left_actions.child(
+            kit::ghost_button(issue_btn_id, format!("#{num}"), theme).on_click(cx.listener(
+                move |this, _, window, cx| {
+                    this.open_issue(&iid);
+                    window.focus(&this.focus_handle, cx);
+                    cx.notify();
+                },
+            )),
+        );
+    } else if sess.status != "pending_approval" {
+        left_actions = left_actions.child(
+            kit::ghost_button(promote_btn_id, "Promote", theme).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.promote_session_to_issue(&sid_promote);
+                    cx.notify();
+                },
+            )),
+        );
     }
     if let Some(art) = report_art {
         let aid = art.id.clone();
@@ -707,6 +840,10 @@ fn status_in_flight_row(
     let bot_name = format!("@{}", app.actor_name(&sess.bot_id));
     let sid_changes = sess.id.clone();
     let sid_inspect = sess.id.clone();
+    let sid_promote = sess.id.clone();
+    let linked_issue = app
+        .issue_for_session(&sess.id)
+        .map(|i| (i.id.clone(), i.number));
     let sid_stop = sess.id.clone();
     let is_running = sess.status == "running";
 
@@ -720,6 +857,26 @@ fn status_in_flight_row(
         cx,
     ) {
         actions = actions.child(chip);
+    }
+    if let Some((iid, num)) = linked_issue {
+        actions = actions.child(
+            kit::ghost_button(("st-flight-issue", idx), format!("#{num}"), theme).on_click(
+                cx.listener(move |this, _, window, cx| {
+                    this.open_issue(&iid);
+                    window.focus(&this.focus_handle, cx);
+                    cx.notify();
+                }),
+            ),
+        );
+    } else if sess.status != "pending_approval" {
+        actions = actions.child(
+            kit::ghost_button(("st-flight-promote", idx), "Promote", theme).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.promote_session_to_issue(&sid_promote);
+                    cx.notify();
+                },
+            )),
+        );
     }
     if is_running {
         actions = actions.child(

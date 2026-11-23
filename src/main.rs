@@ -30,6 +30,12 @@ impl Render for KawanApp {
             Screen::Workspace(WorkspacePage::MergeQueue) => {
                 views::merge_queue::render(self, &theme, cx)
             }
+            Screen::Workspace(WorkspacePage::Issues) => {
+                views::issues::render_list(self, &theme, cx)
+            }
+            Screen::Workspace(WorkspacePage::IssueDetail(issue_id)) => {
+                views::issues::render_detail(self, issue_id, &theme, cx)
+            }
             Screen::Workspace(WorkspacePage::Conversation) => {
                 views::conversation::render(self, &theme, cx)
             }
