@@ -42,32 +42,35 @@ fn main_merge_queue_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanAp
         .or_else(|| app.merge_queue_conversation().map(|c| c.id.clone()))
         .unwrap_or_default();
 
-    let (is_paused, policy, bot_label, head_opt, queued_list, recent_count) = match mq_snap {
-        Some(q) => {
-            let bot_name = q
-                .settings
-                .bot_id
-                .as_deref()
-                .map(|bid| format!("@{}", app.actor_name(bid)))
-                .unwrap_or_else(|| "Unassigned".to_string());
-            (
-                q.settings.paused || q.paused_land.is_some(),
-                q.settings.conflict_policy.as_str(),
-                bot_name,
-                q.head.as_ref(),
-                q.queued.as_slice(),
-                q.recent_landed.len(),
-            )
-        }
-        None => (
-            false,
-            "pause_on_issue",
-            "Auto".to_string(),
-            None,
-            &[][..],
-            0,
-        ),
-    };
+    let (is_paused, policy, default_mode, bot_label, head_opt, queued_list, recent_count) =
+        match mq_snap {
+            Some(q) => {
+                let bot_name = q
+                    .settings
+                    .bot_id
+                    .as_deref()
+                    .map(|bid| format!("@{}", app.actor_name(bid)))
+                    .unwrap_or_else(|| "Unassigned".to_string());
+                (
+                    q.settings.paused || q.paused_land.is_some(),
+                    q.settings.conflict_policy.as_str(),
+                    q.settings.default_landing_mode.as_str(),
+                    bot_name,
+                    q.head.as_ref(),
+                    q.queued.as_slice(),
+                    q.recent_landed.len(),
+                )
+            }
+            None => (
+                false,
+                "pause_on_issue",
+                "manual",
+                "Auto".to_string(),
+                None,
+                &[][..],
+                0,
+            ),
+        };
 
     let (queue_state_lbl, queue_state_hex) = if is_paused {
         ("PAUSED", theme::CATEGORY_VALS)
@@ -156,6 +159,19 @@ fn main_merge_queue_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanAp
                                             this.merge_queue_toggle_conflict_policy();
                                             cx.notify();
                                         })),
+                                )
+                                .child(
+                                    kit::ghost_button(
+                                        "mq-default-landing-btn",
+                                        format!("Default: {default_mode}"),
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            this.merge_queue_toggle_default_landing_mode();
+                                            cx.notify();
+                                        },
+                                    )),
                                 )
                                 .child(if is_paused {
                                     kit::small_primary_button("mq-resume", "Resume Queue", theme)

@@ -103,6 +103,8 @@ export function composeSpawnSpec(params: ComposeSpawnParams): ComposedSpawnSpec 
 
   if (params.role === "orchestrator") {
     piArgs.push("--no-builtin-tools");
+  } else if (params.role === "reviewer") {
+    piArgs.push("--exclude-tools", "bash,edit,write");
   }
 
   const childEnv: Record<string, string> = {
@@ -158,7 +160,7 @@ export function composeSpawnSpec(params: ComposeSpawnParams): ComposedSpawnSpec 
   bwrapArgs.push("--ro-bind", extDir, extDir);
   bwrapArgs.push("--ro-bind", params.agentDir, params.agentDir);
   bwrapArgs.push("--bind", params.sessionDir, params.sessionDir);
-  bwrapArgs.push("--bind", params.cwd, params.cwd);
+  bwrapArgs.push(params.role === "reviewer" ? "--ro-bind" : "--bind", params.cwd, params.cwd);
 
   const socketDir = dirname(params.socketPath);
   bwrapArgs.push("--bind", socketDir, socketDir);

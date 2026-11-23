@@ -2,7 +2,7 @@
 //! with editable spec, Collaborate controls, Sync with main, Stop/Abandon, and stream.
 
 use gpui::prelude::*;
-use gpui::{AnyElement, Context, Div, div, px, relative};
+use gpui::{AnyElement, Context, Div, FontWeight, Stateful, div, px, relative};
 
 use crate::kit;
 use crate::protocol::IssueSummary;
@@ -82,45 +82,68 @@ fn main_issues_list_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanAp
         })
         .collect();
 
-    let top_bar = kit::strip_bar(theme)
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(10.0))
-                .child(theme::micro("ISSUES", 9.5, theme.ink))
-                .child(theme::numeric(
-                    format!("{open_count} open"),
-                    10.5,
-                    theme.fg_tertiary,
-                )),
-        )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .child(
-                    kit::ghost_button("issues-refresh", "Refresh", theme).on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.open_issues();
-                            cx.notify();
-                        },
-                    )),
-                )
-                .child(
-                    kit::small_primary_button("issues-new-toggle", "+ New Issue", theme).on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.show_new_issue_form = !this.show_new_issue_form;
-                            if this.show_new_issue_form {
-                                this.focus_target = FocusTarget::IssueTitle;
-                                window.focus(&this.focus_handle, cx);
-                            }
-                            cx.notify();
-                        }),
+    let is_board = app.issue_view_mode == "board";
+
+    let top_bar =
+        kit::strip_bar(theme)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(theme::micro("ISSUES", 9.5, theme.ink))
+                    .child(theme::numeric(
+                        format!("{open_count} open"),
+                        10.5,
+                        theme.fg_tertiary,
+                    ))
+                    .child(
+                        div()
+                            .ml(px(6.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(3.0))
+                            .child(
+                                view_mode_pill("issues-view-list", "List", !is_board, theme)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.issue_view_mode = "list".to_string();
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                view_mode_pill("issues-view-board", "Board", is_board, theme)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.issue_view_mode = "board".to_string();
+                                        cx.notify();
+                                    })),
+                            ),
                     ),
-                ),
-        );
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        kit::ghost_button("issues-refresh", "Refresh", theme).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.open_issues();
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        kit::small_primary_button("issues-new-toggle", "+ New Issue", theme)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_new_issue_form = !this.show_new_issue_form;
+                                if this.show_new_issue_form {
+                                    this.focus_target = FocusTarget::IssueTitle;
+                                    window.focus(&this.focus_handle, cx);
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            );
 
     let filters = [
         ("all", "All"),
@@ -171,7 +194,7 @@ fn main_issues_list_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanAp
 
     let mut inner = div()
         .w(relative(1.0))
-        .max_w(px(ISSUES_MEASURE))
+        .max_w(px(if is_board { 1140.0 } else { ISSUES_MEASURE }))
         .px(px(28.0))
         .py(px(22.0))
         .flex()
@@ -187,12 +210,19 @@ fn main_issues_list_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanAp
                 .gap(px(4.0))
                 .child(theme::title("Issues", 26.0, theme.ink))
                 .child(theme::body(
-                    "Durable markdown specs, collaborative implementation rooms, and review readiness.",
+                    if is_board {
+                        "Active pipeline board — Backlog and Shipped issues stay in List."
+                    } else {
+                        "Durable markdown specs, collaborative implementation rooms, and review readiness."
+                    },
                     13.0,
                     theme.fg_secondary,
                 )),
-        )
-        .child(filter_bar);
+        );
+
+    if !is_board {
+        inner = inner.child(filter_bar);
+    }
 
     if let Some(err) = &app.error_banner {
         inner = inner.child(
@@ -214,50 +244,59 @@ fn main_issues_list_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanAp
         inner = inner.child(new_issue_form_card(app, theme, cx));
     }
 
-    let groups: [(&str, u32, &[&str]); 5] = [
-        ("NEEDS INPUT", theme::CATEGORY_VALS, &["needs_input"]),
-        (
-            "IN PROGRESS",
-            theme::CATEGORY_INDUSTRY,
-            &["implementing", "verifying", "reviewing", "queued"],
-        ),
-        (
-            "READY TO LAND",
-            theme::CATEGORY_ACADEMIC,
-            &["ready_to_land"],
-        ),
-        ("BACKLOG", theme::UMBER_VIVID, &["backlog"]),
-        ("SHIPPED & CLOSED", 0x284D32, &["landed", "closed"]),
-    ];
+    if is_board {
+        let all_issues: Vec<&IssueSummary> = {
+            let mut v: Vec<&IssueSummary> = app.issues_by_id.values().collect();
+            v.sort_by_key(|i| std::cmp::Reverse(i.number));
+            v
+        };
+        inner = inner.child(issues_board_view(app, all_issues, theme, cx));
+    } else {
+        let groups: [(&str, u32, &[&str]); 5] = [
+            ("NEEDS INPUT", theme::CATEGORY_VALS, &["needs_input"]),
+            (
+                "IN PROGRESS",
+                theme::CATEGORY_INDUSTRY,
+                &["implementing", "verifying", "reviewing", "queued"],
+            ),
+            (
+                "READY TO LAND",
+                theme::CATEGORY_ACADEMIC,
+                &["ready_to_land"],
+            ),
+            ("BACKLOG", theme::UMBER_VIVID, &["backlog"]),
+            ("SHIPPED & CLOSED", 0x284D32, &["landed", "closed"]),
+        ];
 
-    let mut any_rendered = false;
-    for (heading, accent, statuses) in groups {
-        let items: Vec<&IssueSummary> = filtered
-            .iter()
-            .copied()
-            .filter(|i| statuses.contains(&i.status.as_str()))
-            .collect();
-        if items.is_empty() {
-            continue;
+        let mut any_rendered = false;
+        for (heading, accent, statuses) in groups {
+            let items: Vec<&IssueSummary> = filtered
+                .iter()
+                .copied()
+                .filter(|i| statuses.contains(&i.status.as_str()))
+                .collect();
+            if items.is_empty() {
+                continue;
+            }
+            any_rendered = true;
+            inner = inner.child(issue_group_section(app, heading, accent, items, theme, cx));
         }
-        any_rendered = true;
-        inner = inner.child(issue_group_section(app, heading, accent, items, theme, cx));
-    }
 
-    if !any_rendered {
-        inner = inner.child(
-            div()
-                .p(px(16.0))
-                .rounded(px(2.0))
-                .border_1()
-                .border_color(theme.border_subtle)
-                .bg(theme.strip)
-                .child(theme::body(
-                    "No issues match this filter yet. Click '+ New Issue' or promote an ad-hoc task.",
-                    12.5,
-                    theme.fg_tertiary,
-                )),
-        );
+        if !any_rendered {
+            inner = inner.child(
+                div()
+                    .p(px(16.0))
+                    .rounded(px(2.0))
+                    .border_1()
+                    .border_color(theme.border_subtle)
+                    .bg(theme.strip)
+                    .child(theme::body(
+                        "No issues match this filter yet. Click '+ New Issue' or promote an ad-hoc task.",
+                        12.5,
+                        theme.fg_tertiary,
+                    )),
+            );
+        }
     }
 
     let body = div()
@@ -490,6 +529,230 @@ fn issue_group_section(
         )
 }
 
+fn view_mode_pill(
+    id: &'static str,
+    label: &'static str,
+    active: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .h(px(22.0))
+        .px(px(8.0))
+        .rounded(px(2.0))
+        .border_1()
+        .border_color(if active {
+            theme.ink
+        } else {
+            theme.border_subtle
+        })
+        .bg(if active { theme.ink } else { theme.strip })
+        .flex()
+        .items_center()
+        .cursor_pointer()
+        .child(theme::micro(
+            label,
+            8.0,
+            if active {
+                theme::hex(0xFFFFFF)
+            } else {
+                theme.fg_secondary
+            },
+        ))
+}
+
+fn issues_board_view(
+    app: &KawanApp,
+    all: Vec<&IssueSummary>,
+    theme: &Theme,
+    cx: &mut Context<KawanApp>,
+) -> Div {
+    let columns: [(&str, u32, &[&str]); 4] = [
+        (
+            "IMPLEMENTING",
+            theme::CATEGORY_INDUSTRY,
+            &["implementing", "verifying"],
+        ),
+        ("REVIEWING", theme::CATEGORY_ACADEMIC, &["reviewing"]),
+        ("NEEDS INPUT", theme::CATEGORY_VALS, &["needs_input"]),
+        ("READY TO LAND", 0x284D32, &["ready_to_land"]),
+    ];
+
+    div()
+        .w_full()
+        .flex()
+        .items_start()
+        .gap(px(12.0))
+        .children(
+            columns
+                .into_iter()
+                .enumerate()
+                .map(|(ci, (title, accent, statuses))| {
+                    let col_items: Vec<&IssueSummary> = all
+                        .iter()
+                        .copied()
+                        .filter(|i| statuses.contains(&i.status.as_str()))
+                        .collect();
+                    div()
+                        .id(("board-col", ci))
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .p(px(10.0))
+                        .rounded(px(2.0))
+                        .border_1()
+                        .border_color(theme.border_subtle)
+                        .bg(theme.strip)
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .pb(px(6.0))
+                                .border_b_1()
+                                .border_color(theme.border_subtle)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.0))
+                                        .child(kit::swatch(theme::hex(accent), px(6.0)))
+                                        .child(theme::micro(title, 9.0, theme.dark)),
+                                )
+                                .child(theme::numeric(
+                                    col_items.len().to_string(),
+                                    10.0,
+                                    theme.fg_tertiary,
+                                )),
+                        )
+                        .children((col_items.is_empty()).then(|| {
+                            div()
+                                .py(px(12.0))
+                                .child(theme::micro("NONE", 8.0, theme.fg_tertiary))
+                        }))
+                        .children(col_items.into_iter().map(|issue| {
+                            let iid = issue.id.clone();
+                            let unread = app
+                                .conversations
+                                .iter()
+                                .find(|c| c.id == issue.conversation_id)
+                                .is_some_and(|c| c.unread_count > 0);
+                            let impl_lbl = issue
+                                .implementer_bot_id
+                                .as_deref()
+                                .map(|bid| format!("@{}", app.actor_name(bid)))
+                                .unwrap_or_else(|| "Unassigned".to_string());
+                            let total_rev = issue.reviewers.len();
+                            let approved_rev = if total_rev > 0 && !issue.reviews.is_empty() {
+                                let target_round = issue
+                                    .reviews
+                                    .iter()
+                                    .map(|r| r.round)
+                                    .max()
+                                    .unwrap_or(issue.current_round);
+                                issue
+                                    .reviews
+                                    .iter()
+                                    .filter(|r| r.round == target_round && r.verdict == "approve")
+                                    .count()
+                            } else {
+                                0
+                            };
+
+                            div()
+                                .id(("board-card", issue.number as usize))
+                                .w_full()
+                                .p(px(10.0))
+                                .rounded(px(2.0))
+                                .border_1()
+                                .border_color(theme.border)
+                                .bg(theme.surface)
+                                .hover(|s| s.border_color(theme.dark))
+                                .cursor_pointer()
+                                .flex()
+                                .flex_col()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap(px(6.0))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(5.0))
+                                                .child(theme::numeric(
+                                                    format!("#{}", issue.number),
+                                                    10.5,
+                                                    theme.vivid,
+                                                ))
+                                                .children(
+                                                    unread
+                                                        .then(|| kit::swatch(theme.vivid, px(5.0))),
+                                                ),
+                                        )
+                                        .child(theme::micro(impl_lbl, 8.0, theme.fg_tertiary)),
+                                )
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .min_w(px(0.0))
+                                        .font_family(theme::SANS)
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_size(px(12.5))
+                                        .line_height(px(17.0))
+                                        .text_color(theme.ink)
+                                        .child(issue.title.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .flex_wrap()
+                                        .gap(px(4.0))
+                                        .children((issue.current_round > 0).then(|| {
+                                            kit::status_tag(
+                                                format!(
+                                                    "R{}/{}",
+                                                    issue.current_round, issue.max_rounds
+                                                ),
+                                                accent,
+                                                theme,
+                                            )
+                                        }))
+                                        .children((total_rev > 0).then(|| {
+                                            kit::status_tag(
+                                                format!("{approved_rev}/{total_rev} REV"),
+                                                if approved_rev == total_rev {
+                                                    0x284D32
+                                                } else {
+                                                    theme::CATEGORY_ACADEMIC
+                                                },
+                                                theme,
+                                            )
+                                        }))
+                                        .children((issue.behind_main > 0).then(|| {
+                                            kit::status_tag(
+                                                format!("{} BEHIND", issue.behind_main),
+                                                theme::UMBER_VIVID,
+                                                theme,
+                                            )
+                                        })),
+                                )
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_issue(&iid);
+                                    window.focus(&this.focus_handle, cx);
+                                    cx.notify();
+                                }))
+                        }))
+                }),
+        )
+}
+
 fn main_issue_detail_pane(
     app: &KawanApp,
     issue_id: &str,
@@ -538,7 +801,9 @@ fn main_issue_detail_pane(
     let iid_edit = issue.id.clone();
     let iid_save = issue.id.clone();
     let iid_expand = issue.id.clone();
+    let iid_cfg = issue.id.clone();
     let iid_assign_run = issue.id.clone();
+    let iid_save_cfg = issue.id.clone();
     let iid_sync = issue.id.clone();
     let iid_review = issue.id.clone();
     let iid_return = issue.id.clone();
@@ -780,6 +1045,119 @@ fn main_issue_detail_pane(
         );
     }
 
+    if !issue.reviewers.is_empty()
+        || !issue.reviews.is_empty()
+        || issue.auto_start_review
+        || issue.landing_mode == "auto"
+    {
+        let target_round = issue
+            .reviews
+            .iter()
+            .map(|r| r.round)
+            .max()
+            .unwrap_or(issue.current_round);
+        let round_chip = if issue.current_round > 0 {
+            format!("ROUND {}/{}", issue.current_round, issue.max_rounds)
+        } else {
+            format!("MAX {} ROUNDS", issue.max_rounds)
+        };
+        header_inner = header_inner.child(
+            div()
+                .px(px(10.0))
+                .py(px(6.0))
+                .rounded(px(2.0))
+                .border_1()
+                .border_color(theme.border_subtle)
+                .bg(theme.strip)
+                .flex()
+                .items_center()
+                .flex_wrap()
+                .gap(px(8.0))
+                .child(theme::micro(round_chip, 8.5, theme.dark))
+                .children(
+                    issue
+                        .auto_start_review
+                        .then(|| kit::status_tag("AUTO REVIEW", theme::CATEGORY_ACADEMIC, theme)),
+                )
+                .children(
+                    (issue.landing_mode == "auto")
+                        .then(|| kit::status_tag("AUTO LAND", 0x284D32, theme)),
+                )
+                .children(issue.reviewers.iter().map(|rev| {
+                    let bot_name = app.actor_name(&rev.bot_id);
+                    let focus_part = rev
+                        .focus
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|f| format!(" · {f}"))
+                        .unwrap_or_default();
+                    let verdict_opt = issue
+                        .reviews
+                        .iter()
+                        .rfind(|r| r.reviewer_slot_id == rev.id && r.round == target_round)
+                        .or_else(|| issue.reviews.iter().rfind(|r| r.reviewer_slot_id == rev.id));
+                    let (v_lbl, v_col) = match verdict_opt.map(|r| r.verdict.as_str()) {
+                        Some("approve") => ("APPROVED", 0x284D32),
+                        Some("request_changes" | "changes_requested") => {
+                            ("CHANGES", theme::CATEGORY_VALS)
+                        }
+                        Some("needs_owner") => ("NEEDS OWNER", theme::CATEGORY_VALS),
+                        _ => ("PENDING", theme::CATEGORY_ACADEMIC),
+                    };
+                    div()
+                        .px(px(6.0))
+                        .py(px(2.0))
+                        .rounded(px(2.0))
+                        .border_1()
+                        .border_color(theme.border_subtle)
+                        .bg(theme.surface)
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .child(theme::micro(
+                            format!("@{bot_name}{focus_part}"),
+                            8.0,
+                            theme.ink,
+                        ))
+                        .child(kit::status_tag(v_lbl, v_col, theme))
+                })),
+        );
+    }
+
+    if matching_land.is_some_and(|l| l.touches_kawan) {
+        header_inner = header_inner.child(
+            div()
+                .relative()
+                .overflow_hidden()
+                .px(px(10.0))
+                .py(px(7.0))
+                .rounded(px(2.0))
+                .border_1()
+                .border_color(theme::with_alpha(theme::CATEGORY_VALS, 0.45))
+                .bg(theme::with_alpha(theme::CATEGORY_VALS, 0.06))
+                .child(kit::left_edge(theme::hex(theme::CATEGORY_VALS)))
+                .child(
+                    div()
+                        .pl(px(6.0))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .flex_wrap()
+                        .gap(px(8.0))
+                        .child(theme::micro(
+                            "MODIFIES .KAWAN/ CHECKS",
+                            8.5,
+                            theme::hex(theme::CATEGORY_VALS),
+                        ))
+                        .child(theme::body(
+                            "Auto-land disabled for check changes; explicit human approval required.",
+                            12.0,
+                            theme.ink,
+                        )),
+                ),
+        );
+    }
+
     if issue.status == "needs_input"
         && let Some(q) = &issue.needs_input_question
     {
@@ -820,6 +1198,11 @@ fn main_issue_detail_pane(
             .clone()
             .or_else(|| issue.implementer_bot_id.clone())
             .or_else(|| app.bots.first().map(|b| b.id.clone()));
+        let selected_rev_bot = app
+            .assign_reviewer_bot_id
+            .clone()
+            .or_else(|| app.bots.first().map(|b| b.id.clone()));
+        let is_backlog = issue.status == "backlog";
 
         header_inner = header_inner.child(
             div()
@@ -831,7 +1214,15 @@ fn main_issue_detail_pane(
                 .flex()
                 .flex_col()
                 .gap(px(8.0))
-                .child(theme::micro("ASSIGN & RUN ISSUE", 9.0, theme.dark))
+                .child(theme::micro(
+                    if is_backlog {
+                        "ASSIGN & RUN ISSUE"
+                    } else {
+                        "CONFIGURE REVIEW LOOP & LANDING"
+                    },
+                    9.0,
+                    theme.dark,
+                ))
                 .child(
                     div()
                         .flex()
@@ -876,22 +1267,183 @@ fn main_issue_detail_pane(
                     div()
                         .flex()
                         .items_center()
+                        .flex_wrap()
+                        .gap(px(6.0))
+                        .child(theme::micro("Reviewers:", 9.0, theme.fg_tertiary))
+                        .children(app.assign_reviewers.iter().enumerate().map(
+                            |(ri, (bid, focus))| {
+                                let bname = app.actor_name(bid);
+                                let label = if focus.trim().is_empty() {
+                                    format!("@{bname}")
+                                } else {
+                                    format!("@{bname} · {}", focus.trim())
+                                };
+                                div()
+                                    .h(px(24.0))
+                                    .px(px(6.0))
+                                    .rounded(px(2.0))
+                                    .border_1()
+                                    .border_color(theme.border_subtle)
+                                    .bg(theme.surface)
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .child(theme::micro(label, 8.5, theme.ink))
+                                    .child(
+                                        kit::ghost_button(("assign-rev-rm", ri), "×", theme)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.remove_assign_reviewer(ri);
+                                                cx.notify();
+                                            })),
+                                    )
+                            },
+                        ))
+                        .children(app.assign_reviewers.is_empty().then(|| {
+                            theme::micro("0 reviewers (checks only)", 8.5, theme.fg_tertiary)
+                        })),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap(px(6.0))
+                        .children(app.bots.iter().enumerate().map(|(bi, b)| {
+                            let bid = b.id.clone();
+                            let active = selected_rev_bot.as_deref() == Some(bid.as_str());
+                            div()
+                                .id(("assign-rev-bot", bi))
+                                .h(px(22.0))
+                                .px(px(7.0))
+                                .rounded(px(2.0))
+                                .border_1()
+                                .border_color(if active {
+                                    theme.ink
+                                } else {
+                                    theme.border_subtle
+                                })
+                                .bg(if active { theme.ink } else { theme.surface })
+                                .flex()
+                                .items_center()
+                                .cursor_pointer()
+                                .child(theme::micro(
+                                    format!("+ @{}:", b.name),
+                                    8.0,
+                                    if active {
+                                        theme::hex(0xFFFFFF)
+                                    } else {
+                                        theme.fg_secondary
+                                    },
+                                ))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.assign_reviewer_bot_id = Some(bid.clone());
+                                    cx.notify();
+                                }))
+                        }))
+                        .child(
+                            div().flex_1().min_w(px(220.0)).overflow_hidden().child(
+                                kit::text_input_box(
+                                    "assign-rev-focus",
+                                    &app.assign_reviewer_focus,
+                                    "Optional review focus (e.g. Security)",
+                                    app.focus_target == FocusTarget::AssignReviewerFocus,
+                                    false,
+                                    theme,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.focus_target = FocusTarget::AssignReviewerFocus;
+                                        window.focus(&this.focus_handle, cx);
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                        )
+                        .child(
+                            kit::secondary_button("assign-rev-add", "+ Add Reviewer", theme)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.add_assign_reviewer();
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
                         .justify_between()
+                        .flex_wrap()
                         .gap(px(8.0))
                         .child(
-                            kit::ghost_button(
-                                "assign-landing-toggle",
-                                format!("Landing: {}", app.assign_landing_mode),
-                                theme,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.assign_landing_mode = if this.assign_landing_mode == "auto" {
-                                    "manual".to_string()
-                                } else {
-                                    "auto".to_string()
-                                };
-                                cx.notify();
-                            })),
+                            div()
+                                .flex()
+                                .items_center()
+                                .flex_wrap()
+                                .gap(px(6.0))
+                                .child(
+                                    kit::ghost_button(
+                                        "assign-auto-review-toggle",
+                                        if app.assign_auto_review {
+                                            "Mode: Autonomous (auto-review)"
+                                        } else {
+                                            "Mode: Interactive"
+                                        },
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            this.assign_auto_review = !this.assign_auto_review;
+                                            cx.notify();
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    kit::ghost_button(
+                                        "assign-landing-toggle",
+                                        format!("Landing: {}", app.assign_landing_mode),
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            this.assign_landing_mode =
+                                                if this.assign_landing_mode == "auto" {
+                                                    "manual".to_string()
+                                                } else {
+                                                    "auto".to_string()
+                                                };
+                                            cx.notify();
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(4.0))
+                                        .child(
+                                            kit::ghost_button("assign-rounds-dec", "-", theme)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.assign_max_rounds = this
+                                                        .assign_max_rounds
+                                                        .saturating_sub(1)
+                                                        .max(1);
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(theme::micro(
+                                            format!("Max rounds: {}", app.assign_max_rounds.max(1)),
+                                            8.5,
+                                            theme.ink,
+                                        ))
+                                        .child(
+                                            kit::ghost_button("assign-rounds-inc", "+", theme)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.assign_max_rounds =
+                                                        (this.assign_max_rounds + 1).min(8);
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                ),
                         )
                         .child(
                             div()
@@ -906,13 +1458,25 @@ fn main_issue_detail_pane(
                                         }),
                                     ),
                                 )
-                                .child(
+                                .child(if is_backlog {
                                     kit::small_primary_button("assign-submit", "Run Issue", theme)
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.assign_and_run_issue(&iid_assign_run);
                                             cx.notify();
-                                        })),
-                                ),
+                                        }))
+                                        .into_any_element()
+                                } else {
+                                    kit::small_primary_button(
+                                        "assign-save-cfg",
+                                        "Save Config",
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.save_issue_loop_config(&iid_save_cfg);
+                                        cx.notify();
+                                    }))
+                                    .into_any_element()
+                                }),
                         ),
                 ),
         );
@@ -922,10 +1486,11 @@ fn main_issue_detail_pane(
     let mut actions: Vec<AnyElement> = Vec::new();
     match issue.status.as_str() {
         "backlog" => {
+            let iid_open = iid_cfg.clone();
             actions.push(
                 kit::small_primary_button("iss-act-assign", "Assign & Run", theme)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.show_assign_panel = !this.show_assign_panel;
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_assign_panel_for_issue(&iid_open);
                         cx.notify();
                     }))
                     .into_any_element(),
@@ -957,6 +1522,14 @@ fn main_issue_detail_pane(
                 kit::secondary_button("iss-act-sync", sync_lbl, theme)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.sync_issue_with_main(&iid_sync);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+            actions.push(
+                kit::ghost_button("iss-act-configure", "Configure", theme)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_assign_panel_for_issue(&iid_cfg);
                         cx.notify();
                     }))
                     .into_any_element(),

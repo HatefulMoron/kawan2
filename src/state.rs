@@ -13,11 +13,11 @@ use crate::protocol::{
     Artifact, ArtifactGetData, BotCreateData, BotListData, BotSummary, Conversation,
     ConversationCreateData, ConversationListData, ConversationMarkReadData, ConversationOpenData,
     Decision, InviteCreateData, IssueActionData, IssueAssignData, IssueListData, IssueOpenData,
-    IssuePromoteData, IssueStartReviewData, IssueSummary, IssueSyncData, Land, LandApproveData,
-    Member, MergeQueueReadData, MergeQueueSnapshot, Message, ModelsTestData, ServerFrame,
-    SessionActionData, SessionDiffData, SessionDiffSummary, SessionListData, SessionOpenData,
-    SessionSummary, SettingsView, SetupStatus, StatusReadData, StatusRepoInfo, UserListData,
-    UserSummary, parse_invite_link,
+    IssuePromoteData, IssueReviewer, IssueStartReviewData, IssueSummary, IssueSyncData, Land,
+    LandApproveData, Member, MergeQueueReadData, MergeQueueSnapshot, Message, ModelsTestData,
+    ServerFrame, SessionActionData, SessionDiffData, SessionDiffSummary, SessionListData,
+    SessionOpenData, SessionSummary, SettingsView, SetupStatus, StatusReadData, StatusRepoInfo,
+    UserListData, UserSummary, parse_invite_link,
 };
 use crate::ssh::default_ssh_key_path;
 use crate::ws_client::{AuthMode, ConnectConfig, WsEvent, WsHandle};
@@ -87,6 +87,7 @@ pub enum FocusTarget {
     IssueBody,
     IssueEditTitle,
     IssueEditBody,
+    AssignReviewerFocus,
 }
 
 #[derive(Clone)]
@@ -160,6 +161,7 @@ pub struct KawanApp {
 
     // Issues view state
     pub issue_filter: String,
+    pub issue_view_mode: String,
     pub show_new_issue_form: bool,
     pub new_issue_title: String,
     pub new_issue_body: String,
@@ -170,6 +172,10 @@ pub struct KawanApp {
     pub assign_bot_id: Option<String>,
     pub assign_landing_mode: String,
     pub assign_auto_review: bool,
+    pub assign_max_rounds: u64,
+    pub assign_reviewers: Vec<(String, String)>,
+    pub assign_reviewer_bot_id: Option<String>,
+    pub assign_reviewer_focus: String,
     pub expanded_issue_specs: HashSet<String>,
 
     // Settings form state
@@ -282,6 +288,7 @@ impl KawanApp {
             new_channel_name: String::new(),
 
             issue_filter: "all".to_string(),
+            issue_view_mode: "list".to_string(),
             show_new_issue_form: false,
             new_issue_title: String::new(),
             new_issue_body: String::new(),
@@ -292,6 +299,10 @@ impl KawanApp {
             assign_bot_id: None,
             assign_landing_mode: "manual".to_string(),
             assign_auto_review: false,
+            assign_max_rounds: 3,
+            assign_reviewers: Vec::new(),
+            assign_reviewer_bot_id: None,
+            assign_reviewer_focus: String::new(),
             expanded_issue_specs: HashSet::new(),
 
             repo_url_input: String::new(),
@@ -927,6 +938,7 @@ impl KawanApp {
                 if let Ok(res) = serde_json::from_value::<IssueActionData>(val) {
                     if command == "issue.update" {
                         self.editing_issue_id = None;
+                        self.show_assign_panel = false;
                     }
                     self.issues_by_id.insert(res.issue.id.clone(), res.issue);
                     self.error_banner = None;
@@ -1303,6 +1315,64 @@ impl KawanApp {
         );
     }
 
+    pub fn open_assign_panel_for_issue(&mut self, issue_id: &str) {
+        if self.show_assign_panel {
+            self.show_assign_panel = false;
+            return;
+        }
+        let default_mode = self
+            .merge_queue
+            .as_ref()
+            .map(|q| q.settings.default_landing_mode.clone())
+            .or_else(|| {
+                self.settings
+                    .merge_queue
+                    .as_ref()
+                    .map(|q| q.default_landing_mode.clone())
+            })
+            .unwrap_or_else(|| "manual".to_string());
+        if let Some(issue) = self.issues_by_id.get(issue_id) {
+            self.assign_bot_id = issue
+                .implementer_bot_id
+                .clone()
+                .or_else(|| self.bots.first().map(|b| b.id.clone()));
+            self.assign_landing_mode = if issue.landing_mode.is_empty() {
+                default_mode
+            } else {
+                issue.landing_mode.clone()
+            };
+            self.assign_auto_review = issue.auto_start_review;
+            self.assign_max_rounds = issue.max_rounds.max(1);
+            self.assign_reviewers = issue
+                .reviewers
+                .iter()
+                .map(|r| (r.bot_id.clone(), r.focus.clone().unwrap_or_default()))
+                .collect();
+            self.assign_reviewer_bot_id = self.bots.first().map(|b| b.id.clone());
+            self.assign_reviewer_focus.clear();
+        }
+        self.show_assign_panel = true;
+    }
+
+    pub fn add_assign_reviewer(&mut self) {
+        let bot_id = self
+            .assign_reviewer_bot_id
+            .clone()
+            .or_else(|| self.bots.first().map(|b| b.id.clone()));
+        let Some(bot_id) = bot_id else {
+            return;
+        };
+        let focus = self.assign_reviewer_focus.trim().to_string();
+        self.assign_reviewers.push((bot_id, focus));
+        self.assign_reviewer_focus.clear();
+    }
+
+    pub fn remove_assign_reviewer(&mut self, idx: usize) {
+        if idx < self.assign_reviewers.len() {
+            self.assign_reviewers.remove(idx);
+        }
+    }
+
     pub fn assign_and_run_issue(&mut self, issue_id: &str) {
         let bot_id = self
             .assign_bot_id
@@ -1312,11 +1382,35 @@ impl KawanApp {
             self.error_banner = Some("Create a bot before assigning an issue.".to_string());
             return;
         };
+        let reviewers_json: Vec<Value> = self
+            .assign_reviewers
+            .iter()
+            .map(|(bid, focus)| {
+                let trimmed = focus.trim();
+                json!({
+                    "bot_id": bid,
+                    "focus": if trimmed.is_empty() { Value::Null } else { Value::String(trimmed.to_string()) },
+                })
+            })
+            .collect();
         if self.is_mock {
             if let Some(issue) = self.issues_by_id.get_mut(issue_id) {
                 issue.implementer_bot_id = Some(bot_id);
                 issue.landing_mode = self.assign_landing_mode.clone();
                 issue.auto_start_review = self.assign_auto_review;
+                issue.max_rounds = self.assign_max_rounds.max(1);
+                issue.reviewers = self
+                    .assign_reviewers
+                    .iter()
+                    .enumerate()
+                    .map(|(oi, (bid, focus))| IssueReviewer {
+                        id: format!("mock-rev-slot-{oi}"),
+                        issue_id: issue_id.to_string(),
+                        bot_id: bid.clone(),
+                        focus: (!focus.trim().is_empty()).then(|| focus.trim().to_string()),
+                        order_index: oi as u64,
+                    })
+                    .collect();
                 issue.status = "implementing".to_string();
                 issue.needs_input_question = None;
             }
@@ -1330,6 +1424,57 @@ impl KawanApp {
                 "implementer_bot_id": bot_id,
                 "landing_mode": self.assign_landing_mode,
                 "auto_start_review": self.assign_auto_review,
+                "max_rounds": self.assign_max_rounds.max(1),
+                "reviewers": reviewers_json,
+            }),
+        );
+    }
+
+    pub fn save_issue_loop_config(&mut self, issue_id: &str) {
+        let reviewers_json: Vec<Value> = self
+            .assign_reviewers
+            .iter()
+            .map(|(bid, focus)| {
+                let trimmed = focus.trim();
+                json!({
+                    "bot_id": bid,
+                    "focus": if trimmed.is_empty() { Value::Null } else { Value::String(trimmed.to_string()) },
+                })
+            })
+            .collect();
+        if self.is_mock {
+            if let Some(issue) = self.issues_by_id.get_mut(issue_id) {
+                if let Some(bid) = &self.assign_bot_id {
+                    issue.implementer_bot_id = Some(bid.clone());
+                }
+                issue.landing_mode = self.assign_landing_mode.clone();
+                issue.auto_start_review = self.assign_auto_review;
+                issue.max_rounds = self.assign_max_rounds.max(1);
+                issue.reviewers = self
+                    .assign_reviewers
+                    .iter()
+                    .enumerate()
+                    .map(|(oi, (bid, focus))| IssueReviewer {
+                        id: format!("mock-rev-slot-{oi}"),
+                        issue_id: issue_id.to_string(),
+                        bot_id: bid.clone(),
+                        focus: (!focus.trim().is_empty()).then(|| focus.trim().to_string()),
+                        order_index: oi as u64,
+                    })
+                    .collect();
+            }
+            self.show_assign_panel = false;
+            return;
+        }
+        self.send_cmd(
+            "issue.update",
+            json!({
+                "issue_id": issue_id,
+                "implementer_bot_id": self.assign_bot_id,
+                "landing_mode": self.assign_landing_mode,
+                "auto_start_review": self.assign_auto_review,
+                "max_rounds": self.assign_max_rounds.max(1),
+                "reviewers": reviewers_json,
             }),
         );
     }
@@ -1857,6 +2002,28 @@ impl KawanApp {
         self.send_cmd("merge_queue.configure", json!({ "conflict_policy": next }));
     }
 
+    pub fn merge_queue_toggle_default_landing_mode(&mut self) {
+        let current = self
+            .merge_queue
+            .as_ref()
+            .map(|q| q.settings.default_landing_mode.as_str())
+            .unwrap_or("manual");
+        let next = if current == "auto" { "manual" } else { "auto" };
+        if self.is_mock {
+            if let Some(mq) = &mut self.merge_queue {
+                mq.settings.default_landing_mode = next.to_string();
+            }
+            if let Some(mq_s) = &mut self.settings.merge_queue {
+                mq_s.default_landing_mode = next.to_string();
+            }
+            return;
+        }
+        self.send_cmd(
+            "merge_queue.configure",
+            json!({ "default_landing_mode": next }),
+        );
+    }
+
     pub fn toggle_artifact_view(&mut self, artifact_id: &str) {
         if !self.expanded_artifacts.remove(artifact_id) {
             self.expanded_artifacts.insert(artifact_id.to_string());
@@ -2278,6 +2445,7 @@ impl KawanApp {
                 FocusTarget::IssueBody | FocusTarget::IssueEditBody => {
                     self.focused_string_mut().push('\n');
                 }
+                FocusTarget::AssignReviewerFocus => self.add_assign_reviewer(),
                 _ => {}
             }
             return;
@@ -2342,6 +2510,7 @@ impl KawanApp {
             FocusTarget::IssueBody => &mut self.new_issue_body,
             FocusTarget::IssueEditTitle => &mut self.edit_issue_title,
             FocusTarget::IssueEditBody => &mut self.edit_issue_body,
+            FocusTarget::AssignReviewerFocus => &mut self.assign_reviewer_focus,
         }
     }
 

@@ -189,6 +189,10 @@ test("Slice C: collaborative issue, ask_owner resume, sync_main, start_review (f
   let stage: "ask" | "draft_ready" | "fix_pass" = "ask";
 
   stub.setHandler((reqBody) => {
+    const sysText = JSON.stringify(reqBody.messages?.[0] ?? "");
+    if (sysText.includes("AI engineering orchestrator")) {
+      return { text: "NO_REPLY" };
+    }
     const msgs = reqBody.messages ?? [];
     const lastMsg = msgs[msgs.length - 1];
     const hasToolResult = lastMsg?.role === "tool";

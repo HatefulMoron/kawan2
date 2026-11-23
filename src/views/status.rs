@@ -88,6 +88,7 @@ fn main_status_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -
     for sess in &workers {
         let land = app.land_for_session(&sess.id);
         let land_status = land.map(|l| l.status.as_str());
+        let issue_status = app.issue_for_session(&sess.id).map(|i| i.status.as_str());
         if matches!(land_status, Some("failed" | "paused"))
             || (sess.status == "failed" && land_status != Some("landed"))
             || sess.status == "pending_approval"
@@ -99,7 +100,9 @@ fn main_status_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -
         ) || (sess.status == "review_requested" && land_status != Some("landed"))
         {
             waiting.push((sess, land));
-        } else if matches!(sess.status.as_str(), "running" | "idle")
+        } else if (matches!(issue_status, Some("verifying" | "reviewing"))
+            || (matches!(sess.status.as_str(), "running" | "idle")
+                && !matches!(issue_status, Some("needs_input" | "closed"))))
             && land_status != Some("landed")
         {
             in_flight.push(sess);
@@ -579,9 +582,33 @@ fn status_task_card(
     let sid_changes = sess.id.clone();
     let sid_inspect = sess.id.clone();
     let sid_promote = sess.id.clone();
-    let linked_issue = app
-        .issue_for_session(&sess.id)
-        .map(|i| (i.id.clone(), i.number));
+    let linked_issue_obj = app.issue_for_session(&sess.id);
+    let linked_issue = linked_issue_obj.map(|i| (i.id.clone(), i.number));
+    let review_summary_tag: Option<(String, u32)> = linked_issue_obj.and_then(|issue| {
+        if issue.reviews.is_empty() {
+            return None;
+        }
+        let target_round = issue
+            .reviews
+            .iter()
+            .map(|r| r.round)
+            .max()
+            .unwrap_or(issue.current_round);
+        let round_revs: Vec<_> = issue
+            .reviews
+            .iter()
+            .filter(|r| r.round == target_round)
+            .collect();
+        let total = issue.reviewers.len().max(round_revs.len());
+        let approved = round_revs.iter().filter(|r| r.verdict == "approve").count();
+        let color = if approved == total && total > 0 {
+            0x284D32
+        } else {
+            theme::CATEGORY_ACADEMIC
+        };
+        Some((format!("{approved}/{total} APPROVED"), color))
+    });
+    let touches_kawan = land.is_some_and(|l| l.touches_kawan);
 
     let mut card = div()
         .w_full()
@@ -617,7 +644,14 @@ fn status_task_card(
                                     short_status_label(status_str).to_uppercase(),
                                     status_color,
                                     theme,
-                                )),
+                                ))
+                                .children(
+                                    review_summary_tag
+                                        .map(|(lbl, col)| kit::status_tag(lbl, col, theme)),
+                                )
+                                .children(touches_kawan.then(|| {
+                                    kit::status_tag("MODIFIES .KAWAN/", theme::CATEGORY_VALS, theme)
+                                })),
                         )
                         .child(theme::micro(bot_name, 8.5, theme.fg_tertiary)),
                 )
@@ -688,19 +722,24 @@ fn status_task_card(
     };
 
     let mut left_actions = div().flex().items_center().gap(px(6.0));
+    let origin_is_same_issue = conv_id
+        .and_then(|cid| app.issue_by_conv(cid))
+        .is_some_and(|i| Some(i.number) == linked_issue.as_ref().map(|(_, n)| *n));
     if let Some(chip) = origin_chip(origin_btn_id, conv_id, thread_id, app, theme, cx) {
         left_actions = left_actions.child(chip);
     }
     if let Some((iid, num)) = linked_issue {
-        left_actions = left_actions.child(
-            kit::ghost_button(issue_btn_id, format!("#{num}"), theme).on_click(cx.listener(
-                move |this, _, window, cx| {
-                    this.open_issue(&iid);
-                    window.focus(&this.focus_handle, cx);
-                    cx.notify();
-                },
-            )),
-        );
+        if !origin_is_same_issue {
+            left_actions = left_actions.child(
+                kit::ghost_button(issue_btn_id, format!("#{num}"), theme).on_click(cx.listener(
+                    move |this, _, window, cx| {
+                        this.open_issue(&iid);
+                        window.focus(&this.focus_handle, cx);
+                        cx.notify();
+                    },
+                )),
+            );
+        }
     } else if sess.status != "pending_approval" {
         left_actions = left_actions.child(
             kit::ghost_button(promote_btn_id, "Promote", theme).on_click(cx.listener(
@@ -841,12 +880,29 @@ fn status_in_flight_row(
     let sid_changes = sess.id.clone();
     let sid_inspect = sess.id.clone();
     let sid_promote = sess.id.clone();
-    let linked_issue = app
-        .issue_for_session(&sess.id)
-        .map(|i| (i.id.clone(), i.number));
+    let linked_issue_obj = app.issue_for_session(&sess.id);
+    let linked_issue = linked_issue_obj.map(|i| (i.id.clone(), i.number));
+    let issue_stage_tag: Option<(String, u32)> =
+        linked_issue_obj.and_then(|i| match i.status.as_str() {
+            "verifying" => Some(("VERIFYING".to_string(), theme::CATEGORY_INDUSTRY)),
+            "reviewing" => Some((
+                format!("REVIEWING R{}/{}", i.current_round.max(1), i.max_rounds),
+                theme::CATEGORY_ACADEMIC,
+            )),
+            "implementing" if i.current_round > 0 => Some((
+                format!("REVISING R{}", i.current_round),
+                theme::CATEGORY_INDUSTRY,
+            )),
+            _ => None,
+        });
     let sid_stop = sess.id.clone();
     let is_running = sess.status == "running";
 
+    let origin_is_same_issue = sess
+        .conversation_id
+        .as_deref()
+        .and_then(|cid| app.issue_by_conv(cid))
+        .is_some_and(|i| Some(i.number) == linked_issue.as_ref().map(|(_, n)| *n));
     let mut actions = div().flex().items_center().gap(px(6.0));
     if let Some(chip) = origin_chip(
         ("st-flight-origin", idx),
@@ -859,15 +915,17 @@ fn status_in_flight_row(
         actions = actions.child(chip);
     }
     if let Some((iid, num)) = linked_issue {
-        actions = actions.child(
-            kit::ghost_button(("st-flight-issue", idx), format!("#{num}"), theme).on_click(
-                cx.listener(move |this, _, window, cx| {
-                    this.open_issue(&iid);
-                    window.focus(&this.focus_handle, cx);
-                    cx.notify();
-                }),
-            ),
-        );
+        if !origin_is_same_issue {
+            actions = actions.child(
+                kit::ghost_button(("st-flight-issue", idx), format!("#{num}"), theme).on_click(
+                    cx.listener(move |this, _, window, cx| {
+                        this.open_issue(&iid);
+                        window.focus(&this.focus_handle, cx);
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
     } else if sess.status != "pending_approval" {
         actions = actions.child(
             kit::ghost_button(("st-flight-promote", idx), "Promote", theme).on_click(cx.listener(
@@ -929,9 +987,13 @@ fn status_in_flight_row(
                     div()
                         .flex()
                         .items_center()
+                        .flex_wrap()
                         .gap(px(8.0))
                         .child(kit::swatch(theme::hex(status_color), px(6.0)))
                         .child(theme::label(title, 13.0, theme.ink))
+                        .children(
+                            issue_stage_tag.map(|(lbl, col)| kit::status_tag(lbl, col, theme)),
+                        )
                         .child(theme::micro(bot_name, 8.5, theme.fg_tertiary)),
                 )
                 .children(
@@ -952,17 +1014,34 @@ fn status_shipped_card(
     cx: &mut Context<KawanApp>,
 ) -> AnyElement {
     let sess = app.sessions_by_id.get(&land.session_id);
+    let linked_issue = app.issue_for_session(&land.session_id);
     let title = sess
         .map(session_display_title)
         .unwrap_or_else(|| format!("Task {}", short_id(&land.session_id)));
     let bot_name = sess
         .map(|s| format!("@{}", app.actor_name(&s.bot_id)))
         .unwrap_or_else(|| "@bot".to_string());
-    let approver = land
-        .approved_by
-        .as_deref()
-        .map(|uid| format!("Approved by {}", app.actor_name(uid)))
-        .unwrap_or_else(|| "Landed".to_string());
+    let approver = if land.trigger.as_deref() == Some("auto_land") {
+        "Auto-landed".to_string()
+    } else {
+        land.approved_by
+            .as_deref()
+            .map(|uid| format!("Approved by {}", app.actor_name(uid)))
+            .unwrap_or_else(|| "Landed".to_string())
+    };
+    let reviewer_suffix = linked_issue
+        .filter(|i| !i.reviewers.is_empty())
+        .map(|i| {
+            let mut names: Vec<String> = Vec::new();
+            for r in &i.reviewers {
+                let n = format!("@{}", app.actor_name(&r.bot_id));
+                if !names.contains(&n) {
+                    names.push(n);
+                }
+            }
+            format!(" · Rev: {}", names.join(", "))
+        })
+        .unwrap_or_default();
     let report_art = sess.and_then(|s| find_report_artifact(app, s, Some(land)));
     let sid_changes = land.session_id.clone();
     let sid_inspect = land.session_id.clone();
@@ -996,11 +1075,14 @@ fn status_shipped_card(
                                 .flex()
                                 .items_center()
                                 .gap(px(8.0))
+                                .children(linked_issue.map(|i| {
+                                    theme::numeric(format!("#{}", i.number), 11.0, theme.vivid)
+                                }))
                                 .child(theme::label(title, 13.5, theme.ink))
                                 .child(kit::status_tag("LANDED", 0x284D32, theme)),
                         )
                         .child(theme::micro(
-                            format!("{bot_name} · {approver}"),
+                            format!("{bot_name}{reviewer_suffix} · {approver}"),
                             8.5,
                             theme.fg_tertiary,
                         )),

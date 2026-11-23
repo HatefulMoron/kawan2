@@ -1184,6 +1184,7 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
         clearTimeout(timer);
       }
       holdTimers.clear();
+      await issueManager.close();
       await mergeQueue.close();
       await sessionManager.stopAll();
       await new Promise<void>((resolve) => {

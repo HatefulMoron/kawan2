@@ -25,6 +25,7 @@ import type {
   LandRow,
   LandingMode,
   MessageRow,
+  ReviewVerdict,
   SessionDiffSummary,
   SessionRow,
   UserRow,
@@ -68,6 +69,11 @@ export interface IssueToolHandlers {
   listIssues(status?: string): unknown;
   askOwner(session: SessionRow, question: string): Promise<unknown>;
   syncWithMain(session: SessionRow): Promise<unknown>;
+  submitReview(
+    session: SessionRow,
+    input: { verdict: ReviewVerdict; summary: string; notes_md?: string },
+  ): Promise<unknown>;
+  onIssueWorkerTurnCompleted?(issue: IssueRow, session: SessionRow): Promise<void>;
 }
 
 const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
@@ -407,6 +413,7 @@ export class SessionManager {
       reportedInTurn: boolean;
       sourceWorkerId?: string | null;
       spawnIntent?: { explicitWorkStart: "yes" | "no"; workRequest: "yes" | "no" };
+      suppressChatPublish?: boolean;
     }
   >();
   private workerRuns = new Map<string, Promise<void>>();
@@ -747,6 +754,9 @@ export class SessionManager {
 
       case "update_issue": {
         if (!this.issueHandlers) throw new Error("Issue handlers are not registered");
+        if (session.kind === "reviewer") {
+          throw new Error("Reviewer sessions are read-only and cannot update issues");
+        }
         const activeIssue = this.db.getIssueBySessionId(session.id);
         const rawRef =
           typeof params.issue_ref === "string" && params.issue_ref.trim()
@@ -775,6 +785,9 @@ export class SessionManager {
 
       case "ask_owner": {
         if (!this.issueHandlers) throw new Error("Issue handlers are not registered");
+        if (session.kind === "reviewer") {
+          throw new Error("Reviewer sessions should call submit_review with verdict 'needs_owner'");
+        }
         const question = typeof params.question === "string" ? params.question : "";
         if (!question.trim()) throw new Error("question is required");
         return await this.issueHandlers.askOwner(session, question);
@@ -782,7 +795,29 @@ export class SessionManager {
 
       case "sync_with_main": {
         if (!this.issueHandlers) throw new Error("Issue handlers are not registered");
+        if (session.kind === "reviewer") {
+          throw new Error("Reviewer sessions are read-only and cannot sync branches");
+        }
         return await this.issueHandlers.syncWithMain(session);
+      }
+
+      case "submit_review": {
+        if (session.kind !== "reviewer") {
+          throw new Error("Only reviewer sessions can call submit_review");
+        }
+        if (!this.issueHandlers) throw new Error("Issue handlers are not registered");
+        const verdict = typeof params.verdict === "string" ? params.verdict.trim() : "";
+        if (verdict !== "approve" && verdict !== "request_changes" && verdict !== "needs_owner") {
+          throw new Error("verdict must be 'approve', 'request_changes', or 'needs_owner'");
+        }
+        const summary = typeof params.summary === "string" ? params.summary.trim() : "";
+        if (!summary) throw new Error("summary is required");
+        const notesMd = typeof params.notes_md === "string" ? params.notes_md : undefined;
+        return await this.issueHandlers.submitReview(session, {
+          verdict,
+          summary,
+          notes_md: notesMd,
+        });
       }
 
       default:
@@ -878,6 +913,121 @@ export class SessionManager {
       throw new Error("Bot no longer exists");
     }
     await this.sendPromptToWorker(bot, worker, promptText);
+  }
+
+  async runReviewerSession(params: {
+    bot: UserRow;
+    issue: IssueRow;
+    round: number;
+    focus: string | null;
+    clonePath: string;
+    systemPrompt: string;
+    promptText: string;
+    onSessionCreated?: (sessionId: string) => void;
+  }): Promise<{
+    sessionId: string;
+    assistantText: string;
+    errorMessage: string | null;
+    aborted: boolean;
+  }> {
+    const sessionId = randomUUID();
+    const settings = this.db.getHostSettings();
+    const latestSoul = this.db.getLatestSoul(params.bot.id);
+    const soulSnapshot = latestSoul ? filterSoulForWorker(latestSoul.content) : null;
+    const focusSuffix = params.focus ? `: ${params.focus}` : "";
+    const sessionBase = join(this.dataDir, "sessions", sessionId);
+    const agentDir = join(sessionBase, "agent");
+    const sessionDir = join(sessionBase, "pi-sessions");
+    materializeSessionAgentDir(agentDir, settings);
+
+    const sessRow = this.db.createSession({
+      id: sessionId,
+      botId: params.bot.id,
+      parentSessionId: null,
+      kind: "reviewer",
+      conversationId: params.issue.conversation_id,
+      threadId: null,
+      title: `Review #${params.issue.number} R${params.round}${focusSuffix}`,
+      task: params.focus ?? "Code review",
+      status: "running",
+      branch: null,
+      clonePath: params.clonePath,
+      agentDir,
+      soulSnapshot,
+    });
+    this.wsServer.broadcast({ type: "session.update", session: serializeSession(sessRow) });
+    params.onSessionCreated?.(sessionId);
+
+    const spec = composeSpawnSpec({
+      role: "reviewer",
+      bot: params.bot,
+      settings,
+      agentDir,
+      sessionDir,
+      cwd: params.clonePath,
+      socketPath: this.socketPath,
+      extensionPath: EXTENSION_ENTRY_PATH,
+      sessionToken: sessRow.token,
+      systemPrompt: params.systemPrompt,
+      disableSandbox: this.disableSandbox,
+    });
+
+    const proc = new PiRpcProcess(spec);
+    this.processes.set(sessionId, proc);
+    let assistantText = "";
+    let errorMessage: string | null = null;
+    let aborted = false;
+
+    try {
+      await proc.start();
+      if (this.closed || this.db.getSession(sessionId)?.status === "stopped") {
+        aborted = true;
+      } else {
+        const turn = await proc.runPrompt(params.promptText);
+        assistantText = turn.assistantText;
+        errorMessage = turn.errorMessage;
+        aborted = turn.aborted;
+      }
+    } catch (err) {
+      errorMessage = err instanceof Error ? err.message : String(err);
+    } finally {
+      if (this.processes.get(sessionId) === proc) {
+        this.processes.delete(sessionId);
+      }
+      await proc.stop().catch(() => {});
+      if (!this.closed) {
+        const latest = this.db.getSession(sessionId);
+        if (latest && latest.status !== "stopped") {
+          const finalStatus = errorMessage && !assistantText && latest.status !== "failed" ? "failed" : "archived";
+          const finalized = this.db.updateSession(sessionId, {
+            status: finalStatus,
+            last_report: errorMessage ? errorMessage : latest.last_report,
+          })!;
+          this.wsServer.broadcast({ type: "session.update", session: serializeSession(finalized) });
+        }
+      }
+    }
+
+    return { sessionId, assistantText, errorMessage, aborted };
+  }
+
+  enqueueSoulDigest(params: {
+    bot: UserRow;
+    conversation: ConversationRow;
+    digestPrompt: string;
+  }): void {
+    if (this.closed) return;
+    this.enqueueOrchestratorPrompt(
+      params.bot,
+      params.conversation,
+      null,
+      [],
+      true,
+      params.digestPrompt,
+      null,
+      undefined,
+      true,
+    );
   }
 
   private async ensureOrchestratorProcess(bot: UserRow, session: SessionRow): Promise<PiRpcProcess> {
@@ -1035,6 +1185,7 @@ export class SessionManager {
     promptOverride?: string,
     sourceWorkerId?: string | null,
     spawnIntent?: { explicitWorkStart: "yes" | "no"; workRequest: "yes" | "no" },
+    suppressChatPublish = false,
   ): void {
     const prev = this.orchQueues.get(bot.id) ?? Promise.resolve();
     const next = prev
@@ -1063,6 +1214,7 @@ export class SessionManager {
           reportedInTurn: false,
           sourceWorkerId: sourceWorkerId ?? null,
           spawnIntent,
+          suppressChatPublish,
         });
 
         let promptText =
@@ -1099,6 +1251,7 @@ export class SessionManager {
             });
           } else if (
             !ctx?.reportedInTurn &&
+            !ctx?.suppressChatPublish &&
             turn.assistantText &&
             turn.assistantText.trim() !== "NO_REPLY"
           ) {
@@ -1533,6 +1686,7 @@ export class SessionManager {
             });
           } else if (
             !ctx?.reportedInTurn &&
+            !ctx?.suppressChatPublish &&
             turn.assistantText &&
             turn.assistantText.trim() !== "NO_REPLY"
           ) {
@@ -1650,6 +1804,20 @@ export class SessionManager {
       }
 
       if (linkedIssue) {
+        const latestIssue = this.db.getIssue(linkedIssue.id);
+        const latestSess = this.db.getSession(session.id);
+        if (latestIssue && latestSess && this.issueHandlers?.onIssueWorkerTurnCompleted) {
+          void this.issueHandlers.onIssueWorkerTurnCompleted(latestIssue, latestSess).catch((err) => {
+            if (!this.closed && conv) {
+              this.wsServer.broadcastToConversation(conv, {
+                type: "error",
+                conversation_id: conv.id,
+                session_id: session.id,
+                message: err instanceof Error ? err.message : String(err),
+              });
+            }
+          });
+        }
         return;
       }
 
@@ -1854,7 +2022,7 @@ export class SessionManager {
     const updatedSession = this.db.updateSession(session.id, { last_report: text })!;
     this.wsServer.broadcast({ type: "session.update", session: serializeSession(updatedSession) });
 
-    if (session.kind === "worker" && !linkedIssue) {
+    if ((session.kind === "worker" && !linkedIssue) || ctx?.suppressChatPublish) {
       return {
         message_id: null,
         artifact_id: artifactRow?.id ?? null,

@@ -672,15 +672,21 @@ pub fn populate_mock(app: &mut KawanApp) {
         ],
     );
 
-    // Slice C mock issues (#1 needs_input, #2 implementing behind main, #3 backlog)
+    // Slice C & D mock issues (#1 needs_input, #2 implementing, #3 backlog, #4 reviewing, #5 ready_to_land)
     let conv_i1 = "conv-issue-1".to_string();
     let conv_i2 = "conv-issue-2".to_string();
     let conv_i3 = "conv-issue-3".to_string();
+    let conv_i4 = "conv-issue-4".to_string();
+    let conv_i5 = "conv-issue-5".to_string();
     let issue_1 = "mock-issue-1".to_string();
     let issue_2 = "mock-issue-2".to_string();
     let issue_3 = "mock-issue-3".to_string();
+    let issue_4 = "mock-issue-4".to_string();
+    let issue_5 = "mock-issue-5".to_string();
     let sess_i1 = "7b88d100-0004-4000-8000-000000000004".to_string();
     let sess_i2 = "7b88d100-0005-4000-8000-000000000005".to_string();
+    let sess_i4 = "7b88d100-0006-4000-8000-000000000006".to_string();
+    let sess_i5 = "7b88d100-0007-4000-8000-000000000007".to_string();
 
     for (cid, num, title, last_seq, last_read_seq, unread) in [
         (
@@ -705,6 +711,22 @@ pub fn populate_mock(app: &mut KawanApp) {
             "Persist per-channel composer drafts across view switches",
             1u64,
             1u64,
+            0u64,
+        ),
+        (
+            &conv_i4,
+            4u64,
+            "Parallel reviewer focus slots & round circuit breaker",
+            2u64,
+            2u64,
+            0u64,
+        ),
+        (
+            &conv_i5,
+            5u64,
+            "Add pre-commit formatting check in .kawan/checks",
+            2u64,
+            2u64,
             0u64,
         ),
     ] {
@@ -820,26 +842,231 @@ pub fn populate_mock(app: &mut KawanApp) {
             parent_issue_id: None,
             needs_input_question: None,
             behind_main: 2,
-            reviewers: vec![IssueReviewer {
-                id: "rev-slot-1".to_string(),
-                issue_id: issue_2.clone(),
-                bot_id: bot_id.clone(),
-                focus: Some("sandbox isolation & error messages".to_string()),
-                order_index: 0,
-            }],
+            reviewers: vec![
+                IssueReviewer {
+                    id: "rev-slot-1".to_string(),
+                    issue_id: issue_2.clone(),
+                    bot_id: bot_id.clone(),
+                    focus: Some("sandbox isolation & error messages".to_string()),
+                    order_index: 0,
+                },
+                IssueReviewer {
+                    id: "rev-slot-2".to_string(),
+                    issue_id: issue_2.clone(),
+                    bot_id: bot_id.clone(),
+                    focus: Some("timeout cleanup".to_string()),
+                    order_index: 1,
+                },
+            ],
             reviews: vec![IssueReview {
                 id: "rev-1".to_string(),
-                issue_id: issue_2,
+                issue_id: issue_2.clone(),
                 round: 1,
                 reviewer_slot_id: "rev-slot-1".to_string(),
                 session_id: None,
-                verdict: "changes_requested".to_string(),
+                verdict: "request_changes".to_string(),
                 summary: "Capture stderr separately from stdout on check timeout.".to_string(),
                 notes_artifact_id: None,
                 created_at: 1_795_401_050_000,
             }],
             created_at: 1_795_400_900_000,
             updated_at: 1_795_401_150_000,
+        },
+    );
+
+    app.sessions_by_id.insert(
+        sess_i4.clone(),
+        SessionSummary {
+            id: sess_i4.clone(),
+            bot_id: bot_id.clone(),
+            parent_session_id: None,
+            kind: "worker".to_string(),
+            conversation_id: Some(conv_i4.clone()),
+            thread_id: None,
+            title: Some("Parallel reviewer focus slots & round circuit breaker".to_string()),
+            task: Some("Implement parallel N-reviewer focus slots".to_string()),
+            status: "idle".to_string(),
+            branch: Some("kawan/issue-4".to_string()),
+            clone_path: Some("/var/lib/kawan/workspaces/issue-4".to_string()),
+            agent_dir: None,
+            pi_session_file: None,
+            last_entry_id: None,
+            last_report: Some("All unit checks pass; awaiting Round 1 verdicts.".to_string()),
+            soul_snapshot: None,
+            created_at: 265,
+            updated_at: 270,
+        },
+    );
+    app.sessions_by_id.insert(
+        sess_i5.clone(),
+        SessionSummary {
+            id: sess_i5.clone(),
+            bot_id: bot_id.clone(),
+            parent_session_id: None,
+            kind: "worker".to_string(),
+            conversation_id: Some(conv_i5.clone()),
+            thread_id: None,
+            title: Some("Add pre-commit formatting check in .kawan/checks".to_string()),
+            task: Some("Add 00-fmt.sh script inside .kawan/checks/".to_string()),
+            status: "review_requested".to_string(),
+            branch: Some("kawan/issue-5".to_string()),
+            clone_path: Some("/var/lib/kawan/workspaces/issue-5".to_string()),
+            agent_dir: None,
+            pi_session_file: None,
+            last_entry_id: None,
+            last_report: Some(
+                "Added .kawan/checks/00-fmt.sh; both reviewers approved in Round 2.".to_string(),
+            ),
+            soul_snapshot: None,
+            created_at: 255,
+            updated_at: 275,
+        },
+    );
+    app.lands_by_id.insert(
+        "land-issue-5".to_string(),
+        Land {
+            id: "land-issue-5".to_string(),
+            session_id: sess_i5.clone(),
+            conversation_id: conv_i5.clone(),
+            thread_id: None,
+            message_id: None,
+            status: "requested".to_string(),
+            approved_by: None,
+            base_sha: None,
+            landed_sha: None,
+            verify_output: Some("00-fmt.sh (exit 0), 01-test.sh (exit 0)".to_string()),
+            error: None,
+            queue_position: None,
+            issue_id: Some(issue_5.clone()),
+            pause_reason: None,
+            queue_session_id: None,
+            queue_thread_id: None,
+            trigger: Some("manual_approve".to_string()),
+            checks: vec![CheckRunItem {
+                name: "00-fmt.sh".to_string(),
+                ok: true,
+                exit_code: Some(0),
+                duration_ms: 120,
+                output: String::new(),
+                artifact_id: None,
+            }],
+            touches_kawan: true,
+            created_at: 274,
+            updated_at: 275,
+        },
+    );
+
+    app.issues_by_id.insert(
+        issue_4.clone(),
+        IssueSummary {
+            id: issue_4.clone(),
+            number: 4,
+            conversation_id: conv_i4.clone(),
+            title: "Parallel reviewer focus slots & round circuit breaker".to_string(),
+            body_md: "## Goal\nFan out parallel read-only reviewer sessions per round and enforce max_rounds circuit breaker.".to_string(),
+            status: "reviewing".to_string(),
+            owner_id: alice_id.clone(),
+            implementer_bot_id: Some(bot_id.clone()),
+            auto_start_review: true,
+            landing_mode: "auto".to_string(),
+            max_rounds: 3,
+            current_round: 1,
+            active_session_id: Some(sess_i4),
+            parent_issue_id: None,
+            needs_input_question: None,
+            behind_main: 0,
+            reviewers: vec![
+                IssueReviewer {
+                    id: "rev4-slot-1".to_string(),
+                    issue_id: issue_4.clone(),
+                    bot_id: bot_id.clone(),
+                    focus: Some("Concurrency & safety".to_string()),
+                    order_index: 0,
+                },
+                IssueReviewer {
+                    id: "rev4-slot-2".to_string(),
+                    issue_id: issue_4.clone(),
+                    bot_id: bot_id.clone(),
+                    focus: Some("Test coverage".to_string()),
+                    order_index: 1,
+                },
+            ],
+            reviews: vec![IssueReview {
+                id: "rev4-1".to_string(),
+                issue_id: issue_4,
+                round: 1,
+                reviewer_slot_id: "rev4-slot-1".to_string(),
+                session_id: None,
+                verdict: "approve".to_string(),
+                summary: "Cycle lock & cancellation tokens prevent stale state writes.".to_string(),
+                notes_artifact_id: None,
+                created_at: 1_795_401_260_000,
+            }],
+            created_at: 1_795_401_210_000,
+            updated_at: 1_795_401_260_000,
+        },
+    );
+    app.issues_by_id.insert(
+        issue_5.clone(),
+        IssueSummary {
+            id: issue_5.clone(),
+            number: 5,
+            conversation_id: conv_i5.clone(),
+            title: "Add pre-commit formatting check in .kawan/checks".to_string(),
+            body_md: "## Goal\nAdd `.kawan/checks/00-fmt.sh` to enforce `cargo fmt --check` before review.".to_string(),
+            status: "ready_to_land".to_string(),
+            owner_id: alice_id.clone(),
+            implementer_bot_id: Some(bot_id.clone()),
+            auto_start_review: true,
+            landing_mode: "auto".to_string(),
+            max_rounds: 3,
+            current_round: 2,
+            active_session_id: Some(sess_i5),
+            parent_issue_id: None,
+            needs_input_question: None,
+            behind_main: 0,
+            reviewers: vec![
+                IssueReviewer {
+                    id: "rev5-slot-1".to_string(),
+                    issue_id: issue_5.clone(),
+                    bot_id: bot_id.clone(),
+                    focus: Some("CI safety".to_string()),
+                    order_index: 0,
+                },
+                IssueReviewer {
+                    id: "rev5-slot-2".to_string(),
+                    issue_id: issue_5.clone(),
+                    bot_id: bot_id.clone(),
+                    focus: Some("Performance".to_string()),
+                    order_index: 1,
+                },
+            ],
+            reviews: vec![
+                IssueReview {
+                    id: "rev5-1".to_string(),
+                    issue_id: issue_5.clone(),
+                    round: 2,
+                    reviewer_slot_id: "rev5-slot-1".to_string(),
+                    session_id: None,
+                    verdict: "approve".to_string(),
+                    summary: "Executable check script verified safe.".to_string(),
+                    notes_artifact_id: None,
+                    created_at: 1_795_401_280_000,
+                },
+                IssueReview {
+                    id: "rev5-2".to_string(),
+                    issue_id: issue_5,
+                    round: 2,
+                    reviewer_slot_id: "rev5-slot-2".to_string(),
+                    session_id: None,
+                    verdict: "approve".to_string(),
+                    summary: "Runs in <200ms in sandbox.".to_string(),
+                    notes_artifact_id: None,
+                    created_at: 1_795_401_285_000,
+                },
+            ],
+            created_at: 1_795_401_220_000,
+            updated_at: 1_795_401_285_000,
         },
     );
     app.issues_by_id.insert(
@@ -910,7 +1137,7 @@ pub fn populate_mock(app: &mut KawanApp) {
                 id: "i2-msg-2".to_string(),
                 conversation_id: "conv-issue-2".to_string(),
                 seq: 2,
-                author_id: bot_id,
+                author_id: bot_id.clone(),
                 thread_id: None,
                 body: "Updated `runRepoChecks` to keep separate stderr tail buffers; ready for another check pass after syncing main.".to_string(),
                 artifact_id: None,
@@ -924,12 +1151,50 @@ pub fn populate_mock(app: &mut KawanApp) {
             id: "i3-msg-1".to_string(),
             conversation_id: "conv-issue-3".to_string(),
             seq: 1,
-            author_id: alice_id,
+            author_id: alice_id.clone(),
             thread_id: None,
             body: "Spec drafted — assign an implementer when ready.".to_string(),
             artifact_id: None,
             created_at: 1_795_400_800_000,
         }],
+    );
+    app.messages_by_conv.insert(
+        conv_i4,
+        vec![Message {
+            id: "i4-msg-1".to_string(),
+            conversation_id: "conv-issue-4".to_string(),
+            seq: 1,
+            author_id: bot_id.clone(),
+            thread_id: None,
+            body: "[Round 1/3 · Concurrency & safety] APPROVED: Cycle lock & cancellation tokens prevent stale state writes.".to_string(),
+            artifact_id: None,
+            created_at: 1_795_401_260_000,
+        }],
+    );
+    app.messages_by_conv.insert(
+        conv_i5,
+        vec![
+            Message {
+                id: "i5-msg-1".to_string(),
+                conversation_id: "conv-issue-5".to_string(),
+                seq: 1,
+                author_id: bot_id,
+                thread_id: None,
+                body: "Checks passed (00-fmt.sh, 01-test.sh). Ready to approve land into `main`. (Modifies `.kawan/` checks — auto-land downgraded to manual approval.)".to_string(),
+                artifact_id: None,
+                created_at: 1_795_401_285_000,
+            },
+            Message {
+                id: "i5-msg-2".to_string(),
+                conversation_id: "conv-issue-5".to_string(),
+                seq: 2,
+                author_id: alice_id,
+                thread_id: None,
+                body: "Looks good — will approve from header after inspecting check log.".to_string(),
+                artifact_id: None,
+                created_at: 1_795_401_290_000,
+            },
+        ],
     );
 
     app.screen = Screen::Workspace(WorkspacePage::Conversation);

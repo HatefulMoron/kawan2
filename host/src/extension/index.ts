@@ -117,81 +117,83 @@ export default function (pi: ExtensionAPI) {
           artifact: artifactParamSchema,
         });
 
-  pi.registerTool({
-    name: "report",
-    label: "Report",
-    description:
-      role === "orchestrator"
-        ? "Post a message into the active conversation and optionally attach a text, markdown, or image artifact."
-        : "Send a summary, progress note, blocking question, or artifact back to your orchestrator (never posted directly to humans).",
-    parameters: reportParameters,
-    async execute(_toolCallId, params) {
-      try {
-        let artifactPayload: Record<string, unknown> | undefined;
-        if (params.artifact && typeof params.artifact === "object") {
-          const a = params.artifact as {
-            filename?: string;
-            mime_type?: string;
-            content?: string;
-            base64?: string;
-            path?: string;
-          };
-          if (a.path) {
-            const abs = resolve(process.cwd(), a.path);
-            const st = statSync(abs);
-            if (st.size > 10 * 1024 * 1024) {
-              return textResult(`Artifact exceeds 10 MB limit (${st.size} bytes)`, true);
+  if (role !== "reviewer") {
+    pi.registerTool({
+      name: "report",
+      label: "Report",
+      description:
+        role === "orchestrator"
+          ? "Post a message into the active conversation and optionally attach a text, markdown, or image artifact."
+          : "Send a summary, progress note, blocking question, or artifact back to your orchestrator (never posted directly to humans).",
+      parameters: reportParameters,
+      async execute(_toolCallId, params) {
+        try {
+          let artifactPayload: Record<string, unknown> | undefined;
+          if (params.artifact && typeof params.artifact === "object") {
+            const a = params.artifact as {
+              filename?: string;
+              mime_type?: string;
+              content?: string;
+              base64?: string;
+              path?: string;
+            };
+            if (a.path) {
+              const abs = resolve(process.cwd(), a.path);
+              const st = statSync(abs);
+              if (st.size > 10 * 1024 * 1024) {
+                return textResult(`Artifact exceeds 10 MB limit (${st.size} bytes)`, true);
+              }
+              const bytes = readFileSync(abs);
+              const ext = abs.toLowerCase();
+              const inferredMime = ext.endsWith(".png")
+                ? "image/png"
+                : ext.endsWith(".jpg") || ext.endsWith(".jpeg")
+                  ? "image/jpeg"
+                  : ext.endsWith(".webp")
+                    ? "image/webp"
+                    : ext.endsWith(".md") || ext.endsWith(".markdown")
+                      ? "text/markdown"
+                      : "text/plain";
+              artifactPayload = {
+                filename: a.filename ?? basename(abs),
+                mime_type: a.mime_type ?? inferredMime,
+                base64: bytes.toString("base64"),
+              };
+            } else if (typeof a.base64 === "string") {
+              artifactPayload = {
+                filename: a.filename ?? "artifact.bin",
+                mime_type: a.mime_type ?? "application/octet-stream",
+                base64: a.base64,
+              };
+            } else if (typeof a.content === "string") {
+              const fname = a.filename ?? "report.txt";
+              const lowerName = fname.toLowerCase();
+              const inferredMime =
+                lowerName.endsWith(".md") || lowerName.endsWith(".markdown")
+                  ? "text/markdown"
+                  : "text/plain";
+              artifactPayload = {
+                filename: fname,
+                mime_type: a.mime_type ?? inferredMime,
+                base64: Buffer.from(a.content, "utf8").toString("base64"),
+              };
             }
-            const bytes = readFileSync(abs);
-            const ext = abs.toLowerCase();
-            const inferredMime = ext.endsWith(".png")
-              ? "image/png"
-              : ext.endsWith(".jpg") || ext.endsWith(".jpeg")
-                ? "image/jpeg"
-                : ext.endsWith(".webp")
-                  ? "image/webp"
-                  : ext.endsWith(".md") || ext.endsWith(".markdown")
-                    ? "text/markdown"
-                    : "text/plain";
-            artifactPayload = {
-              filename: a.filename ?? basename(abs),
-              mime_type: a.mime_type ?? inferredMime,
-              base64: bytes.toString("base64"),
-            };
-          } else if (typeof a.base64 === "string") {
-            artifactPayload = {
-              filename: a.filename ?? "artifact.bin",
-              mime_type: a.mime_type ?? "application/octet-stream",
-              base64: a.base64,
-            };
-          } else if (typeof a.content === "string") {
-            const fname = a.filename ?? "report.txt";
-            const lowerName = fname.toLowerCase();
-            const inferredMime =
-              lowerName.endsWith(".md") || lowerName.endsWith(".markdown")
-                ? "text/markdown"
-                : "text/plain";
-            artifactPayload = {
-              filename: fname,
-              mime_type: a.mime_type ?? inferredMime,
-              base64: Buffer.from(a.content, "utf8").toString("base64"),
-            };
           }
+          const inThread = (params as { in_thread?: unknown }).in_thread;
+          const res = await callHost("report", {
+            text: params.text,
+            ...(artifactPayload ? { artifact: artifactPayload } : {}),
+            ...(role === "orchestrator" && typeof inThread === "boolean"
+              ? { in_thread: inThread }
+              : {}),
+          });
+          return textResult(res);
+        } catch (err) {
+          return textResult(err instanceof Error ? err.message : String(err), true);
         }
-        const inThread = (params as { in_thread?: unknown }).in_thread;
-        const res = await callHost("report", {
-          text: params.text,
-          ...(artifactPayload ? { artifact: artifactPayload } : {}),
-          ...(role === "orchestrator" && typeof inThread === "boolean"
-            ? { in_thread: inThread }
-            : {}),
-        });
-        return textResult(res);
-      } catch (err) {
-        return textResult(err instanceof Error ? err.message : String(err), true);
-      }
-    },
-  });
+      },
+    });
+  }
 
   if (role === "orchestrator") {
     pi.registerTool({
@@ -401,6 +403,38 @@ export default function (pi: ExtensionAPI) {
       async execute(_toolCallId, params) {
         try {
           const res = await callHost("eject_to_implementer", { reason: params.reason });
+          return textResult(res);
+        } catch (err) {
+          return textResult(err instanceof Error ? err.message : String(err), true);
+        }
+      },
+    });
+  } else if (role === "reviewer") {
+    pi.registerTool({
+      name: "submit_review",
+      label: "Submit Review",
+      description:
+        "Submit your final review verdict ('approve', 'request_changes', or 'needs_owner') and summary for this issue.",
+      parameters: Type.Object({
+        verdict: Type.String({
+          description: "Review verdict: 'approve', 'request_changes', or 'needs_owner'",
+        }),
+        summary: Type.String({
+          description: "Concise 1-3 sentence summary of your review verdict and key findings",
+        }),
+        notes_md: Type.Optional(
+          Type.String({
+            description: "Optional detailed markdown review notes saved as an artifact",
+          }),
+        ),
+      }),
+      async execute(_toolCallId, params) {
+        try {
+          const res = await callHost("submit_review", {
+            verdict: params.verdict,
+            summary: params.summary,
+            ...(params.notes_md ? { notes_md: params.notes_md } : {}),
+          });
           return textResult(res);
         } catch (err) {
           return textResult(err instanceof Error ? err.message : String(err), true);

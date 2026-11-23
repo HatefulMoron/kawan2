@@ -4,6 +4,7 @@ import {
   branchTouchesKawanDir,
   commitsAhead,
   commitsBehindMain,
+  getSessionDiff,
   isWorkingTreeClean,
   runRepoChecks,
   syncBranchWithMain,
@@ -14,11 +15,15 @@ import { deriveTaskTitle } from "./sessions.js";
 import type {
   CheckRunItem,
   ConversationRow,
+  HostSettings,
+  IssueReviewRow,
+  IssueReviewerRow,
   IssueRow,
   IssueStatus,
   LandingMode,
   LandRow,
   MessageRow,
+  ReviewVerdict,
   SerializedIssue,
   SessionRow,
   UserRow,
@@ -31,6 +36,16 @@ export interface IssueReviewerInput {
   focus?: string | null;
 }
 
+interface ReviewerRunState {
+  issueId: string;
+  round: number;
+  slotId: string;
+  botId: string;
+  focus: string | null;
+  submitted?: IssueReviewRow;
+  notesMd?: string;
+}
+
 export class IssueManager {
   private readonly dataDir: string;
   private readonly db: KawanDb;
@@ -38,6 +53,13 @@ export class IssueManager {
   private readonly sessionManager: SessionManager;
   private readonly mergeQueue: MergeQueueManager;
   private readonly disableSandbox: boolean;
+  private closed = false;
+  private runningReviewCycles = new Set<string>();
+  private activeCycleTokens = new Map<string, symbol>();
+  private pendingAutoReview = new Map<string, { nextRound: number }>();
+  private consecutiveCheckFails = new Map<string, number>();
+  private activeReviewerSessions = new Map<string, Set<string>>();
+  private reviewerRunState = new Map<string, ReviewerRunState>();
 
   constructor(opts: {
     dataDir: string;
@@ -100,11 +122,111 @@ export class IssueManager {
         }
         return await this.syncWithMain(issue.id, { fromWorkerTool: true });
       },
+      submitReview: async (session, input) => {
+        return await this.handleSubmitReview(session, input);
+      },
+      onIssueWorkerTurnCompleted: async (issue, session) => {
+        await this.onWorkerTurnCompleted(issue, session);
+      },
     });
 
     this.mergeQueue.setIssueSyncCallback((land) => {
       this.onLandStatusChanged(land);
     });
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+    const issueIds = new Set<string>([
+      ...this.runningReviewCycles,
+      ...this.activeReviewerSessions.keys(),
+    ]);
+    await Promise.all([...issueIds].map((id) => this.cancelActiveReviewers(id)));
+  }
+
+  private async cancelActiveReviewers(issueId: string): Promise<void> {
+    this.pendingAutoReview.delete(issueId);
+    const active = this.activeReviewerSessions.get(issueId);
+    if (!active || active.size === 0) {
+      this.activeReviewerSessions.delete(issueId);
+      return;
+    }
+    this.activeReviewerSessions.delete(issueId);
+    await Promise.allSettled([...active].map((sid) => this.sessionManager.stopSession(sid)));
+  }
+
+  private async handleSubmitReview(
+    session: SessionRow,
+    input: { verdict: ReviewVerdict; summary: string; notes_md?: string },
+  ): Promise<{ review: IssueReviewRow }> {
+    const state = this.reviewerRunState.get(session.id);
+    if (!state) {
+      throw new Error("Reviewer session is no longer active");
+    }
+    if (state.submitted) {
+      return { review: state.submitted };
+    }
+    const issue = this.db.getIssue(state.issueId);
+    if (!issue) {
+      throw new Error("Issue no longer exists");
+    }
+    let notesArtifactId: string | null = null;
+    const cleanNotes = input.notes_md?.trim() || "";
+    if (cleanNotes) {
+      const conv = this.db.getConversation(issue.conversation_id);
+      const art = this.sessionManager.createTextArtifact({
+        content: cleanNotes,
+        filename: `review-r${state.round}-${state.slotId.slice(0, 6)}.md`,
+        mimeType: "text/markdown",
+        sessionId: session.id,
+        conversationId: issue.conversation_id,
+      });
+      notesArtifactId = art.id;
+      if (conv) {
+        this.wsServer.broadcastToConversation(conv, { type: "artifact.new", artifact: art });
+      }
+    }
+
+    const review = this.db.createIssueReview({
+      issueId: state.issueId,
+      round: state.round,
+      reviewerSlotId: state.slotId,
+      sessionId: session.id,
+      verdict: input.verdict,
+      summary: input.summary.trim(),
+      notesArtifactId,
+    });
+    state.submitted = review;
+    if (cleanNotes) {
+      state.notesMd = cleanNotes;
+    }
+    this.broadcastIssue(this.db.serializeIssue(this.db.getIssue(issue.id)!));
+    return { review };
+  }
+
+  private async onWorkerTurnCompleted(issue: IssueRow, session: SessionRow): Promise<void> {
+    if (this.closed) return;
+    if (issue.status !== "implementing" || session.status !== "idle") return;
+    if (this.runningReviewCycles.has(issue.id)) return;
+
+    const pending = this.pendingAutoReview.get(issue.id);
+    const shouldAutoFirstPass = !pending && Boolean(issue.auto_start_review) && issue.current_round === 0;
+    if (!pending && !shouldAutoFirstPass) return;
+
+    const settings = this.db.getHostSettings();
+    if (!settings.repo?.bare_path || !session.clone_path || !existsSync(session.clone_path)) {
+      return;
+    }
+    const clean = await isWorkingTreeClean(session.clone_path);
+    const ahead = clean ? await commitsAhead(session.clone_path, settings.repo.default_branch) : 0;
+    if (!clean || ahead < 1) {
+      // Implementer paused cleanly without committing new code (or left dirty state); stay in Collaborate
+      this.pendingAutoReview.delete(issue.id);
+      return;
+    }
+
+    this.pendingAutoReview.delete(issue.id);
+    await this.startReviewCycle(issue.id, { round: pending?.nextRound, isAuto: true });
   }
 
   resolveIssueRef(ref: string | number): IssueRow {
@@ -745,7 +867,10 @@ export class IssueManager {
     return true;
   }
 
-  async startReviewCycle(issueRef: string | number): Promise<{
+  async startReviewCycle(
+    issueRef: string | number,
+    opts?: { round?: number; isAuto?: boolean },
+  ): Promise<{
     issue: SerializedIssue;
     ok: boolean;
     checks: CheckRunItem[];
@@ -763,6 +888,9 @@ export class IssueManager {
     if (sess.status === "running") {
       throw new Error("Wait for the current worker turn to finish or Stop it before starting review");
     }
+    if (this.runningReviewCycles.has(issue.id)) {
+      throw new Error("A review cycle is already in progress for this issue");
+    }
     const clean = await isWorkingTreeClean(sess.clone_path);
     if (!clean) {
       throw new Error("Worker clone has uncommitted changes; commit before starting review");
@@ -776,57 +904,434 @@ export class IssueManager {
 
     const conv = this.db.getConversation(issue.conversation_id)!;
     const bot = this.db.getUser(sess.bot_id)!;
-    issue = this.db.updateIssue(issue.id, {
-      status: "verifying",
-      current_round: Math.max(1, issue.current_round),
-      needs_input_question: null,
-    })!;
-    this.broadcastIssue(this.db.serializeIssue(issue));
+    const prevReviews = this.db.listIssueReviews(issue.id);
+    const maxRecordedRound = prevReviews.reduce((m, r) => Math.max(m, r.round), 0);
+    const round = opts?.round ?? Math.max(1, maxRecordedRound + 1);
 
-    const checkRes = await runRepoChecks({
-      workdir: sess.clone_path,
-      verifyCommand: settings.verify_command,
-      sandboxEnabled: Boolean(bot.sandbox_enabled),
-      sandboxNetwork: Boolean(bot.sandbox_network),
-      disableSandbox: this.disableSandbox,
-    });
-    const touchesKawan = await branchTouchesKawanDir(sess.clone_path, settings.repo.default_branch);
+    const cycleToken = Symbol(`review-${issue.id}-${round}`);
+    this.runningReviewCycles.add(issue.id);
+    this.activeCycleTokens.set(issue.id, cycleToken);
+    let handedToBackgroundReviewers = false;
 
-    if (!checkRes.ok) {
-      const failArt = this.sessionManager.createTextArtifact({
-        content: checkRes.combined_output,
-        filename: "checks-failure.log",
-        sessionId: sess.id,
-        conversationId: conv.id,
+    try {
+      issue = this.db.updateIssue(issue.id, {
+        status: "verifying",
+        current_round: round,
+        needs_input_question: null,
+      })!;
+      this.broadcastIssue(this.db.serializeIssue(issue));
+
+      const checkRes = await runRepoChecks({
+        workdir: sess.clone_path,
+        verifyCommand: settings.verify_command,
+        sandboxEnabled: Boolean(bot.sandbox_enabled),
+        sandboxNetwork: Boolean(bot.sandbox_network),
+        disableSandbox: this.disableSandbox,
       });
-      this.wsServer.broadcastToConversation(conv, { type: "artifact.new", artifact: failArt });
+      const touchesKawan = await branchTouchesKawanDir(sess.clone_path, settings.repo.default_branch);
 
-      issue = this.db.updateIssue(issue.id, { status: "implementing" })!;
+      if (this.closed || this.activeCycleTokens.get(issue.id) !== cycleToken) {
+        return { issue: this.db.serializeIssue(this.db.getIssue(issue.id)!), ok: false, checks: checkRes.checks };
+      }
+
+      const reviewers = this.db.listIssueReviewers(issue.id);
+
+      if (!checkRes.ok) {
+        const failArt = this.sessionManager.createTextArtifact({
+          content: checkRes.combined_output,
+          filename: "checks-failure.log",
+          sessionId: sess.id,
+          conversationId: conv.id,
+        });
+        this.wsServer.broadcastToConversation(conv, { type: "artifact.new", artifact: failArt });
+
+        const autoLoopEnabled = reviewers.length > 0 || Boolean(issue.auto_start_review);
+        if (autoLoopEnabled) {
+          const fails = (this.consecutiveCheckFails.get(issue.id) ?? 0) + 1;
+          this.consecutiveCheckFails.set(issue.id, fails);
+          if (fails >= 2) {
+            const owner = this.db.getUser(issue.owner_id);
+            const q =
+              "Pre-review verification checks failed twice in a row. Inspect `checks-failure.log` and reply with guidance or fix manually.";
+            issue = this.db.updateIssue(issue.id, {
+              status: "needs_input",
+              needs_input_question: q,
+            })!;
+            this.pendingAutoReview.delete(issue.id);
+            this.postHostNote(conv, bot, `@${owner?.name ?? "owner"}: ${q}`, failArt.id);
+            const serialized = this.db.serializeIssue(issue);
+            this.broadcastIssue(serialized);
+            return { issue: serialized, ok: false, checks: checkRes.checks };
+          }
+          this.pendingAutoReview.set(issue.id, { nextRound: round });
+        }
+
+        issue = this.db.updateIssue(issue.id, { status: "implementing" })!;
+        this.postHostNote(
+          conv,
+          bot,
+          `Pre-review verification failed (${checkRes.summary}) — returning to implementer to fix.`,
+          failArt.id,
+        );
+        const serialized = this.db.serializeIssue(issue);
+        this.broadcastIssue(serialized);
+
+        void this.sessionManager.resumeIssueWorker(
+          sess.id,
+          [
+            `[Pre-review checks failed (${checkRes.summary})]`,
+            checkRes.combined_output,
+            "",
+            "Fix the failing checks cleanly, commit on your branch, and call report(summary).",
+          ].join("\n"),
+        );
+
+        return { issue: serialized, ok: false, checks: checkRes.checks };
+      }
+
+      this.consecutiveCheckFails.delete(issue.id);
+
+      if (reviewers.length === 0) {
+        const finalized = await this.finalizeApprovedReviewCycle({
+          issue,
+          sess,
+          conv,
+          implBot: bot,
+          settings,
+          checkRes,
+          touchesKawan,
+        });
+        return { issue: finalized.issue, ok: true, checks: checkRes.checks, land: finalized.land };
+      }
+
+      issue = this.db.updateIssue(issue.id, {
+        status: "reviewing",
+        current_round: round,
+        needs_input_question: null,
+      })!;
+      const serialized = this.db.serializeIssue(issue);
+      this.broadcastIssue(serialized);
       this.postHostNote(
         conv,
         bot,
-        `Pre-review verification failed (${checkRes.summary}) — returning to implementer to fix.`,
-        failArt.id,
-      );
-      const serialized = this.db.serializeIssue(issue);
-      this.broadcastIssue(serialized);
-
-      void this.sessionManager.resumeIssueWorker(
-        sess.id,
-        [
-          `[Pre-review checks failed (${checkRes.summary})]`,
-          checkRes.combined_output,
-          "",
-          "Fix the failing checks cleanly, commit on your branch, and call report(summary).",
-        ].join("\n"),
+        `Checks passed (${checkRes.summary}). Starting Review Round ${round}/${issue.max_rounds} with ${reviewers.length} reviewer${reviewers.length === 1 ? "" : "s"}.`,
       );
 
-      return { issue: serialized, ok: false, checks: checkRes.checks };
+      handedToBackgroundReviewers = true;
+      void this.runParallelReviewers({
+        issueId: issue.id,
+        cycleToken,
+        round,
+        sess,
+        conv,
+        implBot: bot,
+        reviewers,
+        checkRes,
+        touchesKawan,
+      });
+
+      return { issue: serialized, ok: true, checks: checkRes.checks };
+    } finally {
+      if (!handedToBackgroundReviewers && this.activeCycleTokens.get(issue.id) === cycleToken) {
+        this.runningReviewCycles.delete(issue.id);
+        this.activeCycleTokens.delete(issue.id);
+      }
     }
+  }
 
-    // Create or refresh land request linked to this issue
+  private async runParallelReviewers(params: {
+    issueId: string;
+    cycleToken: symbol;
+    round: number;
+    sess: SessionRow;
+    conv: ConversationRow;
+    implBot: UserRow;
+    reviewers: IssueReviewerRow[];
+    checkRes: { summary: string; combined_output: string };
+    touchesKawan: boolean;
+  }): Promise<void> {
+    try {
+      const settings = this.db.getHostSettings();
+      const issue = this.db.getIssue(params.issueId);
+      if (
+        !issue ||
+        this.closed ||
+        !params.sess.clone_path ||
+        !existsSync(params.sess.clone_path) ||
+        !settings.repo?.bare_path
+      ) {
+        return;
+      }
+
+      const diff = await getSessionDiff({
+        clonePath: params.sess.clone_path,
+        defaultBranch: settings.repo.default_branch,
+      });
+      let diffText = "(No diff available)";
+      if (diff.available) {
+        const chunks: string[] = [];
+        let total = 0;
+        for (const f of diff.files) {
+          const block = `### ${f.path} [${f.status}] (+${f.insertions}/-${f.deletions})\n\`\`\`diff\n${f.patch}\n\`\`\``;
+          if (total + block.length > 20_000) {
+            chunks.push("\n... (remaining files truncated)");
+            break;
+          }
+          chunks.push(block);
+          total += block.length;
+        }
+        diffText = chunks.join("\n\n") || "(Empty diff)";
+      }
+
+      const priorReviews = this.db
+        .listIssueReviews(issue.id)
+        .filter((r) => r.round < params.round);
+      const priorSection =
+        priorReviews.length > 0
+          ? priorReviews
+              .map(
+                (r) =>
+                  `- Round ${r.round} (${r.verdict}): ${r.summary}`,
+              )
+              .join("\n")
+          : "(None)";
+
+      const activeSet = new Set<string>();
+      this.activeReviewerSessions.set(issue.id, activeSet);
+
+      const results = await Promise.all(
+        params.reviewers.map(async (slot) => {
+          const reviewerBot = this.db.getUser(slot.bot_id) ?? params.implBot;
+          const focusLine = slot.focus?.trim()
+            ? `Your assigned review focus: ${slot.focus.trim()}`
+            : "Review holistically for correctness, edge cases, and maintainability.";
+          const roundGuidance =
+            params.round >= 2
+              ? `This is Review Round ${params.round} of ${issue.max_rounds}. Strictly verify whether prior blocking findings were resolved and check for regressions. Do NOT raise new style nits or scope creep.`
+              : "Focus on real bugs, missing requirements, edge cases, and test coverage rather than stylistic nitpicks.";
+
+          const systemPrompt = [
+            `You are read-only code reviewer @${reviewerBot.name} for Issue #${issue.number}: "${issue.title}".`,
+            focusLine,
+            roundGuidance,
+            "Rules:",
+            "- You are in a READ-ONLY workspace with no edit/write/bash commit rights.",
+            "- Inspect additional repository files read-only only if needed.",
+            "- Finish by calling submit_review(verdict, summary, notes_md?) with verdict 'approve', 'request_changes', or 'needs_owner'.",
+          ].join("\n");
+
+          const promptText = [
+            `# Review Request: Issue #${issue.number} — ${issue.title} (Round ${params.round}/${issue.max_rounds})`,
+            "",
+            "## Specification",
+            issue.body_md || "(No markdown specification provided.)",
+            "",
+            "## Implementer's Summary",
+            params.sess.last_report || "(No explicit report text.)",
+            "",
+            "## Pre-Review Checks",
+            params.checkRes.summary,
+            "",
+            "## Prior Review Rounds",
+            priorSection,
+            "",
+            "## Branch Diff vs Default Branch",
+            diffText,
+          ].join("\n");
+
+          let createdSessionId = "";
+          let notesMd: string | undefined;
+          let submitted: IssueReviewRow | undefined;
+
+          try {
+            const turn = await this.sessionManager.runReviewerSession({
+              bot: reviewerBot,
+              issue,
+              round: params.round,
+              focus: slot.focus,
+              clonePath: params.sess.clone_path!,
+              systemPrompt,
+              promptText,
+              onSessionCreated: (sid) => {
+                createdSessionId = sid;
+                activeSet.add(sid);
+                this.reviewerRunState.set(sid, {
+                  issueId: issue.id,
+                  round: params.round,
+                  slotId: slot.id,
+                  botId: reviewerBot.id,
+                  focus: slot.focus,
+                });
+              },
+            });
+
+            if (createdSessionId) {
+              const st = this.reviewerRunState.get(createdSessionId);
+              submitted = st?.submitted;
+              notesMd = st?.notesMd;
+            }
+
+            if (
+              !submitted &&
+              !this.closed &&
+              !turn.aborted &&
+              this.activeCycleTokens.get(issue.id) === params.cycleToken
+            ) {
+              const fallbackSummary = turn.errorMessage
+                ? `Reviewer failed: ${turn.errorMessage}`
+                : turn.assistantText.trim() || "Reviewer ended turn without submitting a structured verdict.";
+              submitted = this.db.createIssueReview({
+                issueId: issue.id,
+                round: params.round,
+                reviewerSlotId: slot.id,
+                sessionId: createdSessionId || null,
+                verdict: "needs_owner",
+                summary: fallbackSummary.slice(0, 600),
+              });
+            }
+          } finally {
+            if (createdSessionId) {
+              activeSet.delete(createdSessionId);
+              this.reviewerRunState.delete(createdSessionId);
+            }
+          }
+
+          return {
+            slot,
+            reviewerBot,
+            review: submitted,
+            notesMd,
+          };
+        }),
+      );
+
+      this.activeReviewerSessions.delete(issue.id);
+      if (this.closed || this.activeCycleTokens.get(issue.id) !== params.cycleToken) {
+        return;
+      }
+
+      const current = this.db.getIssue(issue.id);
+      if (!current || current.status !== "reviewing" || current.current_round !== params.round) {
+        return;
+      }
+
+      for (const item of results) {
+        if (!item.review) continue;
+        const focusTag = item.slot.focus?.trim() ? ` · ${item.slot.focus.trim()}` : "";
+        const verdictTag =
+          item.review.verdict === "approve"
+            ? "APPROVED"
+            : item.review.verdict === "request_changes"
+              ? "CHANGES REQUESTED"
+              : "NEEDS OWNER";
+        this.postHostNote(
+          params.conv,
+          item.reviewerBot,
+          `[Round ${params.round}/${current.max_rounds}${focusTag}] ${verdictTag}: ${item.review.summary}`,
+          item.review.notes_artifact_id,
+        );
+      }
+
+      const reviews = results.map((r) => r.review).filter((r): r is IssueReviewRow => Boolean(r));
+      const needsOwner = reviews.filter((r) => r.verdict === "needs_owner");
+      const changesRequested = results.filter((r) => r.review?.verdict === "request_changes");
+
+      if (needsOwner.length > 0) {
+        const owner = this.db.getUser(current.owner_id);
+        const question = needsOwner.map((r) => r.summary).join(" | ");
+        const updated = this.db.updateIssue(current.id, {
+          status: "needs_input",
+          needs_input_question: question,
+        })!;
+        this.postHostNote(
+          params.conv,
+          params.implBot,
+          `@${owner?.name ?? "owner"}: Reviewer escalated to owner in Round ${params.round}: ${question}`,
+        );
+        this.broadcastIssue(this.db.serializeIssue(updated));
+        return;
+      }
+
+      if (changesRequested.length === 0 && reviews.length === params.reviewers.length) {
+        await this.finalizeApprovedReviewCycle({
+          issue: current,
+          sess: params.sess,
+          conv: params.conv,
+          implBot: params.implBot,
+          settings,
+          checkRes: params.checkRes,
+          touchesKawan: params.touchesKawan,
+        });
+        return;
+      }
+
+      // Some reviewer requested changes
+      if (params.round >= current.max_rounds) {
+        const owner = this.db.getUser(current.owner_id);
+        const q = `Reached max review rounds (${params.round}/${current.max_rounds}) with changes still requested. Reply with guidance to revise, or click Return to Collaborate.`;
+        const updated = this.db.updateIssue(current.id, {
+          status: "needs_input",
+          needs_input_question: q,
+        })!;
+        this.postHostNote(params.conv, params.implBot, `@${owner?.name ?? "owner"}: ${q}`);
+        this.broadcastIssue(this.db.serializeIssue(updated));
+        return;
+      }
+
+      const feedbackBlocks = changesRequested.map((item, idx) => {
+        const focusLabel = item.slot.focus?.trim() ? ` (${item.slot.focus.trim()})` : "";
+        const notes = item.notesMd ? `\nNotes:\n${item.notesMd}` : "";
+        return `${idx + 1}. @${item.reviewerBot.name}${focusLabel}: ${item.review!.summary}${notes}`;
+      });
+      const revisionPrompt = [
+        `[Review Round ${params.round}/${current.max_rounds} — Changes Requested for Issue #${current.number}]`,
+        feedbackBlocks.join("\n\n"),
+        "",
+        "Address every requested change cleanly in your branch clone, run verification, commit, and call report(summary).",
+      ].join("\n");
+
+      const nextRound = params.round + 1;
+      this.pendingAutoReview.set(current.id, { nextRound });
+      const revisedIssue = this.db.updateIssue(current.id, {
+        status: "implementing",
+        needs_input_question: null,
+      })!;
+      this.postHostNote(
+        params.conv,
+        params.implBot,
+        `Review Round ${params.round}/${current.max_rounds} requested changes — resuming @${params.implBot.name} for revision (next: Round ${nextRound}).`,
+      );
+      this.broadcastIssue(this.db.serializeIssue(revisedIssue));
+
+      void this.sessionManager.resumeIssueWorker(params.sess.id, revisionPrompt).catch((err) => {
+        if (!this.closed) {
+          this.wsServer.broadcastToConversation(params.conv, {
+            type: "error",
+            conversation_id: params.conv.id,
+            session_id: params.sess.id,
+            message: err instanceof Error ? err.message : String(err),
+          });
+        }
+      });
+    } finally {
+      if (this.activeCycleTokens.get(params.issueId) === params.cycleToken) {
+        this.runningReviewCycles.delete(params.issueId);
+        this.activeCycleTokens.delete(params.issueId);
+      }
+    }
+  }
+
+  private async finalizeApprovedReviewCycle(params: {
+    issue: IssueRow;
+    sess: SessionRow;
+    conv: ConversationRow;
+    implBot: UserRow;
+    settings: HostSettings;
+    checkRes: { summary: string; combined_output: string; checks?: CheckRunItem[] };
+    touchesKawan: boolean;
+  }): Promise<{ issue: SerializedIssue; land: ReturnType<typeof serializeLand> }> {
     const existingLand = this.db
-      .listLands({ sessionId: sess.id })
+      .listLands({ sessionId: params.sess.id })
       .find(
         (l) =>
           l.status === "requested" ||
@@ -836,46 +1341,75 @@ export class IssueManager {
     const landRow = existingLand
       ? this.db.updateLand(existingLand.id, {
           status: "requested",
-          issue_id: issue.id,
-          conversation_id: conv.id,
+          issue_id: params.issue.id,
+          conversation_id: params.conv.id,
           thread_id: null,
-          checks_json: JSON.stringify(checkRes.checks),
-          touches_kawan: touchesKawan ? 1 : 0,
-          verify_output: checkRes.combined_output,
+          checks_json: JSON.stringify(params.checkRes.checks ?? []),
+          touches_kawan: params.touchesKawan ? 1 : 0,
+          verify_output: params.checkRes.combined_output,
           error: null,
         })!
       : (() => {
           const created = this.db.createLand({
-            sessionId: sess.id,
-            conversationId: conv.id,
-            issueId: issue.id,
+            sessionId: params.sess.id,
+            conversationId: params.conv.id,
+            issueId: params.issue.id,
           });
           return this.db.updateLand(created.id, {
-            checks_json: JSON.stringify(checkRes.checks),
-            touches_kawan: touchesKawan ? 1 : 0,
-            verify_output: checkRes.combined_output,
+            checks_json: JSON.stringify(params.checkRes.checks ?? []),
+            touches_kawan: params.touchesKawan ? 1 : 0,
+            verify_output: params.checkRes.combined_output,
           })!;
         })();
 
-    const updatedSess = this.db.updateSession(sess.id, { status: "review_requested" })!;
-    issue = this.db.updateIssue(issue.id, { status: "ready_to_land" })!;
+    const updatedSess = this.db.updateSession(params.sess.id, { status: "review_requested" })!;
+    this.wsServer.broadcast({
+      type: "session.update",
+      session: this.sessionManager.serializePublicSession(updatedSess),
+    });
 
-    const kawanWarn = touchesKawan
-      ? " (Modifies `.kawan/` checks — manual approval required before landing.)"
+    const wantsAutoLand = params.issue.landing_mode === "auto";
+    const canAutoLand = wantsAutoLand && !params.touchesKawan && !this.closed;
+
+    if (canAutoLand) {
+      this.wsServer.broadcast({ type: "land.update", land: serializeLand(landRow) });
+      this.postHostNote(
+        params.conv,
+        params.implBot,
+        `Checks (${params.checkRes.summary}) and reviews passed — auto-enqueueing Issue #${params.issue.number} onto the Merge Queue.`,
+      );
+      const enqueued = await this.mergeQueue.enqueueLand({
+        landId: landRow.id,
+        approvedBy: params.issue.owner_id,
+        trigger: "auto_land",
+        waitForSettlement: false,
+      });
+      const latestIssue = this.db.getIssue(params.issue.id)!;
+      return { issue: this.db.serializeIssue(latestIssue), land: enqueued.land };
+    }
+
+    const updatedIssue = this.db.updateIssue(params.issue.id, {
+      status: "ready_to_land",
+      needs_input_question: null,
+    })!;
+    const kawanWarn = params.touchesKawan
+      ? wantsAutoLand
+        ? " (Modifies `.kawan/` checks — auto-land downgraded to manual approval.)"
+        : " (Modifies `.kawan/` checks — manual approval required before landing.)"
       : "";
+    const defaultBranch = params.settings.repo?.default_branch ?? "main";
     this.postHostNote(
-      conv,
-      bot,
-      `Checks passed (${checkRes.summary}). Ready to approve land into \`${settings.repo.default_branch}\`.${kawanWarn}`,
+      params.conv,
+      params.implBot,
+      `Checks passed (${params.checkRes.summary}). Ready to approve land into \`${defaultBranch}\`.${kawanWarn}`,
     );
 
     const serializedLand = serializeLand(landRow);
-    const serializedIssue = this.db.serializeIssue(issue);
-    this.wsServer.broadcast({ type: "session.update", session: this.sessionManager.serializePublicSession(updatedSess) });
+    const serializedIssue = this.db.serializeIssue(updatedIssue);
     this.wsServer.broadcast({ type: "land.update", land: serializedLand });
     this.broadcastIssue(serializedIssue);
 
-    return { issue: serializedIssue, ok: true, checks: checkRes.checks, land: serializedLand };
+    return { issue: serializedIssue, land: serializedLand };
   }
 
   returnToCollaborate(issueRef: string | number): SerializedIssue {
@@ -883,6 +1417,10 @@ export class IssueManager {
     if (existing.status === "landed" || existing.status === "closed" || existing.status === "queued") {
       throw new Error(`Cannot return issue #${existing.number} in status ${existing.status} to collaborate`);
     }
+    this.activeCycleTokens.delete(existing.id);
+    this.runningReviewCycles.delete(existing.id);
+    this.consecutiveCheckFails.delete(existing.id);
+    void this.cancelActiveReviewers(existing.id);
     const updated = this.db.updateIssue(existing.id, {
       status: "implementing",
       needs_input_question: null,
@@ -900,6 +1438,9 @@ export class IssueManager {
 
   async stopIssue(issueRef: string | number): Promise<SerializedIssue> {
     const issue = this.resolveIssueRef(issueRef);
+    this.activeCycleTokens.delete(issue.id);
+    this.runningReviewCycles.delete(issue.id);
+    await this.cancelActiveReviewers(issue.id);
     if (issue.active_session_id) {
       await this.sessionManager.stopWorkerSession(issue.active_session_id);
     }
@@ -911,6 +1452,9 @@ export class IssueManager {
 
   async closeIssue(issueRef: string | number, abandon = false): Promise<SerializedIssue> {
     const issue = this.resolveIssueRef(issueRef);
+    this.activeCycleTokens.delete(issue.id);
+    this.runningReviewCycles.delete(issue.id);
+    await this.cancelActiveReviewers(issue.id);
     if (issue.active_session_id) {
       const lands = this.db.listLands({ sessionId: issue.active_session_id });
       for (const l of lands) {
@@ -978,5 +1522,47 @@ export class IssueManager {
       ...(nextStatus === "landed" ? { behind_main: 0, needs_input_question: null } : {}),
     })!;
     this.broadcastIssue(this.db.serializeIssue(updated));
+
+    if (nextStatus === "landed" && !this.closed) {
+      this.sendPostLandingSoulDigest(updated, land);
+    }
+  }
+
+  private sendPostLandingSoulDigest(issue: IssueRow, land: LandRow): void {
+    if (!issue.implementer_bot_id) return;
+    const implBot = this.db.getUser(issue.implementer_bot_id);
+    if (!implBot || implBot.kind !== "bot") return;
+    const conv = this.db.getConversation(issue.conversation_id);
+    if (!conv) return;
+    const settings = this.db.getHostSettings();
+    if (!settings.roles.default || Object.keys(settings.providers).length === 0) return;
+
+    const sess = issue.active_session_id ? this.db.getSession(issue.active_session_id) : null;
+    const reviews = this.db.listIssueReviews(issue.id);
+    const reviewSummary =
+      reviews.length > 0
+        ? reviews.map((r) => `- Round ${r.round} (${r.verdict}): ${r.summary}`).join("\n")
+        : "(Direct land with no extra reviewer rounds)";
+    const specExcerpt = issue.body_md ? issue.body_md.slice(0, 600) : "(None)";
+    const checkSummary = land.pause_reason
+      ? `Had merge-queue pause (${land.pause_reason}: ${land.error ?? ""}).`
+      : "Clean rebase & checks passed.";
+
+    const digestPrompt = [
+      `[post-land-soul-digest for Issue #${issue.number}: "${issue.title}"]`,
+      `Outcome: Landed cleanly via ${land.trigger}${land.landed_sha ? ` (${land.landed_sha.slice(0, 10)})` : ""}.`,
+      `Specification:\n${specExcerpt}`,
+      `Final implementation report:\n${sess?.last_report ?? "(None)"}`,
+      `Review findings:\n${reviewSummary}`,
+      `Verification & landing: ${checkSummary}`,
+      "",
+      "Review kawan://soul.md. If this issue uncovered any durable repository facts, build/test conventions, or human/workflow preferences worth carrying into future issues, update your soul with `soul_replace` or `soul_write` (staying under 4 KB). When finished (or if nothing durable needs adding), output exactly: NO_REPLY",
+    ].join("\n");
+
+    this.sessionManager.enqueueSoulDigest({
+      bot: implBot,
+      conversation: conv,
+      digestPrompt,
+    });
   }
 }
