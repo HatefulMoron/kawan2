@@ -229,3 +229,30 @@ export interface WsEventFrame {
   type: string;
   [key: string]: unknown;
 }
+
+export interface ReadCursorRow {
+  user_id: string;
+  conversation_id: string;
+  last_read_seq: number;
+  updated_at: number;
+}
+
+export interface SessionDiffFile {
+  path: string;
+  status: string;
+  insertions: number;
+  deletions: number;
+  patch: string;
+}
+
+export interface SessionDiffSummary {
+  available: boolean;
+  base_ref: string | null;
+  head_ref: string | null;
+  files_changed: number;
+  insertions: number;
+  deletions: number;
+  truncated: boolean;
+  files: SessionDiffFile[];
+  note?: string;
+}

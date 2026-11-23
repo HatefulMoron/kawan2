@@ -44,6 +44,10 @@ pub struct Conversation {
     #[serde(default)]
     pub last_seq: u64,
     #[serde(default)]
+    pub last_read_seq: u64,
+    #[serde(default)]
+    pub unread_count: u64,
+    #[serde(default)]
     pub members: Vec<Member>,
 }
 
@@ -315,6 +319,62 @@ pub struct InviteCreateData {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusRepoInfo {
+    pub url: String,
+    pub default_branch: String,
+    pub head_sha: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusReadData {
+    pub repo: Option<StatusRepoInfo>,
+    #[serde(default)]
+    pub sessions: Vec<SessionSummary>,
+    #[serde(default)]
+    pub lands: Vec<Land>,
+    #[serde(default)]
+    pub artifacts: Vec<Artifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationMarkReadData {
+    pub conversation_id: String,
+    pub last_read_seq: u64,
+    pub unread_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDiffFile {
+    pub path: String,
+    pub status: String,
+    pub insertions: u64,
+    pub deletions: u64,
+    pub patch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDiffSummary {
+    pub available: bool,
+    pub base_ref: Option<String>,
+    pub head_ref: Option<String>,
+    pub files_changed: u64,
+    pub insertions: u64,
+    pub deletions: u64,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub files: Vec<SessionDiffFile>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDiffData {
+    pub session_id: String,
+    pub diff: SessionDiffSummary,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerFrame {
@@ -363,6 +423,12 @@ pub enum ServerFrame {
     ArtifactNew { artifact: Artifact },
     #[serde(rename = "land.update")]
     LandUpdate { land: Land },
+    #[serde(rename = "read_cursor.update")]
+    ReadCursorUpdate {
+        conversation_id: String,
+        last_read_seq: u64,
+        unread_count: u64,
+    },
     #[serde(rename = "error")]
     Error {
         #[serde(default)]

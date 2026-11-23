@@ -102,6 +102,28 @@ function scrubSecretsForRecording(frame: unknown): unknown {
   return out;
 }
 
+function serializeConversationForUser(
+  db: KawanDb,
+  conv: ConversationRow,
+  userId: string,
+  cursors?: Map<string, number>,
+) {
+  const lastSeq = conv.next_seq - 1;
+  const lastReadSeq = cursors ? (cursors.get(conv.id) ?? 0) : db.getReadCursor(userId, conv.id);
+  return {
+    ...conv,
+    last_seq: lastSeq,
+    last_read_seq: lastReadSeq,
+    unread_count: Math.max(0, lastSeq - lastReadSeq),
+    members: db.listMembers(conv.id).map((m) => ({
+      id: m.id,
+      kind: m.kind,
+      name: m.name,
+      role: m.role,
+    })),
+  };
+}
+
 export class KawanWsServer {
   private readonly wss: WebSocketServer;
   private readonly clients = new Set<ClientConn>();
@@ -502,16 +524,10 @@ export class KawanWsServer {
       }
 
       case "conversation.list": {
-        const conversations = db.listConversationsForUser(user.id).map((c) => ({
-          ...c,
-          last_seq: c.next_seq - 1,
-          members: db.listMembers(c.id).map((m) => ({
-            id: m.id,
-            kind: m.kind,
-            name: m.name,
-            role: m.role,
-          })),
-        }));
+        const cursors = db.listReadCursorsForUser(user.id);
+        const conversations = db
+          .listConversationsForUser(user.id)
+          .map((c) => serializeConversationForUser(db, c, user.id, cursors));
         return { conversations };
       }
 
@@ -525,16 +541,7 @@ export class KawanWsServer {
           const existing = db.findDmBetween(user.id, peerId);
           if (existing) {
             return {
-              conversation: {
-                ...existing,
-                last_seq: existing.next_seq - 1,
-                members: db.listMembers(existing.id).map((m) => ({
-                  id: m.id,
-                  kind: m.kind,
-                  name: m.name,
-                  role: m.role,
-                })),
-              },
+              conversation: serializeConversationForUser(db, existing, user.id),
               created: false,
             };
           }
@@ -544,16 +551,7 @@ export class KawanWsServer {
               memberIds: peerId === user.id ? [user.id] : [user.id, peerId],
             }),
           );
-          const payload = {
-            ...conv,
-            last_seq: conv.next_seq - 1,
-            members: db.listMembers(conv.id).map((m) => ({
-              id: m.id,
-              kind: m.kind,
-              name: m.name,
-              role: m.role,
-            })),
-          };
+          const payload = serializeConversationForUser(db, conv, user.id);
           this.broadcastToConversation(conv, { type: "conversation.new", conversation: payload });
           return { conversation: payload, created: true };
         }
@@ -580,16 +578,7 @@ export class KawanWsServer {
             memberIds: [...memberIds],
           }),
         );
-        const payload = {
-          ...conv,
-          last_seq: conv.next_seq - 1,
-          members: db.listMembers(conv.id).map((m) => ({
-            id: m.id,
-            kind: m.kind,
-            name: m.name,
-            role: m.role,
-          })),
-        };
+        const payload = serializeConversationForUser(db, conv, user.id);
         this.broadcastToConversation(conv, { type: "conversation.new", conversation: payload });
         return { conversation: payload, created: true };
       }
@@ -603,16 +592,7 @@ export class KawanWsServer {
         const target = db.getUser(memberId);
         if (!target) throw new Error(`User not found: ${memberId}`);
         const added = db.addMember(convId, memberId);
-        const payload = {
-          ...conv,
-          last_seq: conv.next_seq - 1,
-          members: db.listMembers(convId).map((m) => ({
-            id: m.id,
-            kind: m.kind,
-            name: m.name,
-            role: m.role,
-          })),
-        };
+        const payload = serializeConversationForUser(db, conv, user.id);
         if (added) {
           this.broadcastToConversation(conv, { type: "conversation.new", conversation: payload });
         }
@@ -627,6 +607,11 @@ export class KawanWsServer {
         if (conv.kind === "dm" && !db.isMember(convId, user.id)) {
           throw new Error("Not a member of this DM");
         }
+        const lastSeq = conv.next_seq - 1;
+        const lastReadSeq =
+          req.mark_read === false
+            ? db.getReadCursor(user.id, convId)
+            : db.markConversationRead(user.id, convId, lastSeq).last_read_seq;
         const members = db.listMembers(convId).map((m) => ({
           id: m.id,
           kind: m.kind,
@@ -644,7 +629,9 @@ export class KawanWsServer {
         return {
           conversation: {
             ...conv,
-            last_seq: conv.next_seq - 1,
+            last_seq: lastSeq,
+            last_read_seq: lastReadSeq,
+            unread_count: Math.max(0, lastSeq - lastReadSeq),
           },
           members,
           messages,
@@ -652,6 +639,37 @@ export class KawanWsServer {
           sessions,
           artifacts,
           lands,
+        };
+      }
+
+      case "conversation.mark_read": {
+        const convId = String(req.conversation_id ?? "");
+        if (!convId) throw new Error("conversation_id is required");
+        const conv = db.getConversation(convId);
+        if (!conv) throw new Error(`Conversation not found: ${convId}`);
+        if (conv.kind === "dm" && !db.isMember(convId, user.id)) {
+          throw new Error("Not a member of this DM");
+        }
+        const lastSeq = conv.next_seq - 1;
+        const requestedSeq =
+          typeof req.seq === "number" && Number.isFinite(req.seq)
+            ? Math.min(lastSeq, Math.max(0, Math.floor(req.seq)))
+            : lastSeq;
+        const cursor = db.markConversationRead(user.id, convId, requestedSeq);
+        const unreadCount = Math.max(0, lastSeq - cursor.last_read_seq);
+        this.broadcast(
+          {
+            type: "read_cursor.update",
+            conversation_id: convId,
+            last_read_seq: cursor.last_read_seq,
+            unread_count: unreadCount,
+          },
+          (u) => u.id === user.id,
+        );
+        return {
+          conversation_id: convId,
+          last_read_seq: cursor.last_read_seq,
+          unread_count: unreadCount,
         };
       }
 
@@ -677,6 +695,7 @@ export class KawanWsServer {
           body,
           threadId,
         });
+        db.markConversationRead(user.id, convId, message.seq);
         this.broadcastToConversation(conv, {
           type: "message.new",
           message,

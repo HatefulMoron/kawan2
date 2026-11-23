@@ -13,7 +13,7 @@ import {
   testDecisionModel,
   type DecisionMode,
 } from "./decisions.js";
-import { attachRepository, ensureHostSshKey, generateBotKeypair } from "./git.js";
+import { attachRepository, ensureHostSshKey, generateBotKeypair, getBranchHead } from "./git.js";
 import { serializeSession, SessionManager, type SoulHandlers } from "./sessions.js";
 import { createSoulHandlers, INITIAL_SOUL_DOCUMENT } from "./soul.js";
 import type {
@@ -690,6 +690,40 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
         }
       }
       return { decision: updated };
+    },
+
+    "status.read": async () => {
+      const settings = db.getHostSettings();
+      let headSha: string | null = null;
+      if (settings.repo?.bare_path && settings.repo.default_branch) {
+        try {
+          headSha = await getBranchHead(
+            settings.repo.bare_path,
+            `refs/heads/${settings.repo.default_branch}`,
+          );
+        } catch {
+          headSha = null;
+        }
+      }
+      return {
+        repo: settings.repo
+          ? {
+              url: settings.repo.url,
+              default_branch: settings.repo.default_branch,
+              head_sha: headSha,
+            }
+          : null,
+        sessions: db.listSessions({ kind: "worker" }).map(serializeSession),
+        lands: db.listLands(),
+        artifacts: db.listArtifacts(),
+      };
+    },
+
+    "session.diff": async (req) => {
+      const sessionId = String(req.session_id ?? "").trim();
+      if (!sessionId) throw new Error("session_id is required");
+      const diff = await sessionManager.getSessionDiff(sessionId);
+      return { session_id: sessionId, diff };
     },
   };
 

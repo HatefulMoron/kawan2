@@ -11,10 +11,11 @@ use serde_json::{Value, json};
 use crate::mock;
 use crate::protocol::{
     Artifact, ArtifactGetData, BotCreateData, BotListData, BotSummary, Conversation,
-    ConversationCreateData, ConversationListData, ConversationOpenData, Decision, InviteCreateData,
-    Land, LandApproveData, Member, Message, ModelsTestData, ServerFrame, SessionListData,
-    SessionOpenData, SessionSummary, SettingsView, SetupStatus, UserListData, UserSummary,
-    parse_invite_link,
+    ConversationCreateData, ConversationListData, ConversationMarkReadData, ConversationOpenData,
+    Decision, InviteCreateData, Land, LandApproveData, Member, Message, ModelsTestData,
+    ServerFrame, SessionDiffData, SessionDiffSummary, SessionListData, SessionOpenData,
+    SessionSummary, SettingsView, SetupStatus, StatusReadData, StatusRepoInfo, UserListData,
+    UserSummary, parse_invite_link,
 };
 use crate::ssh::default_ssh_key_path;
 use crate::ws_client::{AuthMode, ConnectConfig, WsEvent, WsHandle};
@@ -28,6 +29,7 @@ pub enum Screen {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspacePage {
+    Status,
     Conversation,
     Settings(SettingsTab),
 }
@@ -37,6 +39,12 @@ pub enum SettingsTab {
     Repository,
     Models,
     Bots,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionDrawerTab {
+    Overview,
+    Changes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,11 +132,16 @@ pub struct KawanApp {
     pub loaded_artifacts: HashMap<String, LoadedArtifact>,
     pub expanded_artifacts: HashSet<String>,
     pub session_entries: HashMap<String, Vec<Value>>,
+    pub status_repo: Option<StatusRepoInfo>,
 
     // Conversation interactive state
     pub composer_text: String,
     pub thread_composer_text: String,
     pub right_panel: RightPanel,
+    pub session_drawer_tab: SessionDrawerTab,
+    pub session_diffs: HashMap<String, SessionDiffSummary>,
+    pub session_diff_loading: HashSet<String>,
+    pub selected_diff_file: HashMap<String, String>,
     pub redirect_menu_decision_id: Option<String>,
     pub show_add_member: bool,
     pub show_new_channel: bool,
@@ -227,10 +240,15 @@ impl KawanApp {
             loaded_artifacts: HashMap::new(),
             expanded_artifacts: HashSet::new(),
             session_entries: HashMap::new(),
+            status_repo: None,
 
             composer_text: String::new(),
             thread_composer_text: String::new(),
             right_panel: RightPanel::None,
+            session_drawer_tab: SessionDrawerTab::Overview,
+            session_diffs: HashMap::new(),
+            session_diff_loading: HashSet::new(),
+            selected_diff_file: HashMap::new(),
             redirect_menu_decision_id: None,
             show_add_member: false,
             show_new_channel: false,
@@ -454,6 +472,8 @@ impl KawanApp {
             }
             ServerFrame::MessageNew { message, author } => {
                 let conv_id = message.conversation_id.clone();
+                let msg_seq = message.seq;
+                let author_is_self = author.id == self.current_user_id;
                 if let Some(members) = self.members_by_conv.get_mut(&conv_id)
                     && !members.iter().any(|m| m.id == author.id)
                 {
@@ -464,10 +484,26 @@ impl KawanApp {
                         role: "member".to_string(),
                     });
                 }
-                let list = self.messages_by_conv.entry(conv_id).or_default();
+                let list = self.messages_by_conv.entry(conv_id.clone()).or_default();
                 if !list.iter().any(|m| m.id == message.id) {
                     list.push(message);
                     list.sort_by_key(|m| m.seq);
+                }
+                let viewing_active = self.screen == Screen::Workspace(WorkspacePage::Conversation)
+                    && self.active_conversation_id.as_deref() == Some(conv_id.as_str());
+                if let Some(conv) = self.conversations.iter_mut().find(|c| c.id == conv_id) {
+                    conv.last_seq = conv.last_seq.max(msg_seq);
+                    conv.next_seq = conv.next_seq.max(conv.last_seq + 1);
+                    if viewing_active || author_is_self {
+                        conv.last_read_seq = conv.last_read_seq.max(msg_seq);
+                    }
+                    conv.unread_count = conv.last_seq.saturating_sub(conv.last_read_seq);
+                }
+                if viewing_active && !author_is_self && !self.is_mock {
+                    self.send_cmd(
+                        "conversation.mark_read",
+                        json!({ "conversation_id": conv_id, "seq": msg_seq }),
+                    );
                 }
             }
             ServerFrame::DecisionNew { decision } => {
@@ -505,7 +541,33 @@ impl KawanApp {
                 }
             }
             ServerFrame::LandUpdate { land } => {
+                let sess_id = land.session_id.clone();
+                let is_landed = land.status == "landed";
                 self.lands_by_id.insert(land.id.clone(), land);
+                if is_landed {
+                    self.session_diffs.remove(&sess_id);
+                    self.session_diff_loading.remove(&sess_id);
+                    if self.right_panel == RightPanel::Session(sess_id.clone())
+                        && self.session_drawer_tab == SessionDrawerTab::Changes
+                        && !self.is_mock
+                    {
+                        self.fetch_session_diff(&sess_id);
+                    }
+                }
+            }
+            ServerFrame::ReadCursorUpdate {
+                conversation_id,
+                last_read_seq,
+                unread_count,
+            } => {
+                if let Some(conv) = self
+                    .conversations
+                    .iter_mut()
+                    .find(|c| c.id == conversation_id)
+                {
+                    conv.last_read_seq = last_read_seq;
+                    conv.unread_count = unread_count;
+                }
             }
             ServerFrame::Error {
                 conversation_id,
@@ -703,6 +765,56 @@ impl KawanApp {
                     self.error_banner = None;
                 }
             }
+            "status.read" => {
+                if let Ok(res) = serde_json::from_value::<StatusReadData>(val) {
+                    self.status_repo = res.repo;
+                    for s in res.sessions {
+                        self.sessions_by_id.insert(s.id.clone(), s);
+                    }
+                    for l in res.lands {
+                        self.lands_by_id.insert(l.id.clone(), l);
+                    }
+                    for art in res.artifacts {
+                        let aid = art.id.clone();
+                        let should_fetch = !self.loaded_artifacts.contains_key(&aid)
+                            && !art.mime_type.starts_with("image/");
+                        self.artifacts_by_id.insert(aid.clone(), art);
+                        if should_fetch && !self.is_mock {
+                            self.send_cmd("artifact.get", json!({ "artifact_id": aid }));
+                        }
+                    }
+                }
+            }
+            "conversation.mark_read" => {
+                if let Ok(res) = serde_json::from_value::<ConversationMarkReadData>(val)
+                    && let Some(conv) = self
+                        .conversations
+                        .iter_mut()
+                        .find(|c| c.id == res.conversation_id)
+                {
+                    conv.last_read_seq = res.last_read_seq;
+                    conv.unread_count = res.unread_count;
+                }
+            }
+            "session.diff" => {
+                if let Ok(res) = serde_json::from_value::<SessionDiffData>(val) {
+                    let sid = res.session_id;
+                    self.session_diff_loading.remove(&sid);
+                    let valid_selected = self
+                        .selected_diff_file
+                        .get(&sid)
+                        .is_some_and(|p| res.diff.files.iter().any(|f| &f.path == p));
+                    if !valid_selected {
+                        if let Some(first) = res.diff.files.first() {
+                            self.selected_diff_file
+                                .insert(sid.clone(), first.path.clone());
+                        } else {
+                            self.selected_diff_file.remove(&sid);
+                        }
+                    }
+                    self.session_diffs.insert(sid, res.diff);
+                }
+            }
             _ => {}
         }
     }
@@ -767,6 +879,7 @@ impl KawanApp {
         self.send_cmd("user.list", json!({}));
         self.send_cmd("conversation.list", json!({}));
         self.send_cmd("session.list", json!({}));
+        self.send_cmd("status.read", json!({}));
     }
 
     pub fn open_conversation(&mut self, conv_id: &str) {
@@ -776,8 +889,30 @@ impl KawanApp {
         self.redirect_menu_decision_id = None;
         self.show_add_member = false;
         self.focus_target = FocusTarget::Composer;
+        if let Some(conv) = self.conversations.iter_mut().find(|c| c.id == conv_id) {
+            conv.last_read_seq = conv.last_read_seq.max(conv.last_seq);
+            conv.unread_count = 0;
+        }
         if !self.is_mock {
             self.send_cmd("conversation.open", json!({ "conversation_id": conv_id }));
+        }
+    }
+
+    pub fn open_conversation_thread(&mut self, conv_id: &str, thread_id: Option<&str>) {
+        self.open_conversation(conv_id);
+        if let Some(tid) = thread_id {
+            self.right_panel = RightPanel::Thread(tid.to_string());
+            self.focus_target = FocusTarget::ThreadComposer;
+        }
+    }
+
+    pub fn open_status(&mut self) {
+        self.screen = Screen::Workspace(WorkspacePage::Status);
+        self.right_panel = RightPanel::None;
+        self.redirect_menu_decision_id = None;
+        self.show_add_member = false;
+        if !self.is_mock {
+            self.send_cmd("status.read", json!({}));
         }
     }
 
@@ -815,9 +950,28 @@ impl KawanApp {
 
     pub fn open_session_inspector(&mut self, session_id: &str) {
         self.right_panel = RightPanel::Session(session_id.to_string());
+        self.session_drawer_tab = SessionDrawerTab::Overview;
         if !self.is_mock {
             self.send_cmd("session.open", json!({ "session_id": session_id }));
+            self.fetch_session_diff(session_id);
         }
+    }
+
+    pub fn open_session_changes(&mut self, session_id: &str) {
+        self.right_panel = RightPanel::Session(session_id.to_string());
+        self.session_drawer_tab = SessionDrawerTab::Changes;
+        if !self.is_mock {
+            self.send_cmd("session.open", json!({ "session_id": session_id }));
+            self.fetch_session_diff(session_id);
+        }
+    }
+
+    pub fn fetch_session_diff(&mut self, session_id: &str) {
+        if self.is_mock {
+            return;
+        }
+        self.session_diff_loading.insert(session_id.to_string());
+        self.send_cmd("session.diff", json!({ "session_id": session_id }));
     }
 
     pub fn send_composer_message(&mut self) {
@@ -939,6 +1093,8 @@ impl KawanApp {
                 next_seq: 1,
                 created_at: 0,
                 last_seq: 0,
+                last_read_seq: 0,
+                unread_count: 0,
                 members: Vec::new(),
             });
             self.show_new_channel = false;
@@ -1255,6 +1411,15 @@ impl KawanApp {
             if conv.kind == "channel" {
                 return format!("#{}", conv.name.as_deref().unwrap_or("channel"));
             }
+            if let Some(members) = self.members_by_conv.get(conv_id)
+                && let Some(peer) = members.iter().find(|m| m.id != self.current_user_id)
+            {
+                return if peer.kind == "bot" {
+                    format!("@{}", peer.name)
+                } else {
+                    peer.name.clone()
+                };
+            }
             return "DM".to_string();
         }
         "chat".to_string()
@@ -1268,6 +1433,29 @@ impl KawanApp {
             .collect();
         matches.sort_by_key(|l| l.created_at);
         matches.last().copied()
+    }
+
+    pub fn status_counts(&self) -> (usize, usize, usize) {
+        let mut needs_you = 0usize;
+        let mut waiting = 0usize;
+        let mut in_flight = 0usize;
+        for sess in self.all_worker_sessions() {
+            let land_status = self.land_for_session(&sess.id).map(|l| l.status.as_str());
+            if land_status == Some("failed")
+                || (sess.status == "failed" && land_status != Some("landed"))
+            {
+                needs_you += 1;
+            } else if matches!(land_status, Some("requested" | "verifying"))
+                || (sess.status == "review_requested" && land_status != Some("landed"))
+            {
+                waiting += 1;
+            } else if matches!(sess.status.as_str(), "running" | "idle")
+                && land_status != Some("landed")
+            {
+                in_flight += 1;
+            }
+        }
+        (needs_you, waiting, in_flight)
     }
 
     pub fn actor_name(&self, user_id: &str) -> String {

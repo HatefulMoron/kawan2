@@ -12,6 +12,7 @@ import type {
   LandRow,
   LandStatus,
   MessageRow,
+  ReadCursorRow,
   SessionKind,
   SessionRow,
   SessionStatus,
@@ -251,6 +252,15 @@ export class KawanDb {
     if (!landCols.some((c) => c.name === "message_id")) {
       this.sqlite.exec("ALTER TABLE lands ADD COLUMN message_id TEXT");
     }
+    this.sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS read_cursors (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        last_read_seq INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (user_id, conversation_id)
+      );
+    `);
   }
 
   // ---- Settings ----
@@ -1075,5 +1085,41 @@ export class KawanDb {
         id,
       );
     return this.getLand(id);
+  }
+
+  // ---- Read Cursors ----
+  getReadCursor(userId: string, conversationId: string): number {
+    const row = this.sqlite
+      .prepare("SELECT last_read_seq FROM read_cursors WHERE user_id = ? AND conversation_id = ?")
+      .get(userId, conversationId) as { last_read_seq: number } | undefined;
+    return row ? row.last_read_seq : 0;
+  }
+
+  listReadCursorsForUser(userId: string): Map<string, number> {
+    const rows = this.sqlite
+      .prepare("SELECT conversation_id, last_read_seq FROM read_cursors WHERE user_id = ?")
+      .all(userId) as Array<{ conversation_id: string; last_read_seq: number }>;
+    const map = new Map<string, number>();
+    for (const r of rows) {
+      map.set(r.conversation_id, r.last_read_seq);
+    }
+    return map;
+  }
+
+  markConversationRead(userId: string, conversationId: string, seq: number): ReadCursorRow {
+    const clampedSeq = Math.max(0, Math.floor(seq));
+    const now = Date.now();
+    this.sqlite
+      .prepare(
+        `INSERT INTO read_cursors (user_id, conversation_id, last_read_seq, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(user_id, conversation_id) DO UPDATE SET
+           last_read_seq = MAX(read_cursors.last_read_seq, excluded.last_read_seq),
+           updated_at = excluded.updated_at`,
+      )
+      .run(userId, conversationId, clampedSeq, now);
+    return this.sqlite
+      .prepare("SELECT * FROM read_cursors WHERE user_id = ? AND conversation_id = ?")
+      .get(userId, conversationId) as unknown as ReadCursorRow;
   }
 }

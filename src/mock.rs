@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use crate::protocol::{
     Artifact, BotSummary, Conversation, Decision, DecisionRoleView, DefaultRoleView, Land, Member,
-    Message, ModelDefView, ProviderView, RepoSettingsView, RolesView, SessionSummary, SettingsView,
-    SetupStatus, UserSummary,
+    Message, ModelDefView, ProviderView, RepoSettingsView, RolesView, SessionDiffFile,
+    SessionDiffSummary, SessionSummary, SettingsView, SetupStatus, StatusRepoInfo, UserSummary,
 };
 use crate::state::{FocusTarget, KawanApp, LoadedArtifact, Screen, WorkspacePage};
 
@@ -27,6 +27,11 @@ pub fn populate_mock(app: &mut KawanApp) {
         has_bot: true,
         ready: true,
     };
+    app.status_repo = Some(StatusRepoInfo {
+        url: "git@github.com:kawan-dev/kawan.git".to_string(),
+        default_branch: "main".to_string(),
+        head_sha: Some("c8a41f001122aabb".to_string()),
+    });
 
     let mut providers = HashMap::new();
     providers.insert(
@@ -148,6 +153,8 @@ pub fn populate_mock(app: &mut KawanApp) {
             next_seq: 2,
             created_at: 1,
             last_seq: 1,
+            last_read_seq: 0,
+            unread_count: 1,
             members: members.clone(),
         },
         Conversation {
@@ -160,6 +167,8 @@ pub fn populate_mock(app: &mut KawanApp) {
             next_seq: 6,
             created_at: 2,
             last_seq: 5,
+            last_read_seq: 5,
+            unread_count: 0,
             members: members.clone(),
         },
     ];
@@ -168,10 +177,39 @@ pub fn populate_mock(app: &mut KawanApp) {
     app.members_by_conv.insert(conv_runtime.clone(), members);
     app.active_conversation_id = Some(conv_runtime.clone());
 
+    let sess_0 = "1a4d0e22-0000-4000-8000-000000000000".to_string();
     let sess_1 = "8f2a9c41-0001-4000-8000-000000000001".to_string();
     let sess_2 = "3b71d20e-0002-4000-8000-000000000002".to_string();
+    let art_0 = "art-hold-report".to_string();
     let art_1 = "art-pty-check".to_string();
+    let land_0 = "land-hold-countdown".to_string();
     let land_1 = "land-pty-check".to_string();
+
+    app.sessions_by_id.insert(
+        sess_0.clone(),
+        SessionSummary {
+            id: sess_0.clone(),
+            bot_id: bot_id.clone(),
+            parent_session_id: Some("orch-1".to_string()),
+            kind: "worker".to_string(),
+            conversation_id: Some(conv_general.clone()),
+            thread_id: None,
+            title: Some("Add SubQ Snap hold countdown timer".to_string()),
+            task: Some("Add 10s hold expiry countdown pill and Send Now button.".to_string()),
+            status: "landed".to_string(),
+            branch: Some(format!("kawan/{sess_0}")),
+            clone_path: None,
+            agent_dir: None,
+            pi_session_file: None,
+            last_entry_id: None,
+            last_report: Some(
+                "Added live countdown chip and immediate dispatch button.".to_string(),
+            ),
+            soul_snapshot: None,
+            created_at: 40,
+            updated_at: 95,
+        },
+    );
 
     app.sessions_by_id.insert(
         sess_1.clone(),
@@ -222,6 +260,29 @@ pub fn populate_mock(app: &mut KawanApp) {
         },
     );
 
+    let art_0_obj = Artifact {
+        id: art_0.clone(),
+        sha256: "99a01f22e334b810".to_string(),
+        mime_type: "text/markdown".to_string(),
+        byte_size: 162,
+        filename: Some("report.md".to_string()),
+        session_id: Some(sess_0.clone()),
+        conversation_id: Some(conv_general.clone()),
+        message_id: None,
+        created_at: 90,
+    };
+    app.artifacts_by_id.insert(art_0.clone(), art_0_obj);
+    app.loaded_artifacts.insert(
+        art_0,
+        LoadedArtifact {
+            text_preview: Some(
+                "# Summary\n\nAdded a 10-second readiness hold timer in host/src/server.ts and rendered the live countdown + Send Now action in decision chips."
+                    .to_string(),
+            ),
+            image: None,
+        },
+    );
+
     let artifact_obj = Artifact {
         id: art_1.clone(),
         sha256: "b6e41c739902a1f8".to_string(),
@@ -248,6 +309,25 @@ pub fn populate_mock(app: &mut KawanApp) {
     app.expanded_artifacts.insert(art_1.clone());
 
     app.lands_by_id.insert(
+        land_0,
+        Land {
+            id: "land-hold-countdown".to_string(),
+            session_id: sess_0.clone(),
+            conversation_id: conv_general,
+            thread_id: None,
+            message_id: None,
+            status: "landed".to_string(),
+            approved_by: Some(alice_id.clone()),
+            base_sha: Some("91f02a110099".to_string()),
+            landed_sha: Some("c8a41f001122aabb".to_string()),
+            verify_output: Some("13 passed, 0 failed".to_string()),
+            error: None,
+            created_at: 92,
+            updated_at: 95,
+        },
+    );
+
+    app.lands_by_id.insert(
         land_1,
         Land {
             id: "land-pty-check".to_string(),
@@ -263,6 +343,30 @@ pub fn populate_mock(app: &mut KawanApp) {
             error: None,
             created_at: 196,
             updated_at: 196,
+        },
+    );
+
+    app.selected_diff_file
+        .insert(sess_1.clone(), "src/pty/teardown.rs".to_string());
+    app.session_diffs.insert(
+        sess_1.clone(),
+        SessionDiffSummary {
+            available: true,
+            base_ref: Some("c8a41f001122".to_string()),
+            head_ref: Some("7a9d312ee401".to_string()),
+            files_changed: 1,
+            insertions: 4,
+            deletions: 1,
+            truncated: false,
+            files: vec![SessionDiffFile {
+                path: "src/pty/teardown.rs".to_string(),
+                status: "M".to_string(),
+                insertions: 4,
+                deletions: 1,
+                patch: "@@ -18,5 +18,8 @@ pub fn kill_worker_group(pgid: i32) {\n-    unsafe { libc::kill(pgid, libc::SIGTERM); }\n+    // Signal the entire process group so pi child trees clean up FDs.\n+    unsafe {\n+        libc::kill(-pgid, libc::SIGTERM);\n+        libc::close(pty_master_fd);\n+    }\n }"
+                    .to_string(),
+            }],
+            note: None,
         },
     );
 

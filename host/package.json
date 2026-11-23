@@ -7,7 +7,7 @@
     "typecheck": "tsc --noEmit",
     "start": "tsx src/index.ts",
     "dev:host": "tsx src/dev-host.ts",
-    "test": "tsx --test --test-timeout=30000 test/slice1.test.ts test/slice2.test.ts test/slice3.test.ts test/slice4.test.ts test/slice5.test.ts test/bwrap.test.ts",
+    "test": "tsx --test --test-timeout=30000 test/slice1.test.ts test/slice2.test.ts test/slice3.test.ts test/slice4.test.ts test/slice5.test.ts test/bwrap.test.ts test/sliceA.test.ts",
     "test:routing": "tsx test/routing-harness.ts"
   },
   "dependencies": {

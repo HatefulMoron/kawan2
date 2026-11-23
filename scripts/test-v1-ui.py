@@ -170,7 +170,7 @@ def main() -> int:
             ui.shot("/tmp/v1-05-settings-bots.png")
 
             # 6. Open #general via left rail
-            ui.click(120, 102)
+            ui.click(100, 162)
             ui.sleep(0.6)
             ui.shot("/tmp/v1-06-general-empty.png")
 
@@ -201,6 +201,24 @@ def main() -> int:
             if not approve_pos:
                 raise TimeoutError("Timed out waiting for APPROVE LAND button on thread tray")
 
+            # 8b. Check Repository Status (Waiting to Land) and open live branch Changes drawer
+            ui.click(100, 85)
+            ui.sleep(0.6)
+            status_approve_pos = locate_optional(
+                ui, "#102015", tolerance=12, region=(1080, 180, 1280, 520), minimum=400
+            )
+            ui.shot("/tmp/v1-07c-status-waiting.png")
+            if not status_approve_pos:
+                raise RuntimeError("Could not locate APPROVE LAND button on Repository Status Waiting card")
+
+            ui.click(635, status_approve_pos[1])  # CHANGES button in card footer
+            ui.sleep(0.8)
+            ui.shot("/tmp/v1-07d-session-diff.png")
+
+            # Return to #general before continuing the Thread Drawer land approval
+            ui.click(100, 162)
+            ui.sleep(0.5)
+
             # 9. Open the right-hand Thread Drawer via the Slack-style thread tray and inspect report.md card
             ui.click(approve_pos[0] - 320, approve_pos[1])
             ui.sleep(0.6)
@@ -229,10 +247,18 @@ def main() -> int:
             ui.sleep(0.6)
             ui.shot("/tmp/v1-08-landed.png")
 
-            # 10. Open @kawan DM to verify Tasks UX panel
-            ui.click(100, 166)
+            # 11. Open @kawan DM to verify Tasks UX panel
+            ui.click(100, 238)
             ui.sleep(0.5)
             ui.shot("/tmp/v1-09-bot-dm-tasks.png")
+
+            # 12. Open Repository Status to verify task moved to Shipped and inspect bare-repo diff
+            ui.click(100, 85)
+            ui.sleep(0.6)
+            ui.shot("/tmp/v1-09b-status-shipped.png")
+            ui.click(644, 428)  # CHANGES button on Shipped card footer
+            ui.sleep(0.8)
+            ui.shot("/tmp/v1-09c-shipped-diff.png")
 
             if not new_head:
                 raise RuntimeError(f"refs/heads/main never advanced from {initial_head}")

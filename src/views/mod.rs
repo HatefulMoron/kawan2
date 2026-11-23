@@ -4,6 +4,7 @@ pub mod checklist;
 pub mod connect;
 pub mod conversation;
 pub mod settings;
+pub mod status;
 
 use crate::theme;
 

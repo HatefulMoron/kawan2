@@ -30,6 +30,14 @@ static SVG_ASSETS: &[(&str, &[u8])] = &[
         br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#000" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 13V3.5L13.5 8 3 12.5"/><path d="M3 8h5.5"/></svg>"##,
     ),
     (
+        "kawan/status.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#000" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 8.5h2.4l1.7-4 2.4 7 1.8-4.5 1.3 1.5H14"/></svg>"##,
+    ),
+    (
+        "kawan/diff.svg",
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#000" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3.5v4"/><path d="M3 5.5h4"/><path d="M3 11.5h4"/><path d="M9.5 5.5H13"/><path d="M9.5 8.5H13"/><path d="M9.5 11.5H13"/></svg>"##,
+    ),
+    (
         "ui/sliders.svg",
         br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#000" stroke-width="1.2" stroke-linecap="round"><path d="M2 5h7"/><path d="M12 5h2"/><path d="M2 11h2"/><path d="M7 11h7"/><circle cx="10.5" cy="5" r="1.6"/><circle cx="5.5" cy="11" r="1.6"/></svg>"##,
     ),

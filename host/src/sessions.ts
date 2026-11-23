@@ -10,6 +10,7 @@ import {
   createSessionClone,
   ensureAllowedSigners,
   getBranchHead,
+  getSessionDiff,
   isWorkingTreeClean,
   landBranch,
   removeClone,
@@ -22,6 +23,7 @@ import type {
   ConversationRow,
   LandRow,
   MessageRow,
+  SessionDiffSummary,
   SessionRow,
   UserRow,
 } from "./types.js";
@@ -1475,5 +1477,19 @@ export class SessionManager {
       lands: this.db.listLands({ sessionId }),
       entries,
     };
+  }
+
+  async getSessionDiff(sessionId: string): Promise<SessionDiffSummary> {
+    const session = this.db.getSession(sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    const repo = this.db.getHostSettings().repo;
+    const latestLand = this.db.listLands({ sessionId }).at(-1);
+    return await getSessionDiff({
+      barePath: repo?.bare_path,
+      defaultBranch: repo?.default_branch,
+      clonePath: session.clone_path,
+      baseSha: latestLand?.base_sha,
+      landedSha: latestLand?.landed_sha,
+    });
   }
 }

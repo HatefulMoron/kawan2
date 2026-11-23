@@ -10,7 +10,9 @@ use gpui::{AnyElement, Context, Div, FontWeight, div, img, px, relative};
 
 use crate::kit;
 use crate::protocol::{Conversation, Decision, Land, Message, SessionSummary};
-use crate::state::{FocusTarget, KawanApp, RightPanel, SettingsTab};
+use crate::state::{
+    FocusTarget, KawanApp, RightPanel, Screen, SessionDrawerTab, SettingsTab, WorkspacePage,
+};
 use crate::theme::{self, Theme};
 use crate::views::{short_id, status_color_hex};
 
@@ -25,7 +27,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     format!("{}...", prefix.trim_end())
 }
 
-fn session_display_title(sess: &SessionSummary) -> String {
+pub(crate) fn session_display_title(sess: &SessionSummary) -> String {
     if let Some(title) = sess
         .title
         .as_deref()
@@ -43,7 +45,7 @@ fn session_display_title(sess: &SessionSummary) -> String {
     short_id(&sess.id)
 }
 
-fn short_status_label(status: &str) -> &'static str {
+pub(crate) fn short_status_label(status: &str) -> &'static str {
     match status {
         "running" => "running",
         "verifying" => "verifying",
@@ -85,10 +87,82 @@ pub fn left_rail(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
         .iter()
         .filter(|c| c.kind == "dm")
         .collect();
-    let settings_active = matches!(
-        app.screen,
-        crate::state::Screen::Workspace(crate::state::WorkspacePage::Settings(_))
-    );
+    let status_active = matches!(app.screen, Screen::Workspace(WorkspacePage::Status));
+    let conv_page_active = matches!(app.screen, Screen::Workspace(WorkspacePage::Conversation));
+    let settings_active = matches!(app.screen, Screen::Workspace(WorkspacePage::Settings(_)));
+
+    let (needs_you_count, waiting_count, in_flight_count) = app.status_counts();
+    let (status_badge_label, status_badge_color) = if needs_you_count > 0 {
+        (
+            format!("{needs_you_count} failed"),
+            theme::hex(theme::CATEGORY_VALS),
+        )
+    } else if waiting_count > 0 {
+        (
+            format!("{waiting_count} to land"),
+            theme::hex(theme::CATEGORY_ACADEMIC),
+        )
+    } else if in_flight_count > 0 {
+        (
+            format!("{in_flight_count} active"),
+            theme::hex(theme::CATEGORY_INDUSTRY),
+        )
+    } else {
+        (String::new(), theme.fg_tertiary)
+    };
+
+    let mut status_row = div()
+        .id("rail-status")
+        .h(px(30.0))
+        .px(px(8.0))
+        .rounded(px(2.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(8.0))
+        .cursor_pointer();
+    status_row = if status_active {
+        status_row
+            .relative()
+            .overflow_hidden()
+            .bg(theme::with_alpha(theme.palette.vivid, 0.09))
+            .child(kit::left_edge(theme.dark))
+    } else {
+        status_row.hover(|s| s.bg(theme.hover))
+    };
+    let status_row = status_row
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(kit::icon("kawan/status.svg", 13.0, theme.dark))
+                .child(theme::label("Status", 13.0, theme.ink)),
+        )
+        .children((!status_badge_label.is_empty()).then(|| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .child(kit::swatch(status_badge_color, px(5.0)))
+                .child(theme::micro(status_badge_label, 8.0, theme.fg_tertiary))
+        }))
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.open_status();
+            window.focus(&this.focus_handle, cx);
+            cx.notify();
+        }));
+
+    let nav_section = div()
+        .flex()
+        .flex_col()
+        .gap(px(3.0))
+        .child(div().px(px(6.0)).pb(px(2.0)).child(theme::micro(
+            "REPOSITORY",
+            9.0,
+            theme.fg_tertiary,
+        )))
+        .child(status_row);
 
     let mut ch_section = div().flex().flex_col().gap(px(3.0)).child(
         div()
@@ -152,7 +226,8 @@ pub fn left_rail(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
     ch_section = ch_section.children(channels.into_iter().enumerate().map(|(ci, ch)| {
         let cid = ch.id.clone();
         let active =
-            !settings_active && app.active_conversation_id.as_deref() == Some(cid.as_str());
+            conv_page_active && app.active_conversation_id.as_deref() == Some(cid.as_str());
+        let unread = if active { 0 } else { ch.unread_count };
         let name = ch.name.clone().unwrap_or_else(|| "channel".to_string());
         let mut row = div()
             .id(("rail-ch", ci))
@@ -161,6 +236,7 @@ pub fn left_rail(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
             .rounded(px(2.0))
             .flex()
             .items_center()
+            .justify_between()
             .gap(px(8.0))
             .cursor_pointer();
         row = if active {
@@ -171,13 +247,27 @@ pub fn left_rail(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
         } else {
             row.hover(|s| s.bg(theme.hover))
         };
-        row.child(kit::icon("kawan/hash.svg", 12.0, theme.dark))
-            .child(theme::label(name, 13.0, theme.ink))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.open_conversation(&cid);
-                window.focus(&this.focus_handle, cx);
-                cx.notify();
-            }))
+        row.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(kit::icon("kawan/hash.svg", 12.0, theme.dark))
+                .child(theme::label(name, 13.0, theme.ink)),
+        )
+        .children((unread > 0).then(|| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .child(kit::swatch(theme.vivid, px(5.0)))
+                .child(theme::numeric(unread.to_string(), 9.5, theme.fg_tertiary))
+        }))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.open_conversation(&cid);
+            window.focus(&this.focus_handle, cx);
+            cx.notify();
+        }))
     }));
 
     let dm_section = div()
@@ -196,9 +286,14 @@ pub fn left_rail(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
                     .get(&c.id)
                     .is_some_and(|ms| ms.iter().any(|m| m.id == bot_id))
             });
-            let active = !settings_active
+            let active = conv_page_active
                 && existing_dm
                     .is_some_and(|c| app.active_conversation_id.as_deref() == Some(c.id.as_str()));
+            let unread = if active {
+                0
+            } else {
+                existing_dm.map_or(0, |c| c.unread_count)
+            };
             let mut row = div()
                 .id(("rail-dm-bot", bi))
                 .h(px(30.0))
@@ -270,6 +365,7 @@ pub fn left_rail(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
                     .flex()
                     .items_center()
                     .gap(px(5.0))
+                    .children((unread > 0).then(|| kit::swatch(theme.vivid, px(5.0))))
                     .child(kit::swatch(badge_color, px(5.0)))
                     .children(
                         (!badge_label.is_empty())
@@ -294,10 +390,15 @@ pub fn left_rail(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
                             .get(&c.id)
                             .is_some_and(|ms| ms.iter().any(|m| m.id == uid))
                     });
-                    let active = !settings_active
+                    let active = conv_page_active
                         && existing_dm.is_some_and(|c| {
                             app.active_conversation_id.as_deref() == Some(c.id.as_str())
                         });
+                    let unread = if active {
+                        0
+                    } else {
+                        existing_dm.map_or(0, |c| c.unread_count)
+                    };
                     let mut row = div()
                         .id(("rail-dm-human", ui))
                         .h(px(30.0))
@@ -305,6 +406,7 @@ pub fn left_rail(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
                         .rounded(px(2.0))
                         .flex()
                         .items_center()
+                        .justify_between()
                         .gap(px(8.0))
                         .cursor_pointer();
                     row = if active {
@@ -315,13 +417,27 @@ pub fn left_rail(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
                     } else {
                         row.hover(|s| s.bg(theme.hover))
                     };
-                    row.child(kit::human_avatar(&user.name, 20.0, theme))
-                        .child(theme::label(user.name.clone(), 13.0, theme.ink))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_dm_with(&uid);
-                            window.focus(&this.focus_handle, cx);
-                            cx.notify();
-                        }))
+                    row.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(kit::human_avatar(&user.name, 20.0, theme))
+                            .child(theme::label(user.name.clone(), 13.0, theme.ink)),
+                    )
+                    .children((unread > 0).then(|| {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.0))
+                            .child(kit::swatch(theme.vivid, px(5.0)))
+                            .child(theme::numeric(unread.to_string(), 9.5, theme.fg_tertiary))
+                    }))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_dm_with(&uid);
+                        window.focus(&this.focus_handle, cx);
+                        cx.notify();
+                    }))
                 }),
         );
 
@@ -390,6 +506,8 @@ pub fn left_rail(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
                 .flex()
                 .flex_col()
                 .gap(px(14.0))
+                .child(nav_section)
+                .child(kit::hairline(theme.border_subtle))
                 .child(ch_section)
                 .child(kit::hairline(theme.border_subtle))
                 .child(dm_section),
@@ -1721,7 +1839,7 @@ fn land_card(
     )
 }
 
-fn session_strip(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> Div {
+pub(crate) fn session_strip(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> Div {
     let workers = app.all_worker_sessions();
     div()
         .h(px(36.0))
@@ -1816,7 +1934,7 @@ fn session_strip(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
         )
 }
 
-fn right_drawer(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> Div {
+pub(crate) fn right_drawer(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> Div {
     let title = match &app.right_panel {
         RightPanel::Thread(tid) => {
             let reply_count = app
@@ -2043,8 +2161,51 @@ fn session_drawer_body(
         .get(session_id)
         .map(Vec::len)
         .unwrap_or(0);
+    let diff = app.session_diffs.get(session_id);
+    let changes_label = match diff {
+        Some(d) if d.available => format!("Changes ({})", d.files_changed),
+        _ => "Changes".to_string(),
+    };
+    let sid_for_changes = session_id.to_string();
 
-    div()
+    let tab_bar = div()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .pb(px(4.0))
+        .border_b_1()
+        .border_color(theme.border_subtle)
+        .child(
+            drawer_tab_button(
+                "sess-tab-overview",
+                "Overview",
+                app.session_drawer_tab == SessionDrawerTab::Overview,
+                theme,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.session_drawer_tab = SessionDrawerTab::Overview;
+                cx.notify();
+            })),
+        )
+        .child(
+            drawer_tab_button(
+                "sess-tab-changes",
+                changes_label,
+                app.session_drawer_tab == SessionDrawerTab::Changes,
+                theme,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.session_drawer_tab = SessionDrawerTab::Changes;
+                if !this.session_diffs.contains_key(&sid_for_changes)
+                    && !this.session_diff_loading.contains(&sid_for_changes)
+                {
+                    this.fetch_session_diff(&sid_for_changes);
+                }
+                cx.notify();
+            })),
+        );
+
+    let mut container = div()
         .id("drawer-session-scroll")
         .flex_1()
         .min_h(px(0.0))
@@ -2059,6 +2220,14 @@ fn session_drawer_body(
             status_color_hex(&sess.status),
             theme,
         ))
+        .child(tab_bar);
+
+    if app.session_drawer_tab == SessionDrawerTab::Changes {
+        container = container.child(session_diff_tab(app, session_id, theme, cx));
+        return container.into_any_element();
+    }
+
+    container
         .child(
             div()
                 .flex()
@@ -2152,4 +2321,335 @@ fn session_drawer_body(
             theme.fg_tertiary,
         ))
         .into_any_element()
+}
+
+fn drawer_tab_button(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<gpui::SharedString>,
+    active: bool,
+    theme: &Theme,
+) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .h(px(24.0))
+        .px(px(9.0))
+        .rounded(px(2.0))
+        .border_1()
+        .border_color(if active {
+            theme::with_alpha(theme.palette.dark, 0.28)
+        } else {
+            theme.border_subtle
+        })
+        .bg(if active {
+            theme::with_alpha(theme.palette.vivid, 0.10)
+        } else {
+            theme.surface
+        })
+        .flex()
+        .items_center()
+        .cursor_pointer()
+        .child(theme::micro(
+            label,
+            8.5,
+            if active {
+                theme.ink
+            } else {
+                theme.fg_secondary
+            },
+        ))
+}
+
+fn session_diff_tab(
+    app: &KawanApp,
+    session_id: &str,
+    theme: &Theme,
+    cx: &mut Context<KawanApp>,
+) -> AnyElement {
+    let sid_refresh = session_id.to_string();
+    let loading = app.session_diff_loading.contains(session_id);
+    let Some(diff) = app.session_diffs.get(session_id) else {
+        let msg = if loading {
+            "Loading branch diff..."
+        } else {
+            "Diff not loaded yet."
+        };
+        return div()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(theme::body(msg, 12.0, theme.fg_secondary))
+            .children((!loading).then(|| {
+                kit::secondary_button("diff-load-btn", "Load Changes", theme).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.fetch_session_diff(&sid_refresh);
+                        cx.notify();
+                    },
+                ))
+            }))
+            .into_any_element();
+    };
+
+    if !diff.available {
+        return div()
+            .p(px(10.0))
+            .rounded(px(2.0))
+            .border_1()
+            .border_color(theme.border_subtle)
+            .bg(theme.strip)
+            .child(theme::body(
+                diff.note
+                    .clone()
+                    .unwrap_or_else(|| "No git diff available for this session.".to_string()),
+                12.0,
+                theme.fg_secondary,
+            ))
+            .into_any_element();
+    }
+
+    let selected_path = app
+        .selected_diff_file
+        .get(session_id)
+        .filter(|p| diff.files.iter().any(|f| &f.path == *p))
+        .cloned()
+        .or_else(|| diff.files.first().map(|f| f.path.clone()));
+    let selected_file = selected_path
+        .as_deref()
+        .and_then(|p| diff.files.iter().find(|f| f.path == p));
+
+    let ref_line = match (&diff.base_ref, &diff.head_ref) {
+        (Some(b), Some(h)) => format!("{b} → {h}"),
+        (Some(b), None) => format!("vs {b}"),
+        _ => String::new(),
+    };
+
+    let mut col = div()
+        .flex()
+        .flex_col()
+        .gap(px(10.0))
+        .child(
+            div()
+                .p(px(10.0))
+                .rounded(px(2.0))
+                .border_1()
+                .border_color(theme.border_subtle)
+                .bg(theme.strip)
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(theme::label(
+                                    format!("{} files", diff.files_changed),
+                                    12.0,
+                                    theme.ink,
+                                ))
+                                .child(theme::numeric(
+                                    format!("+{}", diff.insertions),
+                                    11.0,
+                                    theme::hex(0x284D32),
+                                ))
+                                .child(theme::numeric(
+                                    format!("-{}", diff.deletions),
+                                    11.0,
+                                    theme::hex(theme::CATEGORY_VALS),
+                                )),
+                        )
+                        .children(
+                            (!ref_line.is_empty())
+                                .then(|| theme::numeric(ref_line, 10.0, theme.fg_tertiary)),
+                        ),
+                )
+                .child(
+                    kit::ghost_button("diff-refresh", "Refresh", theme).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.fetch_session_diff(&sid_refresh);
+                            cx.notify();
+                        },
+                    )),
+                ),
+        )
+        .children(diff.truncated.then(|| {
+            theme::micro(
+                "DIFF TRUNCATED TO 40 FILES / 64 KB",
+                8.5,
+                theme::hex(theme::UMBER_VIVID),
+            )
+        }));
+
+    if diff.files.is_empty() {
+        return col
+            .child(theme::body(
+                "Working tree matches base commit.",
+                12.0,
+                theme.fg_secondary,
+            ))
+            .into_any_element();
+    }
+
+    let sid_owned = session_id.to_string();
+    let file_list = div()
+        .rounded(px(2.0))
+        .border_1()
+        .border_color(theme.border_subtle)
+        .bg(theme.surface)
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .children(diff.files.iter().enumerate().map(|(fi, file)| {
+            let is_sel = selected_path.as_deref() == Some(file.path.as_str());
+            let sid_click = sid_owned.clone();
+            let fpath = file.path.clone();
+            let status_col = match file.status.as_str() {
+                "A" => theme::hex(0x284D32),
+                "D" => theme::hex(theme::CATEGORY_VALS),
+                _ => theme::hex(theme::CATEGORY_ACADEMIC),
+            };
+            div()
+                .id(("diff-file", fi))
+                .px(px(10.0))
+                .py(px(6.0))
+                .border_b_1()
+                .border_color(theme.border_subtle)
+                .bg(if is_sel {
+                    theme::with_alpha(theme.palette.vivid, 0.09)
+                } else {
+                    theme.surface
+                })
+                .hover(|s| s.bg(theme.hover))
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(theme::micro(file.status.clone(), 8.5, status_col))
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .flex_1()
+                                .font_family(theme::MONO)
+                                .text_size(px(11.0))
+                                .line_height(px(15.0))
+                                .text_color(theme.ink)
+                                .child(file.path.clone()),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .child(theme::numeric(
+                            format!("+{}", file.insertions),
+                            10.0,
+                            theme::hex(0x284D32),
+                        ))
+                        .child(theme::numeric(
+                            format!("-{}", file.deletions),
+                            10.0,
+                            theme::hex(theme::CATEGORY_VALS),
+                        )),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.selected_diff_file
+                        .insert(sid_click.clone(), fpath.clone());
+                    cx.notify();
+                }))
+        }));
+
+    col = col.child(file_list);
+
+    if let Some(file) = selected_file {
+        let all_lines: Vec<&str> = file.patch.lines().collect();
+        let remaining = all_lines.len().saturating_sub(240);
+        let patch_box = div()
+            .rounded(px(2.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.surface)
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .bg(theme.strip)
+                    .border_b_1()
+                    .border_color(theme.border_subtle)
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w(px(0.0))
+                            .font_family(theme::MONO)
+                            .text_size(px(11.0))
+                            .line_height(px(15.0))
+                            .text_color(theme.dark)
+                            .child(file.path.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .py(px(6.0))
+                    .flex()
+                    .flex_col()
+                    .children(all_lines.into_iter().take(240).map(|line| {
+                        let (bg, fg) = if line.starts_with('+') && !line.starts_with("+++") {
+                            (theme::hex(0xEDF7EF), theme::hex(0x1C592C))
+                        } else if line.starts_with('-') && !line.starts_with("---") {
+                            (theme::hex(0xFDF0EF), theme::hex(0x9B2C27))
+                        } else if line.starts_with("@@")
+                            || line.starts_with("diff ")
+                            || line.starts_with("index ")
+                        {
+                            (theme.strip, theme.fg_tertiary)
+                        } else {
+                            (theme.surface, theme.ink)
+                        };
+                        div()
+                            .w_full()
+                            .min_w(px(0.0))
+                            .px(px(10.0))
+                            .py(px(1.0))
+                            .bg(bg)
+                            .font_family(theme::MONO)
+                            .text_size(px(10.5))
+                            .line_height(px(15.0))
+                            .text_color(fg)
+                            .child(if line.is_empty() {
+                                " ".to_string()
+                            } else {
+                                line.to_string()
+                            })
+                    }))
+                    .children((remaining > 0).then(|| {
+                        div().px(px(10.0)).pt(px(4.0)).child(theme::numeric(
+                            format!("… ({remaining} more lines)"),
+                            10.0,
+                            theme.fg_tertiary,
+                        ))
+                    })),
+            );
+        col = col.child(patch_box);
+    }
+
+    col.into_any_element()
 }

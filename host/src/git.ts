@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, renameSync, c
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import type { SessionDiffFile, SessionDiffSummary } from "./types.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -355,5 +356,161 @@ export async function landBranch(params: LandBranchParams): Promise<LandBranchRe
 export function removeClone(clonePath: string | null | undefined): void {
   if (!clonePath) return;
   rmSync(clonePath, { recursive: true, force: true });
+}
+
+const MAX_DIFF_FILES = 40;
+const MAX_DIFF_BYTES = 64 * 1024;
+
+export async function getSessionDiff(params: {
+  barePath?: string;
+  defaultBranch?: string;
+  clonePath?: string | null;
+  baseSha?: string | null;
+  landedSha?: string | null;
+}): Promise<SessionDiffSummary> {
+  let gitPrefix: string[] | null = null;
+  let diffArgs: string[] = [];
+  let baseRef: string | null = null;
+  let headRef: string | null = null;
+
+  if (params.baseSha && params.landedSha && params.barePath && existsSync(params.barePath)) {
+    gitPrefix = ["--git-dir", params.barePath, "-c", "core.quotePath=false"];
+    diffArgs = [params.baseSha, params.landedSha];
+    baseRef = params.baseSha.slice(0, 12);
+    headRef = params.landedSha.slice(0, 12);
+  } else if (params.clonePath && existsSync(params.clonePath)) {
+    gitPrefix = ["-C", params.clonePath, "-c", "core.quotePath=false"];
+    const defaultBranch = params.defaultBranch ?? "main";
+    let resolvedBase = `origin/${defaultBranch}`;
+    try {
+      const { stdout } = await runGit([
+        "-C",
+        params.clonePath,
+        "merge-base",
+        `origin/${defaultBranch}`,
+        "HEAD",
+      ]);
+      if (stdout.trim()) {
+        resolvedBase = stdout.trim();
+      }
+    } catch {
+      // Fall back to origin/<defaultBranch>
+    }
+    try {
+      const head = await getBranchHead(params.clonePath, "HEAD");
+      headRef = head.slice(0, 12);
+    } catch {
+      headRef = null;
+    }
+    baseRef = resolvedBase.startsWith("origin/") ? resolvedBase : resolvedBase.slice(0, 12);
+    diffArgs = [resolvedBase];
+  }
+
+  if (!gitPrefix) {
+    return {
+      available: false,
+      base_ref: null,
+      head_ref: null,
+      files_changed: 0,
+      insertions: 0,
+      deletions: 0,
+      truncated: false,
+      files: [],
+      note: "No git diff available for this session.",
+    };
+  }
+
+  const [{ stdout: numstatOut }, { stdout: nameStatusOut }] = await Promise.all([
+    runGit([...gitPrefix, "diff", "--numstat", "--no-renames", ...diffArgs, "--"]),
+    runGit([...gitPrefix, "diff", "--name-status", "--no-renames", ...diffArgs, "--"]),
+  ]);
+
+  const statusByPath = new Map<string, string>();
+  for (const line of nameStatusOut.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const tabIdx = line.indexOf("\t");
+    if (tabIdx <= 0) continue;
+    const status = line.slice(0, tabIdx).trim();
+    const filePath = line.slice(tabIdx + 1).trim();
+    if (filePath) {
+      statusByPath.set(filePath, status);
+    }
+  }
+
+  const entries: Array<{ path: string; status: string; insertions: number; deletions: number }> = [];
+  let totalInsertions = 0;
+  let totalDeletions = 0;
+  for (const line of numstatOut.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const parts = line.split("\t");
+    if (parts.length < 3) continue;
+    const ins = parts[0] === "-" ? 0 : Number.parseInt(parts[0], 10) || 0;
+    const del = parts[1] === "-" ? 0 : Number.parseInt(parts[1], 10) || 0;
+    const filePath = parts.slice(2).join("\t").trim();
+    if (!filePath) continue;
+    totalInsertions += ins;
+    totalDeletions += del;
+    entries.push({
+      path: filePath,
+      status: statusByPath.get(filePath) ?? "M",
+      insertions: ins,
+      deletions: del,
+    });
+  }
+
+  let truncated = entries.length > MAX_DIFF_FILES;
+  const selected = entries.slice(0, MAX_DIFF_FILES);
+  const files: SessionDiffFile[] = [];
+  let totalPatchBytes = 0;
+
+  for (const entry of selected) {
+    let patch = "";
+    if (totalPatchBytes < MAX_DIFF_BYTES) {
+      try {
+        const { stdout } = await runGit([
+          ...gitPrefix,
+          "diff",
+          "-U3",
+          "--no-renames",
+          ...diffArgs,
+          "--",
+          entry.path,
+        ]);
+        const remaining = MAX_DIFF_BYTES - totalPatchBytes;
+        const buf = Buffer.from(stdout, "utf8");
+        if (buf.byteLength > remaining) {
+          patch = `${buf.subarray(0, remaining).toString("utf8")}\n... (diff truncated)`;
+          totalPatchBytes = MAX_DIFF_BYTES;
+          truncated = true;
+        } else {
+          patch = stdout.trimEnd();
+          totalPatchBytes += buf.byteLength;
+        }
+      } catch (err) {
+        patch = `Failed to load patch: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    } else {
+      truncated = true;
+    }
+
+    files.push({
+      path: entry.path,
+      status: entry.status,
+      insertions: entry.insertions,
+      deletions: entry.deletions,
+      patch,
+    });
+  }
+
+  return {
+    available: true,
+    base_ref: baseRef,
+    head_ref: headRef,
+    files_changed: entries.length,
+    insertions: totalInsertions,
+    deletions: totalDeletions,
+    truncated,
+    files,
+  };
 }
 
