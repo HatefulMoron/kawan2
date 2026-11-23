@@ -147,6 +147,7 @@ async function main(): Promise<void> {
         kind: "worker",
         conversation_id: "00000000-0000-4000-8000-000000000002",
         thread_id: s.thread_id,
+        title: null,
         task: s.task,
         status: s.status as any,
         branch: `kawan/${s.id}`,

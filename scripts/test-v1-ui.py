@@ -218,6 +218,11 @@ def main() -> int:
             ui.sleep(0.6)
             ui.shot("/tmp/v1-08-landed.png")
 
+            # 10. Open @kawan DM to verify Tasks UX panel
+            ui.click(100, 166)
+            ui.sleep(0.5)
+            ui.shot("/tmp/v1-09-bot-dm-tasks.png")
+
             if not new_head:
                 raise RuntimeError(f"refs/heads/main never advanced from {initial_head}")
 

@@ -43,7 +43,7 @@ test("Slice 3: orchestrator spawns worker, worker commits signed change and post
     const isOrch = sysText.includes("AI engineering orchestrator");
     if (isOrch) {
       if (lastUserText.includes("[worker-report")) {
-        return { text: "NO_REPLY" };
+        return { text: "Created hello.txt containing 'hello kawan' and attached it." };
       }
       if (!hasToolResult) {
         return {
@@ -51,13 +51,14 @@ test("Slice 3: orchestrator spawns worker, worker commits signed change and post
             {
               name: "spawn_session",
               arguments: {
+                title: "Add hello.txt",
                 task: "Create a file named hello.txt containing 'hello kawan', commit it with git, and call report with a text artifact.",
               },
             },
           ],
         };
       }
-      return { text: "Spawned worker session to fulfill your request." };
+      return { text: "On it." };
     }
 
     // Worker turns:
@@ -170,6 +171,15 @@ test("Slice 3: orchestrator spawns worker, worker commits signed change and post
       waitTimeout,
     );
 
+    const orchMsgWait = admin.waitForNextFrame(
+      (f) =>
+        f.type === "message.new" &&
+        f.author?.kind === "bot" &&
+        typeof f.message?.body === "string" &&
+        f.message.body.includes("Created hello.txt"),
+      waitTimeout,
+    );
+
     const sent = await admin.request<{ message: { id: string } }>("message.send", {
       conversation_id: generalId,
       body: "@kawan please create a file named hello.txt containing 'hello kawan', commit it on the worker branch, and call report with a text artifact containing the file content.",
@@ -180,10 +190,15 @@ test("Slice 3: orchestrator spawns worker, worker commits signed change and post
     const workerId = workerEv.session.id as string;
     assert.equal(workerEv.session.branch, `kawan/${workerId}`);
 
-    // Wait for artifact to arrive AND worker session to settle from running
+    // Wait for artifact to arrive AND orchestrator wrap-up message
     const artifactEv = await artifactWait;
     assert.notEqual(artifactEv.type, "error", `Unexpected WS error: ${artifactEv.message}`);
     const artifactId = artifactEv.artifact.id as string;
+
+    if (!useLiveLlm) {
+      const wrapMsg = await orchMsgWait;
+      assert.equal(wrapMsg.message.artifact_id, artifactId);
+    }
 
     // Wait until worker finishes running
     const deadline = Date.now() + waitTimeout;
@@ -201,6 +216,15 @@ test("Slice 3: orchestrator spawns worker, worker commits signed change and post
     while (orchRow.status === "running" && Date.now() < orchDeadline) {
       await new Promise((r) => setTimeout(r, 200));
       orchRow = host.db.getActiveOrchestratorSession(botId)!;
+    }
+
+    if (!useLiveLlm) {
+      const convMsgs = host.db.listMessages(generalId);
+      assert.ok(
+        !convMsgs.some((m) => m.body === "Added hello.txt and committed it on branch."),
+        "Worker report() must not post directly into chat",
+      );
+      assert.equal(workerRow.title, "Add hello.txt");
     }
 
     // Structural checks:
@@ -241,6 +265,142 @@ test("Slice 3: orchestrator spawns worker, worker commits signed change and post
     assert.equal(detail.session.id, workerId);
     assert.ok(detail.artifacts.some((a) => a.id === artifactId));
     assert.ok(detail.entries.length > 0, "Expected persisted pi session entries");
+
+    admin.close();
+  } finally {
+    await host.close();
+    await stub.close();
+    repo.cleanup();
+    adminKey.cleanup();
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("Slice 3: worker question routes to orchestrator via message_session without leaking into chat", async () => {
+  const stub = await startStubProvider();
+  const repo = await createFixtureBareRepo();
+  const dataDir = mkdtempSync(join(tmpdir(), "kawan-slice3-msg-"));
+  const adminKey = await TestKeyPair.generate("admin@kawan");
+
+  stub.setHandler((reqBody) => {
+    const msgs = reqBody.messages ?? [];
+    const sysText = JSON.stringify(msgs[0] ?? "");
+    const lastMsg = msgs[msgs.length - 1];
+    const hasToolResult = lastMsg?.role === "tool";
+    const lastUserText = JSON.stringify(
+      [...msgs].reverse().find((m: any) => m.role === "user")?.content ?? "",
+    );
+
+    if (sysText.includes("AI engineering orchestrator")) {
+      if (lastUserText.includes("Should config use JSON or YAML?")) {
+        if (!hasToolResult) {
+          const match = lastUserText.match(/session_id=([0-9a-f-]+)/);
+          return {
+            toolCalls: [
+              {
+                name: "message_session",
+                arguments: {
+                  session_id: match?.[1] ?? "",
+                  message: "Use JSON format.",
+                },
+              },
+            ],
+          };
+        }
+        return { text: "NO_REPLY" };
+      }
+      if (lastUserText.includes("[worker-report")) {
+        return { text: "Added config.json using JSON format as requested." };
+      }
+      if (!hasToolResult) {
+        return {
+          toolCalls: [
+            {
+              name: "spawn_session",
+              arguments: {
+                title: "Create config file",
+                task: "Create a config file (ask orchestrator whether JSON or YAML if needed).",
+              },
+            },
+          ],
+        };
+      }
+      return { text: "On it." };
+    }
+
+    const toolMsgs = msgs.filter((m: any) => m.role === "tool");
+    if (toolMsgs.length === 0) {
+      return {
+        toolCalls: [
+          {
+            name: "report",
+            arguments: { text: "Should config use JSON or YAML?" },
+          },
+        ],
+      };
+    }
+    if (lastUserText.includes("Use JSON format")) {
+      return { text: "Created config.json with JSON format." };
+    }
+    return { text: "Waiting for orchestrator answer." };
+  });
+
+  const host = await startHost({
+    dataDir,
+    quiet: true,
+    disableSandbox: true,
+    decisionMode: "live",
+  });
+
+  try {
+    const admin = await WsTestClient.connect(host.url);
+    await admin.bootstrap(host.bootstrapToken!, "alice", adminKey);
+    await admin.request("settings.update", {
+      repo: { url: repo.barePath, default_branch: repo.defaultBranch },
+      verify_command: "true",
+      providers: {
+        stub: {
+          baseUrl: stub.baseUrl,
+          api: "openai-completions",
+          apiKey: "stub-key",
+          models: [{ id: "stub-model", name: "stub-model", reasoning: false, contextWindow: 128000, maxTokens: 16384 }],
+        },
+      },
+      roles: {
+        default: { provider: "stub", model: "stub-model", thinking_level: "off" },
+        decision: { provider: "stub", baseUrl: stub.systemOneBaseUrl, model: "stub-snap", apiKey: "stub-key" },
+      },
+    });
+
+    const created = await admin.request<{ bot: any }>("bot.create", {
+      name: "kawan",
+      persona: "Orchestrator",
+      sandbox_enabled: false,
+    });
+    const convs = await admin.request<{ conversations: Array<{ id: string; name: string }> }>("conversation.list");
+    const generalId = convs.conversations.find((c) => c.name === "general")!.id;
+    await admin.request("conversation.add_member", { conversation_id: generalId, user_id: created.bot.id });
+
+    const finalMsgWait = admin.waitForNextFrame(
+      (f) =>
+        f.type === "message.new" &&
+        f.author?.kind === "bot" &&
+        typeof f.message?.body === "string" &&
+        f.message.body.includes("Added config.json"),
+      25_000,
+    );
+    await admin.request("message.send", {
+      conversation_id: generalId,
+      body: "@kawan create config file using JSON",
+    });
+
+    const finalFrame = await finalMsgWait;
+    assert.equal(finalFrame.message.body, "Added config.json using JSON format as requested.");
+    const msgs = host.db.listMessages(generalId);
+    assert.ok(
+      !msgs.some((m) => m.body.includes("Should config use JSON or YAML?")),
+      "Worker internal question must go through orchestrator, not chat",
+    );
 
     admin.close();
   } finally {

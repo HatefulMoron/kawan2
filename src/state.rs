@@ -474,6 +474,11 @@ impl KawanApp {
                 self.recompute_setup_local();
             }
             ServerFrame::SessionUpdate { session } => {
+                if session.kind == "orchestrator"
+                    && let Some(bot) = self.bots.iter_mut().find(|b| b.id == session.bot_id)
+                {
+                    bot.orchestrator_status = session.status.clone();
+                }
                 self.sessions_by_id.insert(session.id.clone(), session);
             }
             ServerFrame::ArtifactNew { artifact } => {
@@ -1197,6 +1202,46 @@ impl KawanApp {
             .collect();
         out.sort_by_key(|s| s.created_at);
         out
+    }
+
+    pub fn worker_sessions_for_bot(&self, bot_id: &str) -> Vec<&SessionSummary> {
+        let mut out: Vec<&SessionSummary> = self
+            .sessions_by_id
+            .values()
+            .filter(|s| s.kind == "worker" && s.bot_id == bot_id)
+            .collect();
+        out.sort_by_key(|s| {
+            let prio = match s.status.as_str() {
+                "running" => 0_u8,
+                "review_requested" => 1,
+                "failed" => 2,
+                _ => 3,
+            };
+            (prio, std::cmp::Reverse(s.updated_at))
+        });
+        out
+    }
+
+    pub fn active_dm_bot(&self) -> Option<&BotSummary> {
+        let conv = self.active_conversation()?;
+        if conv.kind != "dm" {
+            return None;
+        }
+        let members = self.members_by_conv.get(&conv.id)?;
+        let bot_member = members
+            .iter()
+            .find(|m| m.kind == "bot" && m.id != self.current_user_id)?;
+        self.bots.iter().find(|b| b.id == bot_member.id)
+    }
+
+    pub fn conversation_label(&self, conv_id: &str) -> String {
+        if let Some(conv) = self.conversations.iter().find(|c| c.id == conv_id) {
+            if conv.kind == "channel" {
+                return format!("#{}", conv.name.as_deref().unwrap_or("channel"));
+            }
+            return "DM".to_string();
+        }
+        "chat".to_string()
     }
 
     pub fn land_for_session(&self, session_id: &str) -> Option<&Land> {

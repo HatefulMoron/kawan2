@@ -84,9 +84,16 @@ export default function (pi: ExtensionAPI) {
     name: "report",
     label: "Report",
     description:
-      "Post a message into the conversation thread and optionally attach a text or image artifact as evidence.",
+      role === "orchestrator"
+        ? "Post a message into the active conversation and optionally attach a text or image artifact."
+        : "Send a summary, progress note, blocking question, or artifact back to your orchestrator (never posted directly to humans).",
     parameters: Type.Object({
-      text: Type.String({ description: "Summary or progress message to post into the conversation" }),
+      text: Type.String({
+        description:
+          role === "orchestrator"
+            ? "Message to post into the conversation"
+            : "Report, question, or result to send back to your orchestrator",
+      }),
       artifact: Type.Optional(
         Type.Object({
           filename: Type.Optional(Type.String({ description: "Filename for the artifact, e.g. summary.txt" })),
@@ -160,11 +167,39 @@ export default function (pi: ExtensionAPI) {
       description:
         "Spawn an isolated worker agent session with its own git clone and branch to perform repository work.",
       parameters: Type.Object({
+        title: Type.Optional(
+          Type.String({ description: "Short 3-6 word human-readable title shown in the Tasks UI" }),
+        ),
         task: Type.String({ description: "Clear, self-contained task description for the worker session" }),
       }),
       async execute(_toolCallId, params) {
         try {
-          const res = await callHost("spawn_session", { task: params.task });
+          const res = await callHost("spawn_session", {
+            task: params.task,
+            ...(params.title ? { title: params.title } : {}),
+          });
+          return textResult(res);
+        } catch (err) {
+          return textResult(err instanceof Error ? err.message : String(err), true);
+        }
+      },
+    });
+
+    pi.registerTool({
+      name: "message_session",
+      label: "Message Worker Session",
+      description:
+        "Send an answer or follow-up instruction directly to an existing worker session by session_id.",
+      parameters: Type.Object({
+        session_id: Type.String({ description: "Target worker session ID" }),
+        message: Type.String({ description: "Answer or instruction for the worker" }),
+      }),
+      async execute(_toolCallId, params) {
+        try {
+          const res = await callHost("message_session", {
+            session_id: params.session_id,
+            message: params.message,
+          });
           return textResult(res);
         } catch (err) {
           return textResult(err instanceof Error ? err.message : String(err), true);
@@ -228,7 +263,7 @@ export default function (pi: ExtensionAPI) {
       name: "land_request",
       label: "Request Land",
       description:
-        "Submit this worker session's committed branch for human approval, verification, and landing onto the default branch.",
+        "Mark this worker session's committed changes as ready for human approval in the Tasks UI and notify your orchestrator (does not post directly to chat).",
       parameters: Type.Object({
         summary: Type.Optional(Type.String({ description: "Short summary of the committed changes ready to land" })),
       }),

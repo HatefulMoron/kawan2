@@ -14,6 +14,44 @@ use crate::views::{short_id, status_color_hex};
 
 const EDITORIAL_MEASURE: f32 = 780.0;
 
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let prefix: String = text.chars().take(max_chars.saturating_sub(3)).collect();
+    format!("{}...", prefix.trim_end())
+}
+
+fn session_display_title(sess: &SessionSummary) -> String {
+    if let Some(title) = sess
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return title.to_string();
+    }
+    if let Some(task) = sess.task.as_deref() {
+        let first = task.lines().next().unwrap_or("").trim();
+        if !first.is_empty() {
+            return truncate_chars(first, 42);
+        }
+    }
+    short_id(&sess.id)
+}
+
+fn short_status_label(status: &str) -> &'static str {
+    match status {
+        "running" => "running",
+        "review_requested" => "review",
+        "landed" => "landed",
+        "failed" => "failed",
+        "stopped" => "stopped",
+        _ => "idle",
+    }
+}
+
 pub fn render(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> Div {
     div()
         .size_full()
@@ -176,6 +214,46 @@ pub fn left_rail(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
             } else {
                 row.hover(|s| s.bg(theme.hover))
             };
+            let workers = app.worker_sessions_for_bot(&bot.id);
+            let workers_running = workers.iter().filter(|s| s.status == "running").count();
+            let workers_review = workers
+                .iter()
+                .filter(|s| s.status == "review_requested")
+                .count();
+            let workers_failed = workers.iter().filter(|s| s.status == "failed").count();
+            let orch_running = bot.orchestrator_status == "running"
+                || app.sessions_by_id.values().any(|s| {
+                    s.bot_id == bot.id && s.kind == "orchestrator" && s.status == "running"
+                });
+
+            let (badge_label, badge_color) = if workers_running > 0 {
+                (
+                    if workers_running == 1 {
+                        "working".to_string()
+                    } else {
+                        format!("{workers_running} working")
+                    },
+                    theme::hex(theme::CATEGORY_INDUSTRY),
+                )
+            } else if orch_running {
+                ("thinking".to_string(), theme::hex(theme::CATEGORY_INDUSTRY))
+            } else if workers_review > 0 {
+                (
+                    format!("{workers_review} review"),
+                    theme::hex(theme::CATEGORY_ACADEMIC),
+                )
+            } else if workers_failed > 0 {
+                (
+                    format!("{workers_failed} failed"),
+                    theme::hex(theme::CATEGORY_VALS),
+                )
+            } else {
+                (
+                    String::new(),
+                    theme::hex(status_color_hex(&bot.orchestrator_status)),
+                )
+            };
+
             row.child(
                 div()
                     .flex()
@@ -184,10 +262,17 @@ pub fn left_rail(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
                     .child(kit::bot_avatar(20.0, theme))
                     .child(theme::label(format!("@{}", bot.name), 13.0, theme.ink)),
             )
-            .child(kit::swatch(
-                theme::hex(status_color_hex(&bot.orchestrator_status)),
-                px(5.0),
-            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .child(kit::swatch(badge_color, px(5.0)))
+                    .children(
+                        (!badge_label.is_empty())
+                            .then(|| theme::micro(badge_label, 8.0, theme.fg_tertiary)),
+                    ),
+            )
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.open_dm_with(&bot_id);
                 window.focus(&this.focus_handle, cx);
@@ -311,6 +396,7 @@ pub fn left_rail(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
 
 fn main_stream_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> Div {
     let conv = app.active_conversation();
+    let dm_bot = app.active_dm_bot();
     let (title, subtitle, is_channel) = match conv {
         Some(c) if c.kind == "channel" => (
             format!("#{}", c.name.as_deref().unwrap_or("channel")),
@@ -320,19 +406,35 @@ fn main_stream_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -
             true,
         ),
         Some(c) => {
-            let other = app
-                .members_by_conv
-                .get(&c.id)
-                .and_then(|ms| ms.iter().find(|m| m.id != app.current_user_id))
-                .map(|m| {
-                    if m.kind == "bot" {
-                        format!("@{}", m.name)
-                    } else {
-                        m.name.clone()
-                    }
-                })
-                .unwrap_or_else(|| "Direct message".to_string());
-            (other, "Direct message".to_string(), false)
+            if let Some(bot) = dm_bot {
+                let workers = app.worker_sessions_for_bot(&bot.id);
+                let running = workers.iter().filter(|s| s.status == "running").count();
+                let review = workers
+                    .iter()
+                    .filter(|s| s.status == "review_requested")
+                    .count();
+                let mut parts = Vec::new();
+                if running > 0 {
+                    parts.push(format!("{running} working"));
+                }
+                if review > 0 {
+                    parts.push(format!("{review} awaiting approval"));
+                }
+                let status_line = if parts.is_empty() {
+                    "Idle · no active tasks".to_string()
+                } else {
+                    parts.join(" · ")
+                };
+                (format!("@{}", bot.name), status_line, false)
+            } else {
+                let other = app
+                    .members_by_conv
+                    .get(&c.id)
+                    .and_then(|ms| ms.iter().find(|m| m.id != app.current_user_id))
+                    .map(|m| m.name.clone())
+                    .unwrap_or_else(|| "Direct message".to_string());
+                (other, "Direct message".to_string(), false)
+            }
         }
         None => (
             "#general".to_string(),
@@ -619,6 +721,8 @@ fn main_stream_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -
                 ),
         );
 
+    let tasks_panel = dm_bot.map(|bot| bot_tasks_panel(app, bot, theme, cx));
+
     div()
         .flex_1()
         .min_h(px(0.0))
@@ -626,8 +730,149 @@ fn main_stream_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -
         .flex()
         .flex_col()
         .child(header)
+        .children(tasks_panel)
         .child(stream)
         .child(composer)
+}
+
+fn bot_tasks_panel(
+    app: &KawanApp,
+    bot: &crate::protocol::BotSummary,
+    theme: &Theme,
+    cx: &mut Context<KawanApp>,
+) -> Div {
+    let workers = app.worker_sessions_for_bot(&bot.id);
+    let active_count = workers
+        .iter()
+        .filter(|s| matches!(s.status.as_str(), "running" | "review_requested" | "failed"))
+        .count();
+
+    let rows: Vec<AnyElement> = if workers.is_empty() {
+        vec![
+            div()
+                .px(px(14.0))
+                .py(px(10.0))
+                .child(theme::body(
+                    "No tasks yet — assign work here or in any channel.",
+                    12.5,
+                    theme.fg_tertiary,
+                ))
+                .into_any_element(),
+        ]
+    } else {
+        workers
+            .iter()
+            .take(6)
+            .enumerate()
+            .map(|(ti, sess)| {
+                let sid = sess.id.clone();
+                let title = session_display_title(sess);
+                let origin = sess
+                    .conversation_id
+                    .as_deref()
+                    .map(|cid| app.conversation_label(cid))
+                    .unwrap_or_else(|| "chat".to_string());
+                let land = app
+                    .land_for_session(&sess.id)
+                    .filter(|l| l.status == "requested" || l.status == "failed");
+                let status_color = status_color_hex(&sess.status);
+
+                div()
+                    .px(px(14.0))
+                    .py(px(8.0))
+                    .border_t_1()
+                    .border_color(theme.border_subtle)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(kit::swatch(theme::hex(status_color), px(6.0)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .font_family(theme::SANS)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_size(px(12.5))
+                                    .text_color(theme.ink)
+                                    .child(title),
+                            )
+                            .child(theme::numeric(origin, 10.0, theme.fg_tertiary))
+                            .child(kit::status_tag(
+                                short_status_label(&sess.status).to_uppercase(),
+                                status_color,
+                                theme,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                kit::ghost_button(("dm-task-inspect", ti), "Inspect", theme)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_session_inspector(&sid);
+                                        cx.notify();
+                                    })),
+                            )
+                            .children(land.map(|l| {
+                                let lid = l.id.clone();
+                                kit::small_primary_button(
+                                    ("dm-task-approve", ti),
+                                    "Approve Land",
+                                    theme,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.approve_land(&lid);
+                                        cx.notify();
+                                    },
+                                ))
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect()
+    };
+
+    div().flex_none().w_full().flex().justify_center().child(
+        div()
+            .w(relative(1.0))
+            .max_w(px(EDITORIAL_MEASURE))
+            .px(px(24.0))
+            .pt(px(12.0))
+            .child(
+                div()
+                    .rounded(px(2.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.surface)
+                    .overflow_hidden()
+                    .child(
+                        kit::strip_bar(theme)
+                            .child(theme::micro(
+                                format!("TASKS · @{}", bot.name),
+                                9.5,
+                                theme.dark,
+                            ))
+                            .child(theme::numeric(
+                                format!("{active_count} active · {} total", workers.len()),
+                                10.0,
+                                theme.fg_tertiary,
+                            )),
+                    )
+                    .children(rows),
+            ),
+    )
 }
 
 fn message_row(
@@ -707,12 +952,10 @@ fn message_row(
             cx,
         ));
     } else if is_bot {
-        // Also surface land approval card on `land_request` messages without an attached artifact
-        let matching_land = app.lands_by_id.values().find(|l| {
-            l.conversation_id == msg.conversation_id
-                && l.thread_id == msg.thread_id
-                && (msg.body.contains("Ready to land") || msg.body.contains("Land blocked"))
-        });
+        let matching_land = app
+            .lands_by_id
+            .values()
+            .find(|l| l.message_id.as_deref() == Some(msg.id.as_str()));
         if let Some(land) = matching_land {
             let sess = app.sessions_by_id.get(&land.session_id);
             content_col = content_col.child(land_card(land, sess, mi, theme, cx));
@@ -731,11 +974,7 @@ fn message_row(
                 .cursor_pointer()
                 .hover(|s| s.opacity(0.75))
                 .child(kit::icon("kawan/thread.svg", 11.0, theme.dark))
-                .child(theme::numeric(
-                    format!("thread {} →", short_id(&tid_open)),
-                    10.5,
-                    theme.dark,
-                ))
+                .child(theme::numeric("thread →", 10.5, theme.dark))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.right_panel = RightPanel::Thread(tid_open.clone());
                     cx.notify();
@@ -972,9 +1211,9 @@ fn artifact_card(
     let status_color = status_color_hex(status);
     let expanded = app.expanded_artifacts.contains(&artifact_id);
     let loaded = app.loaded_artifacts.get(&artifact_id);
-    let branch_label = sess
-        .and_then(|s| s.branch.clone())
-        .unwrap_or_else(|| format!("artifact {}", short_id(&artifact_id)));
+    let header_label = sess
+        .map(session_display_title)
+        .unwrap_or_else(|| "Artifact".to_string());
 
     let mut card = div()
         .mt(px(4.0))
@@ -1003,8 +1242,12 @@ fn artifact_card(
                         .flex()
                         .items_center()
                         .gap(px(10.0))
-                        .child(theme::micro(branch_label, 9.5, theme.dark))
-                        .child(kit::status_tag(status.to_uppercase(), status_color, theme)),
+                        .child(theme::label(header_label, 12.0, theme.dark))
+                        .child(kit::status_tag(
+                            short_status_label(status).to_uppercase(),
+                            status_color,
+                            theme,
+                        )),
                 )
                 .child(theme::numeric(
                     format!(
@@ -1116,9 +1359,9 @@ fn land_card(
     let status_color = status_color_hex(&land.status);
     let lid = land.id.clone();
     let sid = land.session_id.clone();
-    let branch = sess
-        .and_then(|s| s.branch.clone())
-        .unwrap_or_else(|| short_id(&land.session_id));
+    let title = sess
+        .map(session_display_title)
+        .unwrap_or_else(|| "Land request".to_string());
 
     let mut card = div()
         .mt(px(4.0))
@@ -1146,7 +1389,7 @@ fn land_card(
                         .flex()
                         .items_center()
                         .gap(px(10.0))
-                        .child(theme::micro(branch, 9.5, theme.dark))
+                        .child(theme::label(title, 12.0, theme.dark))
                         .child(kit::status_tag(
                             land.status.to_uppercase(),
                             status_color,
@@ -1251,7 +1494,11 @@ fn session_strip(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
                                 .hover(|s| s.bg(theme.hover))
                                 .child(kit::swatch(theme::hex(color), px(5.0)))
                                 .child(theme::numeric(
-                                    format!("{} · {}", short_id(&sess.id), sess.status),
+                                    format!(
+                                        "{} · {}",
+                                        truncate_chars(&session_display_title(sess), 26),
+                                        short_status_label(&sess.status)
+                                    ),
                                     10.5,
                                     if active {
                                         theme.ink
@@ -1445,6 +1692,7 @@ fn session_drawer_body(
         .flex()
         .flex_col()
         .gap(px(12.0))
+        .child(theme::title(session_display_title(sess), 17.0, theme.ink))
         .child(kit::status_tag(
             sess.status.to_uppercase(),
             status_color_hex(&sess.status),
@@ -1462,6 +1710,18 @@ fn session_drawer_body(
                     theme.ink,
                 )),
         )
+        .children(land.and_then(|l| l.landed_sha.as_ref()).map(|sha| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
+                .child(theme::micro("LANDED COMMIT", 9.0, theme.fg_tertiary))
+                .child(theme::numeric(
+                    sha.chars().take(12).collect::<String>(),
+                    11.5,
+                    theme.ink,
+                ))
+        }))
         .children(sess.task.as_ref().map(|task| {
             div()
                 .flex()

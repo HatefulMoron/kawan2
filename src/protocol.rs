@@ -112,6 +112,8 @@ pub struct SessionSummary {
     pub kind: String,
     pub conversation_id: Option<String>,
     pub thread_id: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
     pub task: Option<String>,
     pub status: String,
     pub branch: Option<String>,
@@ -144,6 +146,8 @@ pub struct Land {
     pub session_id: String,
     pub conversation_id: String,
     pub thread_id: Option<String>,
+    #[serde(default)]
+    pub message_id: Option<String>,
     pub status: String,
     pub approved_by: Option<String>,
     pub base_sha: Option<String>,

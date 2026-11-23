@@ -27,7 +27,7 @@ async function main() {
 
     if (sysText.includes("AI engineering orchestrator")) {
       if (lastUserText.includes("[worker-report")) {
-        return { text: "NO_REPLY" };
+        return { text: "Added land_ok.txt and verified locally — ready for your approval." };
       }
       if (!hasToolResult) {
         return {
@@ -35,13 +35,14 @@ async function main() {
             {
               name: "spawn_session",
               arguments: {
-                task: "Create land_ok.txt containing 'ready', commit it, and call report then land_request.",
+                title: "Add land_ok.txt",
+                task: "Create land_ok.txt containing 'ready', commit it, and call land_request.",
               },
             },
           ],
         };
       }
-      return { text: "Spawned worker to prepare the change." };
+      return { text: "On it." };
     }
 
     const toolCallsMade = msgs.filter((m: any) => m.role === "tool").length;
@@ -62,23 +63,13 @@ async function main() {
       return {
         toolCalls: [
           {
-            name: "report",
-            arguments: { text: "Committed land_ok.txt and verified locally." },
-          },
-        ],
-      };
-    }
-    if (toolCallsMade === 2) {
-      return {
-        toolCalls: [
-          {
             name: "land_request",
-            arguments: { summary: "Ready for approval" },
+            arguments: { summary: "Added land_ok.txt containing 'ready'." },
           },
         ],
       };
     }
-    return { text: "Land requested." };
+    return { text: "Submitted land request." };
   });
 
   const repo = await createFixtureBareRepo({ "README.md": "# Kawan UI E2E\n" });

@@ -122,6 +122,7 @@ const SCHEMA_MIGRATIONS: Array<{ version: number; sql: string }> = [
         kind TEXT NOT NULL CHECK(kind IN ('orchestrator', 'worker')),
         conversation_id TEXT,
         thread_id TEXT,
+        title TEXT,
         task TEXT,
         status TEXT NOT NULL,
         branch TEXT,
@@ -170,6 +171,7 @@ const SCHEMA_MIGRATIONS: Array<{ version: number; sql: string }> = [
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
         conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
         thread_id TEXT,
+        message_id TEXT,
         status TEXT NOT NULL CHECK(status IN ('requested', 'verifying', 'landed', 'failed')),
         approved_by TEXT,
         base_sha TEXT,
@@ -236,6 +238,18 @@ export class KawanDb {
       .all() as Array<{ name: string }>;
     if (!decCols.some((c) => c.name === "hold_expires_at")) {
       this.sqlite.exec("ALTER TABLE decisions ADD COLUMN hold_expires_at INTEGER");
+    }
+    const sessCols = this.sqlite
+      .prepare("PRAGMA table_info(sessions)")
+      .all() as Array<{ name: string }>;
+    if (!sessCols.some((c) => c.name === "title")) {
+      this.sqlite.exec("ALTER TABLE sessions ADD COLUMN title TEXT");
+    }
+    const landCols = this.sqlite
+      .prepare("PRAGMA table_info(lands)")
+      .all() as Array<{ name: string }>;
+    if (!landCols.some((c) => c.name === "message_id")) {
+      this.sqlite.exec("ALTER TABLE lands ADD COLUMN message_id TEXT");
     }
   }
 
@@ -747,6 +761,7 @@ export class KawanDb {
     kind: SessionKind;
     conversationId?: string | null;
     threadId?: string | null;
+    title?: string | null;
     task?: string | null;
     status?: SessionStatus;
     branch?: string | null;
@@ -762,10 +777,10 @@ export class KawanDb {
     this.sqlite
       .prepare(
         `INSERT INTO sessions (
-          id, bot_id, parent_session_id, kind, conversation_id, thread_id,
+          id, bot_id, parent_session_id, kind, conversation_id, thread_id, title,
           task, status, branch, clone_path, agent_dir, pi_session_file,
           soul_snapshot, token, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -774,6 +789,7 @@ export class KawanDb {
         input.kind,
         input.conversationId ?? null,
         input.threadId ?? null,
+        input.title ?? null,
         input.task ?? null,
         input.status ?? "not_started",
         input.branch ?? null,
@@ -993,16 +1009,17 @@ export class KawanDb {
     sessionId: string;
     conversationId: string;
     threadId?: string | null;
+    messageId?: string | null;
   }): LandRow {
     const id = input.id ?? randomUUID();
     const now = Date.now();
     this.sqlite
       .prepare(
         `INSERT INTO lands (
-          id, session_id, conversation_id, thread_id, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, 'requested', ?, ?)`,
+          id, session_id, conversation_id, thread_id, message_id, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 'requested', ?, ?)`,
       )
-      .run(id, input.sessionId, input.conversationId, input.threadId ?? null, now, now);
+      .run(id, input.sessionId, input.conversationId, input.threadId ?? null, input.messageId ?? null, now, now);
     return this.getLand(id)!;
   }
 
@@ -1030,6 +1047,7 @@ export class KawanDb {
     id: string,
     patch: Partial<{
       status: LandStatus;
+      message_id: string | null;
       approved_by: string | null;
       base_sha: string | null;
       landed_sha: string | null;
@@ -1042,11 +1060,12 @@ export class KawanDb {
     this.sqlite
       .prepare(
         `UPDATE lands SET
-          status = ?, approved_by = ?, base_sha = ?, landed_sha = ?, verify_output = ?, error = ?, updated_at = ?
+          status = ?, message_id = ?, approved_by = ?, base_sha = ?, landed_sha = ?, verify_output = ?, error = ?, updated_at = ?
         WHERE id = ?`,
       )
       .run(
         patch.status ?? existing.status,
+        patch.message_id !== undefined ? patch.message_id : existing.message_id,
         patch.approved_by !== undefined ? patch.approved_by : existing.approved_by,
         patch.base_sha !== undefined ? patch.base_sha : existing.base_sha,
         patch.landed_sha !== undefined ? patch.landed_sha : existing.landed_sha,

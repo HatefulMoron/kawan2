@@ -47,7 +47,7 @@ test("Slice 4: passing verify lands signed commit onto bare repo; failing verify
 
     if (sysText.includes("AI engineering orchestrator")) {
       if (lastUserText.includes("[worker-report")) {
-        return { text: "NO_REPLY" };
+        return { text: "Prepared the change — ready for your approval." };
       }
       if (!hasToolResult) {
         return {
@@ -55,16 +55,17 @@ test("Slice 4: passing verify lands signed commit onto bare repo; failing verify
             {
               name: "spawn_session",
               arguments: {
+                title: scenarioPhase === "pass" ? "Add land_ok.txt" : "Add bad_change.txt",
                 task:
                   scenarioPhase === "pass"
-                    ? "Create land_ok.txt containing 'ready', commit it, and call report then land_request."
-                    : "Create bad_change.txt containing 'broken', commit it, and call report then land_request.",
+                    ? "Create land_ok.txt containing 'ready', commit it, and call land_request."
+                    : "Create bad_change.txt containing 'broken', commit it, and call land_request.",
               },
             },
           ],
         };
       }
-      return { text: "Spawned worker to prepare the change." };
+      return { text: "On it." };
     }
 
     const toolCallsMade = msgs.filter((m: any) => m.role === "tool").length;
@@ -85,23 +86,13 @@ test("Slice 4: passing verify lands signed commit onto bare repo; failing verify
       return {
         toolCalls: [
           {
-            name: "report",
-            arguments: { text: "Committed change and verified locally." },
-          },
-        ],
-      };
-    }
-    if (toolCallsMade === 2) {
-      return {
-        toolCalls: [
-          {
             name: "land_request",
-            arguments: { summary: "Ready for approval" },
+            arguments: { summary: "Added the file and committed it cleanly." },
           },
         ],
       };
     }
-    return { text: "Land requested." };
+    return { text: "Submitted land request." };
   });
 
   const host = await startHost({
@@ -178,6 +169,14 @@ test("Slice 4: passing verify lands signed commit onto bare repo; failing verify
       (f) => (f.type === "land.update" && f.land?.status === "requested") || f.type === "error",
       waitTimeout,
     );
+    const wrapMsgWait = admin.waitForNextFrame(
+      (f) =>
+        f.type === "message.new" &&
+        f.author?.kind === "bot" &&
+        typeof f.message?.body === "string" &&
+        f.message.body.includes("ready for your approval"),
+      waitTimeout,
+    );
     await admin.request("message.send", {
       conversation_id: generalId,
       body: "@kawan please create a file named land_ok.txt containing 'ready', commit it with git, and call land_request so I can approve landing it.",
@@ -189,6 +188,16 @@ test("Slice 4: passing verify lands signed commit onto bare repo; failing verify
     const worker1Id = landReq1.land.session_id as string;
     const worker1ClonePath = host.db.getSession(worker1Id)!.clone_path!;
     assert.ok(existsSync(worker1ClonePath));
+
+    if (!useLiveLlm) {
+      const wrapMsg = await wrapMsgWait;
+      const linkedLand = host.db.getLand(land1Id)!;
+      assert.equal(linkedLand.message_id, wrapMsg.message.id);
+      assert.ok(
+        !host.db.listMessages(generalId).some((m) => m.body.startsWith("Ready to land")),
+        "Host must not post automated 'Ready to land' messages",
+      );
+    }
 
     const landedWait = admin.waitForNextFrame(
       (f) => f.type === "land.update" && f.land?.id === land1Id && f.land?.status === "landed",

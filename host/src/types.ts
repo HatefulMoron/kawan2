@@ -100,6 +100,7 @@ export interface SessionRow {
   kind: SessionKind;
   conversation_id: string | null;
   thread_id: string | null;
+  title: string | null;
   task: string | null;
   status: SessionStatus;
   branch: string | null;
@@ -141,6 +142,7 @@ export interface LandRow {
   session_id: string;
   conversation_id: string;
   thread_id: string | null;
+  message_id: string | null;
   status: LandStatus;
   approved_by: string | null;
   base_sha: string | null;

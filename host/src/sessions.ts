@@ -32,6 +32,22 @@ const EXTENSION_ENTRY_PATH = resolve(
   fileURLToPath(new URL("./extension/index.ts", import.meta.url)),
 );
 
+export function deriveTaskTitle(
+  task: string | null | undefined,
+  explicitTitle?: string | null,
+): string {
+  const cleanExplicit = explicitTitle?.replace(/\s+/g, " ").trim();
+  if (cleanExplicit) return cleanExplicit.slice(0, 64);
+  const firstLine =
+    (task ?? "")
+      .split(/\r?\n/)[0]
+      ?.replace(/\s+/g, " ")
+      .trim() ?? "";
+  if (!firstLine) return "Worker task";
+  if (firstLine.length <= 48) return firstLine;
+  return `${firstLine.slice(0, 45).trimEnd()}...`;
+}
+
 export interface PiTurnResult {
   assistantText: string;
   errorMessage: string | null;
@@ -327,7 +343,7 @@ export class SessionManager {
   private orchQueues = new Map<string, Promise<void>>();
   private activeContexts = new Map<
     string,
-    { conversationId: string; threadId: string | null; reportedInTurn: boolean }
+    { conversationId: string; threadId: string | null; reportedInTurn: boolean; sourceWorkerId?: string | null }
   >();
   private workerRuns = new Map<string, Promise<void>>();
 
@@ -467,7 +483,19 @@ export class SessionManager {
         }
         const task = typeof params.task === "string" ? params.task.trim() : "";
         if (!task) throw new Error("task is required");
-        return await this.spawnWorker(session, task);
+        const title = typeof params.title === "string" ? params.title.trim() : undefined;
+        return await this.spawnWorker(session, task, title);
+      }
+
+      case "message_session": {
+        if (session.kind !== "orchestrator") {
+          throw new Error("Only the orchestrator session can call message_session");
+        }
+        const targetId = typeof params.session_id === "string" ? params.session_id.trim() : "";
+        const message = typeof params.message === "string" ? params.message.trim() : "";
+        if (!targetId) throw new Error("session_id is required");
+        if (!message) throw new Error("message is required");
+        return await this.messageWorkerSession(session, targetId, message);
       }
 
       case "session_status": {
@@ -478,6 +506,7 @@ export class SessionManager {
         return {
           sessions: workers.map((w) => ({
             id: w.id,
+            title: w.title,
             status: w.status,
             branch: w.branch,
             task: w.task,
@@ -541,27 +570,33 @@ export class SessionManager {
     return [
       `You are ${bot.name}, an AI engineering orchestrator inside Kawan.`,
       bot.persona ? `Persona: ${bot.persona}` : "Persona: Helpful, concise software engineer.",
-      "You coordinate work across channels and DMs using your host tools:",
-      "- spawn_session(task): delegate repository inspection, coding, tests, and git commits to an isolated worker session. Each worker already has its own clone, dedicated branch, bash/file tools, report(), and land_request(summary). Do NOT tell workers to create a new branch or push to origin; when asked to prepare a change for landing or call land_request, instruct the worker to commit on its current branch and call land_request() itself.",
+      `Only you speak in chat for ${bot.name}. Worker sessions run quietly in isolated clones and never post directly to humans.`,
+      "Host tools:",
+      "- spawn_session(title?, task): delegate repository inspection, coding, tests, and git commits to a worker session. Pass a short 3-6 word `title` for the Tasks UI. Each worker already has its own clone, dedicated branch, bash/file tools, report(), and land_request(). Do NOT tell workers to create a new branch or push to origin.",
+      "- message_session(session_id, message): answer a worker's question or steer an existing worker directly.",
       "- session_status(): inspect your child worker sessions.",
-      "- report(text, artifact?): post an explicit update or attach evidence into the active conversation.",
+      "- report(text, artifact?): post a message or attach evidence into the active conversation.",
       "- soul_replace(anchor, text) and soul_write(document): maintain durable project knowledge in your soul (injected each turn at kawan://soul.md).",
-      "Do not pretend to inspect or edit files directly — always delegate repo work to spawn_session(task).",
-      "Always check kawan://soul.md before claiming you do not know a project fact — durable project facts learned in earlier sessions live there.",
-      "Keep runs brief so channels stay responsive. When a normal chat turn completes without calling report(), your final reply is automatically posted in the conversation.",
-      "If you receive an internal [worker-report] notice and nothing needs to be posted to humans, end with exactly: NO_REPLY",
+      "Workflow rules:",
+      "- Do not pretend to inspect or edit files directly — delegate repository work via spawn_session().",
+      "- When delegating, reply with at most one brief acknowledgement (e.g. 'On it.') or output NO_REPLY — live task status is already shown in the Tasks UI.",
+      "- When a worker calls you with a question you can answer from conversation context or kawan://soul.md, reply to it directly with message_session(session_id, answer) and output NO_REPLY. Only ask the human in chat if you do not know.",
+      "- When a worker finishes or requests landing, post ONE concise human-friendly summary of what changed and how it was verified (and note it is ready for review/approval if awaiting land). Never mention internal session IDs, git branch names, commit hashes, or git plumbing ('working tree clean', 'not pushed') unless explicitly asked.",
+      "- Always check kawan://soul.md before claiming you do not know a project fact — durable project facts learned in earlier sessions live there.",
+      "- If you receive an internal [worker-report] notice and nothing needs to be posted to humans, output exactly: NO_REPLY",
     ].join("\n");
   }
 
-  private buildWorkerSystemPrompt(bot: UserRow, session: SessionRow): string {
+  private buildWorkerSystemPrompt(bot: UserRow, _session: SessionRow): string {
     return [
-      `You are a worker agent for ${bot.name} inside an isolated git clone, already checked out on your dedicated session branch ${session.branch}.`,
-      `Assigned task: ${session.task}`,
+      `You are a worker agent for ${bot.name} inside an isolated git clone.`,
+      `Task: ${_session.task}`,
       "Instructions:",
       "1. Inspect the repository, make the requested changes or collect the requested information, and verify your work.",
-      `2. Commit directly on your current branch (${session.branch}): run \`git add\` and \`git commit -m "..."\`. Do NOT create or switch to another branch and do NOT run \`git push\`. Leave \`git status\` clean.`,
-      "3. Call `report(text, artifact?)` to share concrete results and attach any evidence artifact (summary text, logs, or screenshots).",
-      "4. If the task produced committed changes meant to be merged to the default branch, call `land_request(summary)` after committing so a human can approve landing.",
+      "2. You report ONLY to your orchestrator — your assistant text, report(), and land_request() calls are never shown directly to humans.",
+      "3. If blocked on an ambiguity or need human input, call `report(question)` and stop your turn so your orchestrator can answer or ask humans.",
+      "4. For code changes meant to land on the default branch, commit on your current branch (`git add` && `git commit`), verify cleanly (`git status`), and call `land_request(summary)` with a concise summary of what changed and how it was verified. Do NOT create/switch branches and do NOT run `git push`.",
+      "5. Call `report(text, artifact?)` if you are answering a read-only question, sharing findings, or attaching an evidence artifact.",
     ].join("\n");
   }
 
@@ -627,13 +662,68 @@ export class SessionManager {
     }
   }
 
+  private publishOrchestratorMessage(params: {
+    bot: UserRow;
+    conversation: ConversationRow;
+    threadId: string | null;
+    body: string;
+    artifactRow?: ArtifactRow | null;
+    sourceWorkerId?: string | null;
+  }): MessageRow {
+    let artifactRow = params.artifactRow ?? null;
+    if (!artifactRow && params.sourceWorkerId) {
+      const unlinked = this.db
+        .listArtifacts({ sessionId: params.sourceWorkerId })
+        .filter((a) => !a.message_id);
+      artifactRow = unlinked[unlinked.length - 1] ?? null;
+    }
+
+    const posted = this.db.appendMessage({
+      conversationId: params.conversation.id,
+      authorId: params.bot.id,
+      threadId: params.threadId,
+      body: params.body,
+      artifactId: artifactRow?.id ?? null,
+    });
+
+    if (artifactRow) {
+      this.db.linkArtifactMessage(artifactRow.id, posted.id);
+      const refreshedArt = this.db.getArtifact(artifactRow.id);
+      if (refreshedArt) {
+        this.wsServer.broadcastToConversation(params.conversation, {
+          type: "artifact.new",
+          artifact: refreshedArt,
+        });
+      }
+    }
+
+    if (params.sourceWorkerId) {
+      const pendingLand = this.db
+        .listLands({ sessionId: params.sourceWorkerId })
+        .filter((l) => (l.status === "requested" || l.status === "failed") && !l.message_id)
+        .pop();
+      if (pendingLand) {
+        const updatedLand = this.db.updateLand(pendingLand.id, { message_id: posted.id })!;
+        this.wsServer.broadcast({ type: "land.update", land: updatedLand });
+      }
+    }
+
+    this.wsServer.broadcastToConversation(params.conversation, {
+      type: "message.new",
+      message: posted,
+      author: { id: params.bot.id, kind: "bot", name: params.bot.name },
+    });
+    return posted;
+  }
+
   private enqueueOrchestratorPrompt(
     bot: UserRow,
     conversation: ConversationRow,
     threadId: string | null,
     messages: MessageRow[],
-    isInternalNotice = false,
+    _isInternalNotice = false,
     promptOverride?: string,
+    sourceWorkerId?: string | null,
   ): void {
     const prev = this.orchQueues.get(bot.id) ?? Promise.resolve();
     const next = prev
@@ -656,6 +746,7 @@ export class SessionManager {
           conversationId: conversation.id,
           threadId: targetThreadId,
           reportedInTurn: false,
+          sourceWorkerId: sourceWorkerId ?? null,
         });
 
         const promptText =
@@ -688,36 +779,14 @@ export class SessionManager {
           } else if (
             !ctx?.reportedInTurn &&
             turn.assistantText &&
-            turn.assistantText.trim() !== "NO_REPLY" &&
-            !isInternalNotice
-          ) {
-            const posted = this.db.appendMessage({
-              conversationId: conversation.id,
-              authorId: freshBot.id,
-              threadId: targetThreadId,
-              body: turn.assistantText.trim(),
-            });
-            this.wsServer.broadcastToConversation(conversation, {
-              type: "message.new",
-              message: posted,
-              author: { id: freshBot.id, kind: "bot", name: freshBot.name },
-            });
-          } else if (
-            isInternalNotice &&
-            !ctx?.reportedInTurn &&
-            turn.assistantText &&
             turn.assistantText.trim() !== "NO_REPLY"
           ) {
-            const posted = this.db.appendMessage({
-              conversationId: conversation.id,
-              authorId: freshBot.id,
+            this.publishOrchestratorMessage({
+              bot: freshBot,
+              conversation,
               threadId: targetThreadId,
               body: turn.assistantText.trim(),
-            });
-            this.wsServer.broadcastToConversation(conversation, {
-              type: "message.new",
-              message: posted,
-              author: { id: freshBot.id, kind: "bot", name: freshBot.name },
+              sourceWorkerId: ctx?.sourceWorkerId,
             });
           }
         } catch (err) {
@@ -757,9 +826,13 @@ export class SessionManager {
     ].join("\n");
   }
 
-  private async spawnWorker(orchSession: SessionRow, task: string): Promise<{
+  private async spawnWorker(
+    orchSession: SessionRow,
+    task: string,
+    explicitTitle?: string,
+  ): Promise<{
     session_id: string;
-    branch: string;
+    title: string;
     status: string;
   }> {
     const bot = this.db.getUser(orchSession.bot_id);
@@ -780,6 +853,7 @@ export class SessionManager {
 
     const sessionId = randomUUID();
     const branch = `kawan/${sessionId}`;
+    const title = deriveTaskTitle(task, explicitTitle);
     const clonePath = join(this.dataDir, "workspaces", sessionId);
     const sessionBase = join(this.dataDir, "sessions", sessionId);
     const agentDir = join(sessionBase, "agent");
@@ -807,6 +881,7 @@ export class SessionManager {
       kind: "worker",
       conversationId: ctx.conversationId,
       threadId: ctx.threadId,
+      title,
       task,
       status: "running",
       branch,
@@ -846,7 +921,7 @@ export class SessionManager {
     const runPromise = this.runWorkerTurn(proc, workerSession, bot, task);
     this.workerRuns.set(workerSession.id, runPromise);
 
-    return { session_id: workerSession.id, branch, status: "running" };
+    return { session_id: workerSession.id, title, status: "running" };
   }
 
   private async runWorkerTurn(
@@ -896,19 +971,11 @@ export class SessionManager {
         return;
       }
 
-      if (!ctx?.reportedInTurn && turn.assistantText && conv) {
-        const posted = this.db.appendMessage({
-          conversationId: conv.id,
-          authorId: bot.id,
-          threadId: latest.thread_id,
-          body: turn.assistantText,
-        });
-        this.wsServer.broadcastToConversation(conv, {
-          type: "message.new",
-          message: posted,
-          author: { id: bot.id, kind: "bot", name: bot.name },
-        });
-        this.db.updateSession(session.id, { last_report: turn.assistantText });
+      if (!ctx?.reportedInTurn && turn.assistantText) {
+        const updatedReport = this.db.updateSession(session.id, {
+          last_report: turn.assistantText.trim(),
+        })!;
+        this.wsServer.broadcast({ type: "session.update", session: serializeSession(updatedReport) });
       }
 
       const refreshed = this.db.getSession(session.id)!;
@@ -918,14 +985,37 @@ export class SessionManager {
       }
 
       const reportSummary = refreshed.last_report ?? turn.assistantText;
-      if (conv && reportSummary) {
+      if (conv && (reportSummary || refreshed.status === "review_requested")) {
+        const taskTitle = deriveTaskTitle(refreshed.task, refreshed.title);
+        const workerArtifacts = this.db
+          .listArtifacts({ sessionId: session.id })
+          .map((a) => a.filename ?? a.mime_type);
+        const pendingLand = this.db
+          .listLands({ sessionId: session.id })
+          .find((l) => l.status === "requested" || l.status === "failed");
+        const statusNote = pendingLand
+          ? `status=${refreshed.status}, land_approval=pending`
+          : `status=${refreshed.status}`;
+        const artifactNote =
+          workerArtifacts.length > 0 ? `\nArtifacts attached: ${workerArtifacts.join(", ")}` : "";
+
         this.enqueueOrchestratorPrompt(
           bot,
           conv,
           refreshed.thread_id,
           [],
           true,
-          `[worker-report from session ${session.id} (${refreshed.status})]\n${reportSummary}\n\nIf the worker uncovered a durable project fact, agreement, or decision, update your soul with soul_replace or soul_write. Otherwise respond with NO_REPLY.`,
+          [
+            `[worker-report for "${taskTitle}" (session_id=${session.id}, ${statusNote})]${artifactNote}`,
+            reportSummary || "(Worker submitted committed changes for review without extra text.)",
+            "",
+            "Remember: ONLY you represent the bot in chat (this report was not shown to humans).",
+            "- If the worker asked a question you can answer from conversation context or kawan://soul.md, call `message_session(session_id, answer)` and output NO_REPLY.",
+            "- If you need human input to unblock the worker, ask concisely in chat.",
+            "- If the worker completed the task or requested landing (`land_approval=pending`), post ONE clear summary for humans explaining what changed and how it was verified (and mention it is ready for review/approval if pending). Omit internal session IDs, branch names, commit hashes, and git plumbing.",
+            "- If a durable project fact, agreement, or decision was uncovered, save it via `soul_replace` or `soul_write`.",
+          ].join("\n"),
+          session.id,
         );
       }
     } catch (err) {
@@ -945,6 +1035,23 @@ export class SessionManager {
     }
   }
 
+  private async messageWorkerSession(
+    orchSession: SessionRow,
+    workerId: string,
+    message: string,
+  ): Promise<{ session_id: string; status: string }> {
+    const bot = this.db.getUser(orchSession.bot_id);
+    if (!bot || bot.kind !== "bot") {
+      throw new Error("Bot no longer exists");
+    }
+    const worker = this.db.getSession(workerId);
+    if (!worker || worker.kind !== "worker" || worker.bot_id !== bot.id) {
+      throw new Error(`Worker session not found: ${workerId}`);
+    }
+    await this.sendPromptToWorker(bot, worker, `[orchestrator]: ${message}`);
+    return { session_id: worker.id, status: "running" };
+  }
+
   private async dispatchToWorker(
     bot: UserRow,
     workerId: string,
@@ -955,11 +1062,19 @@ export class SessionManager {
     if (!worker || worker.kind !== "worker") {
       throw new Error(`Worker session not found: ${workerId}`);
     }
+    const promptText = this.formatHumanBatchPrompt(conversation, worker.thread_id, messages);
+    await this.sendPromptToWorker(bot, worker, promptText);
+  }
+
+  private async sendPromptToWorker(
+    bot: UserRow,
+    worker: SessionRow,
+    promptText: string,
+  ): Promise<void> {
     if (!worker.clone_path || !existsSync(worker.clone_path)) {
-      throw new Error(`Worker clone is no longer available for session ${workerId}`);
+      throw new Error(`Worker clone is no longer available for session ${worker.id}`);
     }
 
-    const promptText = this.formatHumanBatchPrompt(conversation, worker.thread_id, messages);
     let proc = this.processes.get(worker.id);
     if (!proc || !proc.isAlive) {
       const settings = this.db.getHostSettings();
@@ -1002,7 +1117,7 @@ export class SessionManager {
     session: SessionRow,
     text: string,
     artifactInput?: { filename?: string; mime_type?: string; base64?: string },
-  ): Promise<{ message_id: string; artifact_id: string | null }> {
+  ): Promise<{ message_id: string | null; artifact_id: string | null }> {
     const bot = this.db.getUser(session.bot_id);
     if (!bot) throw new Error("Bot not found");
 
@@ -1045,24 +1160,24 @@ export class SessionManager {
       });
     }
 
-    const msg = this.db.appendMessage({
-      conversationId: conv.id,
-      authorId: bot.id,
-      threadId,
-      body: text,
-      artifactId: artifactRow?.id ?? null,
-    });
-    if (artifactRow) {
-      this.db.linkArtifactMessage(artifactRow.id, msg.id);
+    const updatedSession = this.db.updateSession(session.id, { last_report: text })!;
+    this.wsServer.broadcast({ type: "session.update", session: serializeSession(updatedSession) });
+
+    if (session.kind === "worker") {
+      return {
+        message_id: null,
+        artifact_id: artifactRow?.id ?? null,
+      };
     }
 
-    const updatedSession = this.db.updateSession(session.id, { last_report: text })!;
-    this.wsServer.broadcastToConversation(conv, {
-      type: "message.new",
-      message: msg,
-      author: { id: bot.id, kind: "bot", name: bot.name },
+    const msg = this.publishOrchestratorMessage({
+      bot,
+      conversation: conv,
+      threadId,
+      body: text,
+      artifactRow,
+      sourceWorkerId: ctx?.sourceWorkerId,
     });
-    this.wsServer.broadcast({ type: "session.update", session: serializeSession(updatedSession) });
 
     return {
       message_id: msg.id,
@@ -1120,30 +1235,17 @@ export class SessionManager {
       conversationId: session.conversation_id!,
       threadId: session.thread_id,
     });
-    const updated = this.db.updateSession(session.id, { status: "review_requested" })!;
+    const trimmedSummary = summary.trim();
+    const updated = this.db.updateSession(session.id, {
+      status: "review_requested",
+      ...(trimmedSummary ? { last_report: trimmedSummary } : {}),
+    })!;
     this.wsServer.broadcast({ type: "session.update", session: serializeSession(updated) });
     this.wsServer.broadcast({ type: "land.update", land });
 
-    const conv = session.conversation_id ? this.db.getConversation(session.conversation_id) : null;
-    const bot = this.db.getUser(session.bot_id);
-    if (conv && bot) {
-      const ctx = this.activeContexts.get(session.id);
-      if (ctx) ctx.reportedInTurn = true;
-      const body = summary.trim()
-        ? `Ready to land \`${session.branch}\`: ${summary.trim()}`
-        : `Ready to land \`${session.branch}\`. Awaiting human approval.`;
-      const msg = this.db.appendMessage({
-        conversationId: conv.id,
-        authorId: bot.id,
-        threadId: session.thread_id,
-        body,
-      });
-      this.wsServer.broadcastToConversation(conv, {
-        type: "message.new",
-        message: msg,
-        author: { id: bot.id, kind: "bot", name: bot.name },
-      });
-    }
+    const ctx = this.activeContexts.get(session.id);
+    if (ctx) ctx.reportedInTurn = true;
+
     return { land_id: land.id, status: land.status, branch: updated.branch };
   }
 
@@ -1211,6 +1313,8 @@ export class SessionManager {
       landingDir,
     });
 
+    const taskTitle = deriveTaskTitle(session.task, session.title);
+
     if (result.ok) {
       removeClone(session.clone_path);
       const landed = this.db.updateLand(land.id, {
@@ -1228,7 +1332,7 @@ export class SessionManager {
           conversationId: conv.id,
           authorId: bot.id,
           threadId: land.thread_id,
-          body: `Landed \`${session.branch}\` on \`${settings.repo.default_branch}\` at ${result.landedSha?.slice(0, 12)} (parent ${result.baseSha.slice(0, 12)}).`,
+          body: `Landed "${taskTitle}" on \`${settings.repo.default_branch}\`.`,
         });
         this.wsServer.broadcastToConversation(conv, {
           type: "message.new",
@@ -1253,7 +1357,7 @@ export class SessionManager {
         conversationId: conv.id,
         authorId: bot.id,
         threadId: land.thread_id,
-        body: `Land blocked for \`${session.branch}\`:\n${result.error ?? result.verifyOutput}`,
+        body: `Land blocked for "${taskTitle}":\n${result.error ?? result.verifyOutput}`,
       });
       this.wsServer.broadcastToConversation(conv, {
         type: "message.new",

@@ -165,8 +165,9 @@ export function formatLiveSessionsSummary(sessions: SessionRow[]): string {
     return "## Active & recent worker sessions\n\n(none)\n";
   }
   const lines = sessions.map((w) => {
+    const label = w.title?.trim() || w.task?.split(/\r?\n/, 1)[0]?.slice(0, 48) || w.id.slice(0, 8);
     const reportSnippet = w.last_report ? w.last_report.replace(/\s+/g, " ").slice(0, 160) : "no report yet";
-    return `- ${w.id} [${w.status}] (${w.branch ?? "no-branch"}): ${w.task ?? ""} — ${reportSnippet}`;
+    return `- ${label} (session_id=${w.id}, status=${w.status}): ${reportSnippet}`;
   });
   return `## Active & recent worker sessions\n\n${lines.join("\n")}\n`;
 }
