@@ -115,7 +115,7 @@ export default function (pi: ExtensionAPI) {
             description:
               role === "reviewer"
                 ? "Review findings or concise approval to post directly in the issue conversation"
-                : "Report, question, or result (sent to your orchestrator, or directly to the issue room if working on an issue)",
+                : "Report, question, or result (sent to your orchestrator, or directly to the issue room if working on an issue). A finished result becomes the review card humans approve from, so write it as a user-facing changelog entry focused on outcomes and attach screenshots for visual changes; leave file names, markup, and logs out of it.",
           }),
           artifact: artifactParamSchema,
         });
@@ -128,7 +128,7 @@ export default function (pi: ExtensionAPI) {
         ? "Post a message into the active conversation and optionally attach a text, markdown, or image artifact."
         : role === "reviewer"
           ? "Post read-only code review findings or approval directly into the issue conversation and optionally attach a markdown artifact."
-          : "Send a summary, progress note, blocking question, or artifact (to your orchestrator, or directly into the issue room when bound to an issue).",
+          : "Send a summary, progress note, blocking question, or artifact (to your orchestrator, or directly into the issue room when bound to an issue). Final summaries are shown in the Status view and approval cards, so describe the user-visible outcome in changelog style and attach screenshots for visual changes.",
     parameters: reportParameters,
     async execute(_toolCallId, params) {
       try {
@@ -410,7 +410,10 @@ export default function (pi: ExtensionAPI) {
         "Re-run repository verification checks in the landing clone and fast-forward onto the default branch after reconciliation.",
       parameters: Type.Object({
         summary: Type.Optional(
-          Type.String({ description: "Short human-friendly note of how the conflict or failure was reconciled" }),
+          Type.String({
+            description:
+              "Short user-facing changelog note of how the conflict or failure was reconciled; no file names, logs, or git plumbing",
+          }),
         ),
       }),
       async execute(_toolCallId, params) {
@@ -447,7 +450,12 @@ export default function (pi: ExtensionAPI) {
       description:
         "Mark this worker session's committed changes as ready for human approval in the Tasks UI and notify your orchestrator (for ad-hoc chat tasks only; not used inside issues).",
       parameters: Type.Object({
-        summary: Type.Optional(Type.String({ description: "Short summary of the committed changes ready to land" })),
+        summary: Type.Optional(
+          Type.String({
+            description:
+              "User-facing changelog summary of what changed for the user and how it was verified (shown in the Status view review card); no file names, markup, logs, or git plumbing",
+          }),
+        ),
       }),
       async execute(_toolCallId, params) {
         try {
