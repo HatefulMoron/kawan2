@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use gpui::{Context, FocusHandle, Image, ImageFormat, KeyDownEvent, Task};
@@ -163,6 +163,7 @@ pub struct KawanApp {
     ws: Option<WsHandle>,
     pending_commands: HashMap<String, String>,
     _poll_task: Option<Task<()>>,
+    last_hold_tick_sec: u64,
 }
 
 impl KawanApp {
@@ -246,6 +247,7 @@ impl KawanApp {
             ws: None,
             pending_commands: HashMap::new(),
             _poll_task: None,
+            last_hold_tick_sec: 0,
         };
 
         if is_mock {
@@ -310,7 +312,9 @@ impl KawanApp {
                     .await;
                 let alive = this
                     .update(cx, |this, cx| {
-                        if this.drain_ws_events() {
+                        let drained = this.drain_ws_events();
+                        let ticked = this.tick_hold_countdown();
+                        if drained || ticked {
                             cx.notify();
                         }
                     })
@@ -320,6 +324,28 @@ impl KawanApp {
                 }
             }
         }));
+    }
+
+    fn tick_hold_countdown(&mut self) -> bool {
+        let Some(cid) = self.active_conversation_id.as_deref() else {
+            return false;
+        };
+        let has_pending_hold = self.decisions_by_conv.get(cid).is_some_and(|list| {
+            list.iter()
+                .any(|d| d.readiness == "hold" && d.dispatched == 0 && d.hold_expires_at.is_some())
+        });
+        if !has_pending_hold {
+            return false;
+        }
+        let now_sec = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now_sec != self.last_hold_tick_sec {
+            self.last_hold_tick_sec = now_sec;
+            return true;
+        }
+        false
     }
 
     fn drain_ws_events(&mut self) -> bool {
@@ -822,6 +848,7 @@ impl KawanApp {
                     dispatched: 1,
                     redirected_from: None,
                     redirected_by: None,
+                    hold_expires_at: None,
                     created_at: 1_795_409_400_050,
                 });
             return;
@@ -923,10 +950,13 @@ impl KawanApp {
         if self.is_mock {
             for list in self.decisions_by_conv.values_mut() {
                 if let Some(dec) = list.iter_mut().find(|d| d.id == decision_id) {
-                    dec.redirected_from = Some(dec.destination.clone());
+                    if dec.destination != destination {
+                        dec.redirected_from = Some(dec.destination.clone());
+                    }
                     dec.destination = destination.to_string();
                     dec.readiness = "dispatch".to_string();
                     dec.dispatched = 1;
+                    dec.hold_expires_at = None;
                 }
             }
             return;

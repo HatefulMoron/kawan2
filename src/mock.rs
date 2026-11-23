@@ -327,6 +327,7 @@ pub fn populate_mock(app: &mut KawanApp) {
                 dispatched: 1,
                 redirected_from: None,
                 redirected_by: None,
+                hold_expires_at: None,
                 created_at: 1_795_400_001_000,
             },
             Decision {
@@ -344,6 +345,7 @@ pub fn populate_mock(app: &mut KawanApp) {
                 dispatched: 1,
                 redirected_from: None,
                 redirected_by: None,
+                hold_expires_at: None,
                 created_at: 1_795_400_121_000,
             },
             Decision {
@@ -361,6 +363,7 @@ pub fn populate_mock(app: &mut KawanApp) {
                 dispatched: 1,
                 redirected_from: None,
                 redirected_by: None,
+                hold_expires_at: None,
                 created_at: 1_795_400_241_000,
             },
         ],

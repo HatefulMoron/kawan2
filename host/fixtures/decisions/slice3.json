@@ -1,28 +1,28 @@
 {
-  "2584956687c88311780ab710": {
+  "d9af12a8a4df83d876d59a65": {
     "model": "subq-snap-1.2",
     "answers": {
       "destination": {
         "type": "choice",
         "choice": "orchestrator",
         "probabilities": {
-          "none": 0.00015495563275180757,
-          "orchestrator": 0.999845027923584
+          "none": 0.0001256023970199749,
+          "orchestrator": 0.9998743534088135
         },
-        "confidence": 0.999690055847168
+        "confidence": 0.999748706817627
       },
       "readiness": {
         "type": "choice",
         "choice": "dispatch",
         "probabilities": {
-          "dispatch": 0.9821033477783203,
-          "hold": 0.017896631732583046
+          "dispatch": 0.9956706762313843,
+          "hold": 0.00432934332638979
         },
-        "confidence": 0.9642066955566406
+        "confidence": 0.9913413524627686
       }
     },
     "usage": {
-      "input_tokens": 556,
+      "input_tokens": 606,
       "output_tokens": 0
     }
   }

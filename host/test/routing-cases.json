@@ -200,5 +200,15 @@
     "heldMessages": [],
     "incoming": { "author": "alice", "inThread": false, "body": "@kawan what are your workers currently doing?" },
     "expected": { "destination": "orchestrator", "readiness": "dispatch" }
+  },
+  {
+    "id": "conversational-checkin-whats-up",
+    "botName": "kawan",
+    "conversation": { "kind": "channel", "name": "general" },
+    "activeSessions": [],
+    "recentMessages": [],
+    "heldMessages": [],
+    "incoming": { "author": "alice", "inThread": false, "body": "@kawan what's up?" },
+    "expected": { "destination": "orchestrator", "readiness": "dispatch" }
   }
 ]

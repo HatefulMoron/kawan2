@@ -1,55 +1,55 @@
 {
-  "116a140002a2b3dba4ebefe8": {
+  "3882647fe592fba93b05b4d6": {
     "model": "subq-snap-1.2",
     "answers": {
       "destination": {
         "type": "choice",
         "choice": "orchestrator",
         "probabilities": {
-          "none": 0.00029990015900693834,
-          "orchestrator": 0.9997001886367798
+          "none": 0.00026665758923627436,
+          "orchestrator": 0.9997333884239197
         },
-        "confidence": 0.9994003772735596
+        "confidence": 0.9994667768478394
       },
       "readiness": {
         "type": "choice",
         "choice": "dispatch",
         "probabilities": {
-          "dispatch": 0.9813847541809082,
-          "hold": 0.018615223467350006
+          "dispatch": 0.9913433790206909,
+          "hold": 0.008656567893922329
         },
-        "confidence": 0.9627695083618164
+        "confidence": 0.9826867580413818
       }
     },
     "usage": {
-      "input_tokens": 551,
+      "input_tokens": 601,
       "output_tokens": 0
     }
   },
-  "ba25a5f749300c9ec947f653": {
+  "e2199a52900a68769b85d437": {
     "model": "subq-snap-1.2",
     "answers": {
       "destination": {
         "type": "choice",
         "choice": "orchestrator",
         "probabilities": {
-          "none": 0.00016067536489572376,
-          "orchestrator": 0.9998393058776855
+          "none": 0.00013624949497170746,
+          "orchestrator": 0.9998637437820435
         },
-        "confidence": 0.9996786117553711
+        "confidence": 0.9997274875640869
       },
       "readiness": {
         "type": "choice",
         "choice": "dispatch",
         "probabilities": {
-          "dispatch": 0.9802342057228088,
-          "hold": 0.019765861332416534
+          "dispatch": 0.9932364821434021,
+          "hold": 0.006763511337339878
         },
-        "confidence": 0.9604684114456177
+        "confidence": 0.9864729642868042
       }
     },
     "usage": {
-      "input_tokens": 551,
+      "input_tokens": 601,
       "output_tokens": 0
     }
   }

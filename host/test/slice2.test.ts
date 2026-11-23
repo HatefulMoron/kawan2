@@ -185,6 +185,8 @@ test("Slice 2: settings, models, bots, SubQ Snap routing (dispatch/hold/none), r
     assert.equal(d2Frame.decision.destination, "orchestrator");
     assert.equal(d2Frame.decision.readiness, "hold");
     assert.equal(d2Frame.decision.dispatched, 0);
+    assert.equal(typeof d2Frame.decision.hold_expires_at, "number");
+    assert.ok(d2Frame.decision.hold_expires_at > Date.now() - 1000);
     assert.equal(dispatches.length, 1, "held fragment must NOT dispatch yet");
 
     const d3Wait = admin.waitForNextFrame((f) => f.type === "decision.new");
@@ -250,6 +252,104 @@ test("Slice 2: settings, models, bots, SubQ Snap routing (dispatch/hold/none), r
     const protoContent = readFileSync(protocolPath, "utf8");
     assert.ok(!protoContent.includes(llmApiKey));
     assert.ok(!protoContent.includes("secret-repo-token"));
+
+    admin.close();
+  } finally {
+    await host.close();
+    await stub.close();
+    repo.cleanup();
+    adminKey.cleanup();
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("Slice 2: held fragment auto-dispatches after hold timeout and broadcasts update", async () => {
+  const stub = await startStubProvider();
+  const repo = await createFixtureBareRepo();
+  const dataDir = mkdtempSync(join(tmpdir(), "kawan-slice2-hold-"));
+  const adminKey = await TestKeyPair.generate("admin@kawan");
+
+  const dispatches: DispatchEvent[] = [];
+  const host = await startHost({
+    dataDir,
+    quiet: true,
+    holdTimeoutMs: 200,
+    onDispatch: async (ev) => {
+      dispatches.push(ev);
+    },
+  });
+
+  try {
+    const admin = await WsTestClient.connect(host.url);
+    await admin.bootstrap(host.bootstrapToken!, "alice", adminKey);
+
+    await admin.request("settings.update", {
+      repo: { url: repo.barePath, default_branch: repo.defaultBranch },
+      providers: {
+        stub: {
+          baseUrl: stub.baseUrl,
+          api: "openai-completions",
+          apiKey: "stub-key",
+          models: [
+            {
+              id: "stub-model",
+              name: "stub-model",
+              reasoning: false,
+              contextWindow: 128000,
+              maxTokens: 16384,
+            },
+          ],
+        },
+      },
+      roles: {
+        default: { provider: "stub", model: "stub-model", thinking_level: "off" },
+        decision: { provider: "stub", baseUrl: stub.systemOneBaseUrl, model: "stub-snap", apiKey: "stub-key" },
+      },
+    });
+
+    stub.setSystemOneHandler(() => ({
+      status: 200,
+      body: {
+        model: "stub-snap",
+        answers: {
+          destination: { type: "choice", choice: "orchestrator", confidence: 0.99, probabilities: { orchestrator: 0.99, none: 0.01 } },
+          readiness: { type: "choice", choice: "hold", confidence: 0.95, probabilities: { dispatch: 0.05, hold: 0.95 } },
+        },
+      },
+    }));
+
+    const createdBot = await admin.request<{ bot: any }>("bot.create", {
+      name: "kawan",
+      persona: "Concise coding assistant",
+    });
+    const convs = await admin.request<{ conversations: Array<{ id: string; name: string }> }>("conversation.list");
+    const generalId = convs.conversations.find((c) => c.name === "general")!.id;
+    await admin.request("conversation.add_member", { conversation_id: generalId, user_id: createdBot.bot.id });
+
+    const heldWait = admin.waitForNextFrame((f) => f.type === "decision.new" && f.decision?.dispatched === 0);
+    const autoWait = admin.waitForNextFrame((f) => f.type === "decision.new" && f.decision?.dispatched === 1);
+
+    const sent = await admin.request<{ message: { id: string } }>("message.send", {
+      conversation_id: generalId,
+      body: "@kawan hey",
+    });
+
+    const heldFrame = await heldWait;
+    assert.equal(heldFrame.decision.readiness, "hold");
+    assert.equal(heldFrame.decision.dispatched, 0);
+    assert.equal(typeof heldFrame.decision.hold_expires_at, "number");
+    assert.ok(heldFrame.decision.hold_expires_at > Date.now() - 1000);
+    assert.equal(dispatches.length, 0);
+
+    const autoFrame = await autoWait;
+    assert.equal(autoFrame.decision.id, heldFrame.decision.id);
+    assert.equal(autoFrame.decision.dispatched, 1);
+    assert.equal(autoFrame.decision.hold_expires_at, null);
+    assert.equal(dispatches.length, 1);
+    assert.deepEqual(
+      dispatches[0].messages.map((m) => m.id),
+      [sent.message.id],
+    );
 
     admin.close();
   } finally {

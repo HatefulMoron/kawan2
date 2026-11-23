@@ -16,6 +16,7 @@ import { serializeSession, SessionManager, type SoulHandlers } from "./sessions.
 import { createSoulHandlers, INITIAL_SOUL_DOCUMENT } from "./soul.js";
 import type {
   ConversationRow,
+  DecisionRow,
   HostSettings,
   MessageRow,
   ModelDefinition,
@@ -42,6 +43,7 @@ export interface StartHostOptions {
   decisionMode?: DecisionMode;
   decisionFixturePath?: string;
   disableSandbox?: boolean;
+  holdTimeoutMs?: number;
   soulHandlers?: SoulHandlers;
   onDispatch?: (event: DispatchEvent) => Promise<void> | void;
   quiet?: boolean;
@@ -263,6 +265,70 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
     } else {
       await sessionManager.dispatch(ev);
     }
+  };
+
+  const parsedEnvHold = Number(process.env.KAWAN_HOLD_TIMEOUT_MS ?? 10_000);
+  const holdTimeoutMs =
+    opts.holdTimeoutMs !== undefined
+      ? Math.max(0, opts.holdTimeoutMs)
+      : Number.isFinite(parsedEnvHold)
+        ? Math.max(0, parsedEnvHold)
+        : 10_000;
+  const holdTimers = new Map<string, NodeJS.Timeout>();
+  const holdKey = (conversationId: string, botId: string): string => `${conversationId}:${botId}`;
+
+  const cancelHoldTimer = (conversationId: string, botId: string): void => {
+    const key = holdKey(conversationId, botId);
+    const existing = holdTimers.get(key);
+    if (existing) {
+      clearTimeout(existing);
+      holdTimers.delete(key);
+    }
+  };
+
+  const flushHeldBatch = async (conversationId: string, botId: string): Promise<void> => {
+    cancelHoldTimer(conversationId, botId);
+    const stillHeld = db.listHeldDecisions(conversationId, botId);
+    if (stillHeld.length === 0) return;
+
+    const conv = db.getConversation(conversationId);
+    const bot = db.getUser(botId);
+    if (!conv || !bot) return;
+
+    const destination = stillHeld[stillHeld.length - 1].destination;
+    const batchId = stillHeld.length > 1 ? randomUUID() : null;
+    const updated = db.markDecisionsDispatched(
+      stillHeld.map((h) => h.id),
+      batchId,
+    );
+    for (const decision of updated) {
+      wsServer.broadcastToConversation(conv, { type: "decision.new", decision });
+    }
+    if (destination !== "none") {
+      const lastMsg = stillHeld[stillHeld.length - 1].message;
+      await dispatchEvent({
+        bot,
+        destination,
+        conversation: conv,
+        threadId: lastMsg.thread_id,
+        messages: stillHeld.map((h) => h.message),
+      });
+    }
+  };
+
+  const scheduleHoldTimer = (conversationId: string, botId: string, delayMs: number): void => {
+    cancelHoldTimer(conversationId, botId);
+    const key = holdKey(conversationId, botId);
+    const timer = setTimeout(() => {
+      holdTimers.delete(key);
+      void flushHeldBatch(conversationId, botId).catch((err) => {
+        if (!opts.quiet) {
+          console.error("[kawan-host] hold timer flush error:", err);
+        }
+      });
+    }, Math.max(0, delayMs));
+    timer.unref?.();
+    holdTimers.set(key, timer);
   };
 
   const extraHandlers: Record<string, CommandHandler> = {
@@ -595,6 +661,9 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
 
       const previousDestination = existing.destination;
       const updated = db.redirectDecision(decisionId, destination, client.user.id)!;
+      if (db.listHeldDecisions(updated.conversation_id, updated.bot_id).length === 0) {
+        cancelHoldTimer(updated.conversation_id, updated.bot_id);
+      }
       const conv = db.getConversation(updated.conversation_id)!;
       wsServer.broadcastToConversation(conv, { type: "decision.new", decision: updated });
 
@@ -692,10 +761,20 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
         const isHeld = result.destination !== "none" && result.readiness === "hold";
         const heldBatchId =
           shouldDispatchNow && heldRows.length > 0 ? randomUUID() : null;
+        const holdExpiresAt = isHeld && holdTimeoutMs > 0 ? Date.now() + holdTimeoutMs : null;
 
+        let updatedHeld: DecisionRow[] = [];
         const decision = db.transaction(() => {
           if (shouldDispatchNow && heldRows.length > 0) {
-            db.markDecisionsDispatched(heldRows.map((h) => h.id));
+            updatedHeld = db.markDecisionsDispatched(
+              heldRows.map((h) => h.id),
+              heldBatchId,
+            );
+          } else if (isHeld && heldRows.length > 0) {
+            updatedHeld = db.updateHeldExpiry(
+              heldRows.map((h) => h.id),
+              holdExpiresAt,
+            );
           }
           return db.createDecision({
             conversationId: conversation.id,
@@ -709,6 +788,7 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
             rawJson: result.rawJson,
             heldBatchId,
             dispatched: !isHeld,
+            holdExpiresAt,
           });
         });
 
@@ -716,8 +796,19 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
           type: "decision.new",
           decision,
         });
+        for (const hd of updatedHeld) {
+          wsServer.broadcastToConversation(conversation, {
+            type: "decision.new",
+            decision: hd,
+          });
+        }
+
+        if (isHeld && holdTimeoutMs > 0) {
+          scheduleHoldTimer(conversation.id, bot.id, holdTimeoutMs);
+        }
 
         if (shouldDispatchNow) {
+          cancelHoldTimer(conversation.id, bot.id);
           const batchMessages = [...heldRows.map((h) => h.message), message];
           await dispatchEvent({
             bot,
@@ -740,6 +831,22 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
   });
   await sessionManager.start();
 
+  if (holdTimeoutMs > 0) {
+    const grouped = new Map<string, { conversationId: string; botId: string; expiresAt: number }>();
+    const now = Date.now();
+    for (const h of db.listAllHeldDecisions()) {
+      const key = holdKey(h.conversation_id, h.bot_id);
+      const exp = h.hold_expires_at ?? now;
+      const prev = grouped.get(key);
+      if (!prev || exp > prev.expiresAt) {
+        grouped.set(key, { conversationId: h.conversation_id, botId: h.bot_id, expiresAt: exp });
+      }
+    }
+    for (const item of grouped.values()) {
+      scheduleHoldTimer(item.conversationId, item.botId, Math.max(0, item.expiresAt - now));
+    }
+  }
+
   if (!opts.quiet) {
     if (bootstrapToken) {
       console.log(`kawan ready — connect to ${url} — bootstrap token ${bootstrapToken}`);
@@ -759,6 +866,10 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
     sessionManager,
     httpServer,
     async close(): Promise<void> {
+      for (const timer of holdTimers.values()) {
+        clearTimeout(timer);
+      }
+      holdTimers.clear();
       await sessionManager.stopAll();
       await new Promise<void>((resolve) => {
         for (const client of wss.clients) {

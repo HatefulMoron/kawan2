@@ -1,6 +1,8 @@
 //! Conversations Folio shell: 256px left rail, 780px stream (decision chips, redirect,
 //! artifact/land cards, composer), 36px bottom session strip, and 380px thread/session drawer.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use gpui::prelude::*;
 use gpui::{AnyElement, Context, Div, FontWeight, div, img, px, relative};
 
@@ -770,20 +772,44 @@ fn decision_chip_row(
     } else {
         dec.destination.clone()
     };
-    let status_text = if dec.readiness == "hold" && dec.dispatched == 0 {
-        format!("held · {dest_label}")
+    let is_held_pending = dec.readiness == "hold" && dec.dispatched == 0;
+    let countdown = if is_held_pending {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        dec.hold_expires_at.map(|exp| {
+            let rem_ms = exp.saturating_sub(now_ms);
+            let total_ms = exp.saturating_sub(dec.created_at).max(1);
+            let frac = (rem_ms as f32 / total_ms as f32).clamp(0.0, 1.0);
+            (rem_ms, frac)
+        })
+    } else {
+        None
+    };
+
+    let status_text = if is_held_pending {
+        match countdown {
+            Some((0, _)) => format!("held · {dest_label} · sending…"),
+            Some((rem_ms, _)) => {
+                format!("held · {dest_label} · auto in {}s", rem_ms.div_ceil(1000))
+            }
+            None => format!("held · {dest_label}"),
+        }
     } else {
         format!("routed → {dest_label}")
     };
     let chip_color = if dec.destination == "none" {
         theme::with_alpha(theme.palette.dark, 0.50)
-    } else if dec.readiness == "hold" && dec.dispatched == 0 {
+    } else if is_held_pending {
         theme::hex(theme::UMBER_VIVID)
     } else {
         theme::hex(theme::CATEGORY_INDUSTRY)
     };
 
     let dec_id = dec.id.clone();
+    let dec_id_now = dec.id.clone();
+    let dec_dest_now = dec.destination.clone();
     let menu_open = app.redirect_menu_decision_id.as_deref() == Some(dec_id.as_str());
 
     let mut wrapper = div().flex().flex_col().gap(px(5.0)).child(
@@ -795,6 +821,8 @@ fn decision_chip_row(
             .pt(px(2.0))
             .child(
                 div()
+                    .relative()
+                    .overflow_hidden()
                     .h(px(20.0))
                     .px(px(7.0))
                     .rounded(px(2.0))
@@ -808,8 +836,36 @@ fn decision_chip_row(
                     .child(theme::numeric(status_text, 10.0, theme.fg_secondary))
                     .children(dec.redirected_from.as_ref().map(|from| {
                         theme::numeric(format!("(was {from})"), 9.5, theme.fg_tertiary)
+                    }))
+                    .children(countdown.filter(|(_, frac)| *frac > 0.0).map(|(_, frac)| {
+                        div()
+                            .absolute()
+                            .left_0()
+                            .bottom_0()
+                            .h(px(2.0))
+                            .w(relative(frac))
+                            .bg(theme::hex(theme::UMBER_VIVID))
                     })),
             )
+            .children((is_held_pending && dec.destination != "none").then(|| {
+                div()
+                    .id(("msg-send-now", idx))
+                    .cursor_pointer()
+                    .px(px(6.0))
+                    .h(px(20.0))
+                    .rounded(px(2.0))
+                    .border_1()
+                    .border_color(theme::with_alpha(theme.palette.dark, 0.22))
+                    .bg(theme.surface)
+                    .flex()
+                    .items_center()
+                    .hover(|s| s.bg(theme.hover))
+                    .child(theme::micro("Send now", 8.5, theme.dark))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.redirect_decision(&dec_id_now, &dec_dest_now);
+                        cx.notify();
+                    }))
+            }))
             .child(
                 div()
                     .id(("msg-redirect-toggle", idx))

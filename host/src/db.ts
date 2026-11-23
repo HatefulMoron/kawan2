@@ -108,6 +108,7 @@ const SCHEMA_MIGRATIONS: Array<{ version: number; sql: string }> = [
         dispatched INTEGER NOT NULL DEFAULT 0,
         redirected_from TEXT,
         redirected_by TEXT,
+        hold_expires_at INTEGER,
         created_at INTEGER NOT NULL
       );
 
@@ -229,6 +230,12 @@ export class KawanDb {
           .prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
           .run(m.version, Date.now());
       });
+    }
+    const decCols = this.sqlite
+      .prepare("PRAGMA table_info(decisions)")
+      .all() as Array<{ name: string }>;
+    if (!decCols.some((c) => c.name === "hold_expires_at")) {
+      this.sqlite.exec("ALTER TABLE decisions ADD COLUMN hold_expires_at INTEGER");
     }
   }
 
@@ -601,6 +608,7 @@ export class KawanDb {
     rawJson: string;
     heldBatchId?: string | null;
     dispatched?: boolean;
+    holdExpiresAt?: number | null;
   }): DecisionRow {
     const id = input.id ?? randomUUID();
     const now = Date.now();
@@ -608,8 +616,8 @@ export class KawanDb {
       .prepare(
         `INSERT INTO decisions (
           id, conversation_id, message_id, bot_id, decision_type, destination,
-          readiness, confidence, reason, raw_json, held_batch_id, dispatched, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          readiness, confidence, reason, raw_json, held_batch_id, dispatched, hold_expires_at, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -624,6 +632,7 @@ export class KawanDb {
         input.rawJson,
         input.heldBatchId ?? null,
         input.dispatched ? 1 : 0,
+        input.holdExpiresAt ?? null,
         now,
       );
     return this.getDecision(id)!;
@@ -662,12 +671,47 @@ export class KawanDb {
     }));
   }
 
-  markDecisionsDispatched(decisionIds: string[]): void {
-    if (decisionIds.length === 0) return;
+  listAllHeldDecisions(): Array<DecisionRow & { message: MessageRow }> {
+    const rows = this.sqlite
+      .prepare(
+        `SELECT d.* FROM decisions d
+         JOIN messages m ON m.id = d.message_id
+         WHERE d.readiness = 'hold' AND d.dispatched = 0
+         ORDER BY d.created_at ASC`,
+      )
+      .all() as unknown as DecisionRow[];
+    return rows.map((d) => ({
+      ...d,
+      message: this.getMessage(d.message_id)!,
+    }));
+  }
+
+  updateHeldExpiry(decisionIds: string[], holdExpiresAt: number | null): DecisionRow[] {
+    if (decisionIds.length === 0) return [];
     const placeholders = decisionIds.map(() => "?").join(",");
     this.sqlite
-      .prepare(`UPDATE decisions SET dispatched = 1 WHERE id IN (${placeholders})`)
-      .run(...decisionIds);
+      .prepare(`UPDATE decisions SET hold_expires_at = ? WHERE id IN (${placeholders})`)
+      .run(holdExpiresAt, ...decisionIds);
+    return this.sqlite
+      .prepare(`SELECT * FROM decisions WHERE id IN (${placeholders})`)
+      .all(...decisionIds) as unknown as DecisionRow[];
+  }
+
+  markDecisionsDispatched(decisionIds: string[], heldBatchId: string | null = null): DecisionRow[] {
+    if (decisionIds.length === 0) return [];
+    const placeholders = decisionIds.map(() => "?").join(",");
+    this.sqlite
+      .prepare(
+        `UPDATE decisions
+         SET dispatched = 1,
+             hold_expires_at = NULL,
+             held_batch_id = COALESCE(held_batch_id, ?)
+         WHERE id IN (${placeholders})`,
+      )
+      .run(heldBatchId, ...decisionIds);
+    return this.sqlite
+      .prepare(`SELECT * FROM decisions WHERE id IN (${placeholders})`)
+      .all(...decisionIds) as unknown as DecisionRow[];
   }
 
   redirectDecision(
@@ -680,14 +724,18 @@ export class KawanDb {
     this.sqlite
       .prepare(
         `UPDATE decisions
-         SET redirected_from = COALESCE(redirected_from, destination),
+         SET redirected_from = CASE
+               WHEN ? != destination THEN COALESCE(redirected_from, destination)
+               ELSE redirected_from
+             END,
              redirected_by = ?,
              destination = ?,
              readiness = 'dispatch',
-             dispatched = 1
+             dispatched = 1,
+             hold_expires_at = NULL
          WHERE id = ?`,
       )
-      .run(redirectedBy, destination, id);
+      .run(destination, redirectedBy, destination, id);
     return this.getDecision(id);
   }
 

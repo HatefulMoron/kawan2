@@ -82,6 +82,8 @@ pub struct Decision {
     pub dispatched: u64,
     pub redirected_from: Option<String>,
     pub redirected_by: Option<String>,
+    #[serde(default)]
+    pub hold_expires_at: Option<u64>,
     pub created_at: u64,
 }
 

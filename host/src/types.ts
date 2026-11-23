@@ -89,6 +89,7 @@ export interface DecisionRow {
   dispatched: number;
   redirected_from: string | null;
   redirected_by: string | null;
+  hold_expires_at: number | null;
   created_at: number;
 }
 

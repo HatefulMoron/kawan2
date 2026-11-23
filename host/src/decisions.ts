@@ -261,15 +261,16 @@ export function buildRouteMessagePayload(input: {
     readiness: {
       type: "choice",
       instructions:
-        "Decide whether to dispatch now or hold incoming_message to wait for the next message. " +
-        "Hold ONLY when the user sent an incomplete opening fragment/ping addressed to the bot (such as '@bot hey', '@bot quick question', 'hey @bot', 'one sec', or 'can you check something?') without stating the actual request yet. " +
+        "Decide whether to dispatch now or hold incoming_message briefly to wait for an immediate follow-up message. " +
+        "Hold ONLY when incoming_message is an incomplete opening fragment or lead-in addressed to the bot that clearly implies another message is immediately following (such as '@bot hey', '@bot quick question', 'one sec', or 'can you check something?'). " +
+        "Self-contained conversational questions or check-ins (such as '@bot what's up?', '@bot how are you?', '@bot are you there?') should dispatch immediately. " +
         "If held_messages_waiting_for_completion already has a fragment and incoming_message supplies the request, choose dispatch. " +
         "If destination is none, choose dispatch.",
       criteria: {
         dispatch:
-          "Actionable request/question/feedback is present (alone or combined with held_messages_waiting_for_completion), or destination is none.",
+          "A self-contained message, conversational check-in, question, request, or feedback is present (alone or combined with held_messages_waiting_for_completion), or destination is none.",
         hold:
-          "Incomplete greeting, ping, or dangling lead-in addressed to the bot that lacks the actual request/question and should wait for the user's next message.",
+          "An incomplete bare ping or dangling lead-in addressed to the bot (like '@bot hey' or '@bot quick question') where the user clearly hasn't sent their actual message yet.",
       },
     },
   };
