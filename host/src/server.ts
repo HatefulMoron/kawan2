@@ -7,6 +7,8 @@ import { ensureBootstrapToken } from "./auth.js";
 import { KawanDb } from "./db.js";
 import {
   DecisionFixtureStore,
+  fetchWithRetry,
+  formatFetchError,
   routeMessage,
   testDecisionModel,
   type DecisionMode,
@@ -164,20 +166,23 @@ async function testLlmCompletion(
   try {
     if (api === "anthropic-messages") {
       const url = baseUrl.endsWith("/messages") ? baseUrl : `${baseUrl}/messages`;
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "x-api-key": provider.apiKey ?? "",
-          "anthropic-version": "2023-06-01",
-          "Content-Type": "application/json",
+      const res = await fetchWithRetry(
+        url,
+        {
+          method: "POST",
+          headers: {
+            "x-api-key": provider.apiKey ?? "",
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: modelDef.id,
+            max_tokens: 16,
+            messages: [{ role: "user", content: "Reply with ok." }],
+          }),
         },
-        body: JSON.stringify({
-          model: modelDef.id,
-          max_tokens: 16,
-          messages: [{ role: "user", content: "Reply with ok." }],
-        }),
-        signal: AbortSignal.timeout(20_000),
-      });
+        { timeoutMs: 20_000, maxAttempts: 3, baseDelayMs: 400 },
+      );
       if (!res.ok) {
         return { ok: false, latency_ms: Date.now() - start, error: `${res.status}: ${await res.text()}` };
       }
@@ -195,15 +200,18 @@ async function testLlmCompletion(
     if (modelDef.compat?.thinkingFormat === "deepseek") {
       body.thinking = { type: "disabled" };
     }
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${provider.apiKey ?? ""}`,
-        "Content-Type": "application/json",
+    const res = await fetchWithRetry(
+      url,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${provider.apiKey ?? ""}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
       },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(20_000),
-    });
+      { timeoutMs: 20_000, maxAttempts: 3, baseDelayMs: 400 },
+    );
     if (!res.ok) {
       return { ok: false, latency_ms: Date.now() - start, error: `${res.status}: ${await res.text()}` };
     }
@@ -214,7 +222,7 @@ async function testLlmCompletion(
     return {
       ok: false,
       latency_ms: Date.now() - start,
-      error: err instanceof Error ? err.message : String(err),
+      error: formatFetchError(err),
     };
   }
 }

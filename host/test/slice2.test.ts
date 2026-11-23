@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
-import type { DecisionMode } from "../src/decisions.js";
+import { callSystemOne, type DecisionMode } from "../src/decisions.js";
 import { startHost, type DispatchEvent } from "../src/server.js";
 import { createFixtureBareRepo, TestKeyPair, WsTestClient } from "./helpers.js";
 import { startStubProvider } from "./stub-provider.js";
@@ -358,5 +359,64 @@ test("Slice 2: held fragment auto-dispatches after hold timeout and broadcasts u
     repo.cleanup();
     adminKey.cleanup();
     rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("Slice 2: callSystemOne retries transient fetch socket failures and reports unwrapped cause on exhaustion", async () => {
+  let attempts = 0;
+  let alwaysDrop = false;
+  const server = createServer((req, res) => {
+    attempts += 1;
+    if (alwaysDrop || attempts === 1) {
+      req.socket.destroy();
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        model: "stub-snap",
+        answers: {
+          destination: {
+            type: "choice",
+            choice: "orchestrator",
+            confidence: 0.98,
+            probabilities: { orchestrator: 0.98, none: 0.02 },
+          },
+          readiness: {
+            type: "choice",
+            choice: "dispatch",
+            confidence: 0.97,
+            probabilities: { dispatch: 0.97, hold: 0.03 },
+          },
+        },
+      }),
+    );
+  });
+
+  await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  const addr = server.address();
+  assert.ok(addr && typeof addr === "object");
+  const config = {
+    provider: "subq" as const,
+    baseUrl: `http://127.0.0.1:${addr.port}/v1`,
+    model: "stub-snap",
+    apiKey: "stub-key",
+  };
+  const body = { model: "stub-snap", state: {}, questions: {} };
+
+  try {
+    const recovered = await callSystemOne(config, body, { maxAttempts: 3, baseDelayMs: 20 });
+    assert.equal(attempts, 2);
+    assert.equal(recovered.answers.destination.choice, "orchestrator");
+
+    alwaysDrop = true;
+    attempts = 0;
+    await assert.rejects(
+      () => callSystemOne(config, body, { maxAttempts: 3, baseDelayMs: 20 }),
+      /Decision model call failed:.*fetch failed \(.+\)/,
+    );
+    assert.equal(attempts, 3);
+  } finally {
+    await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
   }
 });

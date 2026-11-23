@@ -136,50 +136,131 @@ export function resolveSystemOneUrl(baseUrl: string): string {
   return `${trimmed}/v1/systemone`;
 }
 
+const RETRYABLE_HTTP_STATUSES = new Set([429, 502, 503, 504, 529]);
+
+/** Format an Error/fetch failure including nested `cause` or `AggregateError` details. */
+export function formatFetchError(err: unknown): string {
+  const base = err instanceof Error ? err.message : String(err);
+  const cause = (err as { cause?: any } | null)?.cause;
+  if (!cause || typeof cause !== "object") {
+    return base;
+  }
+
+  const parts: string[] = [];
+  if (Array.isArray(cause.errors)) {
+    for (const inner of cause.errors) {
+      const code = typeof inner?.code === "string" ? inner.code : "";
+      const addr = typeof inner?.address === "string" ? inner.address : "";
+      const msg = typeof inner?.message === "string" ? inner.message : "";
+      const piece = code && addr ? `${code} ${addr}` : code || msg;
+      if (piece && piece !== base && !parts.includes(piece)) {
+        parts.push(piece);
+      }
+    }
+  }
+
+  if (parts.length === 0) {
+    const code = typeof cause.code === "string" ? cause.code : "";
+    const msg = typeof cause.message === "string" ? cause.message : "";
+    const piece =
+      code && msg && msg !== code ? `${code}: ${msg}` : code || msg;
+    if (piece && piece !== base) {
+      parts.push(piece);
+    }
+  }
+
+  return parts.length > 0 ? `${base} (${parts.join(", ")})` : base;
+}
+
+/** Run `fetch` with a per-attempt timeout and linear backoff retries on transport errors. */
+export async function fetchWithRetry(
+  url: string,
+  init: Omit<RequestInit, "signal">,
+  opts?: {
+    timeoutMs?: number;
+    maxAttempts?: number;
+    baseDelayMs?: number;
+    retryStatuses?: Set<number>;
+  },
+): Promise<Response> {
+  const timeoutMs = opts?.timeoutMs ?? 30_000;
+  const maxAttempts = opts?.maxAttempts ?? 4;
+  const baseDelayMs = opts?.baseDelayMs ?? 400;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const res = await fetch(url, {
+        ...init,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (opts?.retryStatuses?.has(res.status) && attempt < maxAttempts) {
+        await res.arrayBuffer().catch(() => {});
+        await new Promise((r) => setTimeout(r, baseDelayMs * attempt));
+        continue;
+      }
+      return res;
+    } catch (err) {
+      const code = (err as { code?: unknown; cause?: { code?: unknown } } | null)?.code
+        ?? (err as { cause?: { code?: unknown } } | null)?.cause?.code;
+      if (code === "ERR_INVALID_URL" || attempt >= maxAttempts) {
+        throw new Error(formatFetchError(err));
+      }
+      await new Promise((r) => setTimeout(r, baseDelayMs * attempt));
+    }
+  }
+
+  throw new Error("fetch failed after retries");
+}
+
 export async function callSystemOne(
   config: DecisionRoleSettings,
   body: { model: string; state: unknown; questions: Record<string, unknown> },
+  opts?: { timeoutMs?: number; maxAttempts?: number; baseDelayMs?: number },
 ): Promise<SystemOneResponse> {
   const url = resolveSystemOneUrl(config.baseUrl);
-  const maxAttempts = 4;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${config.apiKey ?? ""}`,
-        "Content-Type": "application/json",
+  let res: Response;
+  try {
+    res = await fetchWithRetry(
+      url,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${config.apiKey ?? ""}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
       },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(30_000),
-    });
-
-    if (res.ok) {
-      return (await res.json()) as SystemOneResponse;
-    }
-
-    const rawText = await res.text();
-    let msg = `${res.status} ${res.statusText}`;
-    try {
-      const parsed = JSON.parse(rawText) as { detail?: { error_type?: string; message?: string }; error?: { message?: string } };
-      if (parsed.detail) {
-        msg = `${res.status} ${parsed.detail.error_type ?? "error"}: ${parsed.detail.message ?? rawText}`;
-      } else if (parsed.error?.message) {
-        msg = `${res.status}: ${parsed.error.message}`;
-      }
-    } catch {
-      if (rawText) msg = `${res.status}: ${rawText}`;
-    }
-
-    const retryable = res.status === 429 || res.status === 503 || res.status === 529;
-    if (retryable && attempt < maxAttempts) {
-      await new Promise((r) => setTimeout(r, 400 * attempt));
-      continue;
-    }
-    throw new Error(`Decision model call failed: ${msg}`);
+      {
+        timeoutMs: opts?.timeoutMs ?? 30_000,
+        maxAttempts: opts?.maxAttempts ?? 4,
+        baseDelayMs: opts?.baseDelayMs ?? 400,
+        retryStatuses: RETRYABLE_HTTP_STATUSES,
+      },
+    );
+  } catch (err) {
+    throw new Error(`Decision model call failed: ${formatFetchError(err)}`);
   }
 
-  throw new Error("Decision model call failed after retries");
+  if (res.ok) {
+    return (await res.json()) as SystemOneResponse;
+  }
+
+  const rawText = await res.text();
+  let msg = `${res.status} ${res.statusText}`;
+  try {
+    const parsed = JSON.parse(rawText) as {
+      detail?: { error_type?: string; message?: string };
+      error?: { message?: string };
+    };
+    if (parsed.detail) {
+      msg = `${res.status} ${parsed.detail.error_type ?? "error"}: ${parsed.detail.message ?? rawText}`;
+    } else if (parsed.error?.message) {
+      msg = `${res.status}: ${parsed.error.message}`;
+    }
+  } catch {
+    if (rawText) msg = `${res.status}: ${rawText}`;
+  }
+  throw new Error(`Decision model call failed: ${msg}`);
 }
 
 export function buildRouteMessagePayload(input: {
