@@ -202,3 +202,158 @@ export async function verifyCommitSignature(
   }
 }
 
+export interface LandBranchParams {
+  barePath: string;
+  clonePath: string;
+  branchName: string;
+  defaultBranch: string;
+  verifyCommand: string;
+  botName: string;
+  botEmail: string;
+  signingKeyPath: string;
+  landingDir: string;
+}
+
+export interface LandBranchResult {
+  ok: boolean;
+  baseSha: string;
+  landedSha?: string;
+  verifyOutput: string;
+  error?: string;
+}
+
+async function runShellCommand(
+  command: string,
+  cwd: string,
+): Promise<{ ok: boolean; output: string; code: number | null }> {
+  const { spawn } = await import("node:child_process");
+  return await new Promise((resolve) => {
+    const child = spawn("sh", ["-c", command], {
+      cwd,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const chunks: Buffer[] = [];
+    child.stdout.on("data", (c: Buffer) => chunks.push(c));
+    child.stderr.on("data", (c: Buffer) => chunks.push(c));
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve({
+        ok: false,
+        code: null,
+        output: `${Buffer.concat(chunks).toString("utf8")}\nTimed out after 120s`,
+      });
+    }, 120_000);
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      resolve({
+        ok: code === 0,
+        code,
+        output: Buffer.concat(chunks).toString("utf8").trim(),
+      });
+    });
+  });
+}
+
+export async function landBranch(params: LandBranchParams): Promise<LandBranchResult> {
+  rmSync(params.landingDir, { recursive: true, force: true });
+  mkdirSync(join(params.landingDir, ".."), { recursive: true });
+
+  let baseSha = "";
+  try {
+    await runGit([
+      "clone",
+      "--local",
+      "--branch",
+      params.defaultBranch,
+      params.barePath,
+      params.landingDir,
+    ]);
+    baseSha = await getBranchHead(params.landingDir, "HEAD");
+
+    await runGit(["-C", params.landingDir, "config", "user.name", params.botName]);
+    await runGit(["-C", params.landingDir, "config", "user.email", params.botEmail]);
+    await runGit(["-C", params.landingDir, "config", "gpg.format", "ssh"]);
+    await runGit(["-C", params.landingDir, "config", "commit.gpgsign", "true"]);
+    await runGit(["-C", params.landingDir, "config", "user.signingkey", params.signingKeyPath]);
+
+    await runGit(["-C", params.landingDir, "fetch", params.clonePath, params.branchName]);
+
+    const { stdout: aheadOut } = await runGit([
+      "-C",
+      params.landingDir,
+      "rev-list",
+      "--count",
+      "HEAD..FETCH_HEAD",
+    ]);
+    const aheadCount = Number.parseInt(aheadOut.trim(), 10) || 0;
+    if (aheadCount === 0) {
+      return {
+        ok: false,
+        baseSha,
+        verifyOutput: "",
+        error: "Branch has no commits ahead of default branch",
+      };
+    }
+
+    let isAncestor = false;
+    try {
+      await runGit(["-C", params.landingDir, "merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD"]);
+      isAncestor = true;
+    } catch {
+      isAncestor = false;
+    }
+
+    await runGit(["-C", params.landingDir, "checkout", "-B", params.branchName, "FETCH_HEAD"]);
+    if (!isAncestor) {
+      try {
+        await runGit(["-C", params.landingDir, "rebase", params.defaultBranch]);
+      } catch (err) {
+        try {
+          await runGit(["-C", params.landingDir, "rebase", "--abort"]);
+        } catch {
+          // ignore abort failure
+        }
+        return {
+          ok: false,
+          baseSha,
+          verifyOutput: "",
+          error: `Rebase onto ${params.defaultBranch} failed: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+    }
+
+    const verify = await runShellCommand(params.verifyCommand, params.landingDir);
+    if (!verify.ok) {
+      return {
+        ok: false,
+        baseSha,
+        verifyOutput: verify.output,
+        error: `Verify command failed (exit ${verify.code}):\n${verify.output}`,
+      };
+    }
+
+    await runGit([
+      "-C",
+      params.landingDir,
+      "push",
+      params.barePath,
+      `HEAD:refs/heads/${params.defaultBranch}`,
+    ]);
+    const landedSha = await getBranchHead(params.landingDir, "HEAD");
+    return {
+      ok: true,
+      baseSha,
+      landedSha,
+      verifyOutput: verify.output,
+    };
+  } finally {
+    rmSync(params.landingDir, { recursive: true, force: true });
+  }
+}
+
+export function removeClone(clonePath: string | null | undefined): void {
+  if (!clonePath) return;
+  rmSync(clonePath, { recursive: true, force: true });
+}
+

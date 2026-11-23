@@ -563,6 +563,19 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
       return sessionManager.getArtifactPayload(artifactId);
     },
 
+    "land.approve": async (req, client) => {
+      const landId = typeof req.land_id === "string" ? req.land_id : undefined;
+      const sessionId = typeof req.session_id === "string" ? req.session_id : undefined;
+      if (!landId && !sessionId) {
+        throw new Error("land_id or session_id is required");
+      }
+      return await sessionManager.approveLand({
+        landId,
+        sessionId,
+        approvedBy: client.user.id,
+      });
+    },
+
     "decision.redirect": async (req, client) => {
       const decisionId = String(req.decision_id ?? "");
       const destination = String(req.destination ?? "").trim();

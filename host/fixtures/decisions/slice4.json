@@ -1,0 +1,56 @@
+{
+  "116a140002a2b3dba4ebefe8": {
+    "model": "subq-snap-1.2",
+    "answers": {
+      "destination": {
+        "type": "choice",
+        "choice": "orchestrator",
+        "probabilities": {
+          "none": 0.00029990015900693834,
+          "orchestrator": 0.9997001886367798
+        },
+        "confidence": 0.9994003772735596
+      },
+      "readiness": {
+        "type": "choice",
+        "choice": "dispatch",
+        "probabilities": {
+          "dispatch": 0.9813847541809082,
+          "hold": 0.018615223467350006
+        },
+        "confidence": 0.9627695083618164
+      }
+    },
+    "usage": {
+      "input_tokens": 551,
+      "output_tokens": 0
+    }
+  },
+  "ba25a5f749300c9ec947f653": {
+    "model": "subq-snap-1.2",
+    "answers": {
+      "destination": {
+        "type": "choice",
+        "choice": "orchestrator",
+        "probabilities": {
+          "none": 0.00016067536489572376,
+          "orchestrator": 0.9998393058776855
+        },
+        "confidence": 0.9996786117553711
+      },
+      "readiness": {
+        "type": "choice",
+        "choice": "dispatch",
+        "probabilities": {
+          "dispatch": 0.9802342057228088,
+          "hold": 0.019765861332416534
+        },
+        "confidence": 0.9604684114456177
+      }
+    },
+    "usage": {
+      "input_tokens": 551,
+      "output_tokens": 0
+    }
+  }
+}

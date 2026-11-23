@@ -5,11 +5,21 @@ import { createServer, type Server as NetServer, type Socket } from "node:net";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { KawanDb } from "./db.js";
-import { createSessionClone, ensureAllowedSigners } from "./git.js";
+import {
+  commitsAhead,
+  createSessionClone,
+  ensureAllowedSigners,
+  getBranchHead,
+  isWorkingTreeClean,
+  landBranch,
+  removeClone,
+  runGit,
+} from "./git.js";
 import { composeSpawnSpec, materializeSessionAgentDir } from "./spawn.js";
 import type {
   ArtifactRow,
   ConversationRow,
+  LandRow,
   MessageRow,
   SessionRow,
   UserRow,
@@ -531,7 +541,7 @@ export class SessionManager {
       `You are ${bot.name}, an AI engineering orchestrator inside Kawan.`,
       bot.persona ? `Persona: ${bot.persona}` : "Persona: Helpful, concise software engineer.",
       "You coordinate work across channels and DMs using your host tools:",
-      "- spawn_session(task): delegate repository inspection, coding, tests, and git commits to an isolated worker session.",
+      "- spawn_session(task): delegate repository inspection, coding, tests, and git commits to an isolated worker session. Each worker already has its own clone, dedicated branch, bash/file tools, report(), and land_request(summary). Do NOT tell workers to create a new branch or push to origin; when asked to prepare a change for landing or call land_request, instruct the worker to commit on its current branch and call land_request() itself.",
       "- session_status(): inspect your child worker sessions.",
       "- report(text, artifact?): post an explicit update or attach evidence into the active conversation.",
       "- soul_replace(anchor, text) and soul_write(document): maintain durable project knowledge in your soul.",
@@ -543,11 +553,11 @@ export class SessionManager {
 
   private buildWorkerSystemPrompt(bot: UserRow, session: SessionRow): string {
     return [
-      `You are a worker agent for ${bot.name} inside an isolated git clone on branch ${session.branch}.`,
+      `You are a worker agent for ${bot.name} inside an isolated git clone, already checked out on your dedicated session branch ${session.branch}.`,
       `Assigned task: ${session.task}`,
       "Instructions:",
       "1. Inspect the repository, make the requested changes or collect the requested information, and verify your work.",
-      "2. If you changed or created any files, you MUST run `git add` and `git commit` with a clear commit message, leaving `git status` clean.",
+      `2. Commit directly on your current branch (${session.branch}): run \`git add\` and \`git commit -m "..."\`. Do NOT create or switch to another branch and do NOT run \`git push\`. Leave \`git status\` clean.`,
       "3. Call `report(text, artifact?)` to share concrete results and attach any evidence artifact (summary text, logs, or screenshots).",
       "4. If the task produced committed changes meant to be merged to the default branch, call `land_request(summary)` after committing so a human can approve landing.",
     ].join("\n");
@@ -1058,11 +1068,51 @@ export class SessionManager {
     };
   }
 
-  async handleLandRequest(session: SessionRow, _summary: string): Promise<{
+  async handleLandRequest(session: SessionRow, summary: string): Promise<{
     land_id: string;
     status: string;
     branch: string | null;
   }> {
+    if (!session.clone_path || !existsSync(session.clone_path)) {
+      throw new Error("Worker clone directory is missing");
+    }
+    const settings = this.db.getHostSettings();
+    if (!settings.repo) {
+      throw new Error("Repository is not configured");
+    }
+    const { stdout: currentBranchOut } = await runGit([
+      "-C",
+      session.clone_path,
+      "rev-parse",
+      "--abbrev-ref",
+      "HEAD",
+    ]);
+    const currentBranch = currentBranchOut.trim();
+    if (session.branch && currentBranch !== session.branch) {
+      throw new Error(
+        `Currently on branch '${currentBranch}'; commits must be on your assigned session branch '${session.branch}'.`,
+      );
+    }
+    const clean = await isWorkingTreeClean(session.clone_path);
+    if (!clean) {
+      throw new Error(
+        "Working tree has uncommitted changes; run git add && git commit before calling land_request",
+      );
+    }
+    const ahead = await commitsAhead(session.clone_path, settings.repo.default_branch);
+    if (ahead < 1) {
+      throw new Error(
+        `Branch ${session.branch} has 0 commits ahead of ${settings.repo.default_branch}; commit changes before calling land_request`,
+      );
+    }
+
+    const existing = this.db
+      .listLands({ sessionId: session.id })
+      .find((l) => l.status === "requested" || l.status === "verifying");
+    if (existing) {
+      return { land_id: existing.id, status: existing.status, branch: session.branch };
+    }
+
     const land = this.db.createLand({
       sessionId: session.id,
       conversationId: session.conversation_id!,
@@ -1071,7 +1121,145 @@ export class SessionManager {
     const updated = this.db.updateSession(session.id, { status: "review_requested" })!;
     this.wsServer.broadcast({ type: "session.update", session: serializeSession(updated) });
     this.wsServer.broadcast({ type: "land.update", land });
+
+    const conv = session.conversation_id ? this.db.getConversation(session.conversation_id) : null;
+    const bot = this.db.getUser(session.bot_id);
+    if (conv && bot) {
+      const ctx = this.activeContexts.get(session.id);
+      if (ctx) ctx.reportedInTurn = true;
+      const body = summary.trim()
+        ? `Ready to land \`${session.branch}\`: ${summary.trim()}`
+        : `Ready to land \`${session.branch}\`. Awaiting human approval.`;
+      const msg = this.db.appendMessage({
+        conversationId: conv.id,
+        authorId: bot.id,
+        threadId: session.thread_id,
+        body,
+      });
+      this.wsServer.broadcastToConversation(conv, {
+        type: "message.new",
+        message: msg,
+        author: { id: bot.id, kind: "bot", name: bot.name },
+      });
+    }
     return { land_id: land.id, status: land.status, branch: updated.branch };
+  }
+
+  async approveLand(params: {
+    landId?: string;
+    sessionId?: string;
+    approvedBy: string;
+  }): Promise<{ land: LandRow; session: Omit<SessionRow, "token"> }> {
+    let land: LandRow | null = null;
+    if (params.landId) {
+      land = this.db.getLand(params.landId);
+    } else if (params.sessionId) {
+      const list = this.db.listLands({ sessionId: params.sessionId });
+      land = [...list].reverse().find((l) => l.status === "requested" || l.status === "failed") ?? null;
+    }
+    if (!land) throw new Error("Land request not found");
+    if (land.status === "landed" || land.status === "verifying") {
+      throw new Error(`Land ${land.id} is already ${land.status}`);
+    }
+
+    const session = this.db.getSession(land.session_id);
+    if (!session || !session.clone_path || !session.branch) {
+      throw new Error("Worker session or clone missing for land");
+    }
+    if (!existsSync(session.clone_path)) {
+      throw new Error(`Worker clone no longer exists: ${session.clone_path}`);
+    }
+    const bot = this.db.getUser(session.bot_id);
+    if (!bot || !bot.signing_key_path) {
+      throw new Error("Bot or bot signing key not found");
+    }
+    const settings = this.db.getHostSettings();
+    if (!settings.repo?.bare_path) {
+      throw new Error("Repository is not configured");
+    }
+    if (!settings.verify_command || !settings.verify_command.trim()) {
+      throw new Error("verify_command is not configured in host settings");
+    }
+
+    // Stop live worker process cleanly before landing/cleaning clone
+    const liveProc = this.processes.get(session.id);
+    if (liveProc) {
+      this.processes.delete(session.id);
+      await liveProc.stop();
+    }
+
+    let verifying = this.db.updateLand(land.id, {
+      status: "verifying",
+      approved_by: params.approvedBy,
+      error: null,
+    })!;
+    this.wsServer.broadcast({ type: "land.update", land: verifying });
+
+    const conv = this.db.getConversation(land.conversation_id);
+    const landingDir = join(this.dataDir, "workspaces", `landing-${land.id}`);
+    const result = await landBranch({
+      barePath: settings.repo.bare_path,
+      clonePath: session.clone_path,
+      branchName: session.branch,
+      defaultBranch: settings.repo.default_branch,
+      verifyCommand: settings.verify_command,
+      botName: bot.name,
+      botEmail: bot.email ?? `${bot.name.toLowerCase()}@kawan.local`,
+      signingKeyPath: bot.signing_key_path,
+      landingDir,
+    });
+
+    if (result.ok) {
+      removeClone(session.clone_path);
+      const landed = this.db.updateLand(land.id, {
+        status: "landed",
+        base_sha: result.baseSha,
+        landed_sha: result.landedSha ?? null,
+        verify_output: result.verifyOutput,
+        error: null,
+      })!;
+      const updatedSession = this.db.updateSession(session.id, { status: "landed" })!;
+      this.wsServer.broadcast({ type: "land.update", land: landed });
+      this.wsServer.broadcast({ type: "session.update", session: serializeSession(updatedSession) });
+      if (conv) {
+        const msg = this.db.appendMessage({
+          conversationId: conv.id,
+          authorId: bot.id,
+          threadId: land.thread_id,
+          body: `Landed \`${session.branch}\` on \`${settings.repo.default_branch}\` at ${result.landedSha?.slice(0, 12)} (parent ${result.baseSha.slice(0, 12)}).`,
+        });
+        this.wsServer.broadcastToConversation(conv, {
+          type: "message.new",
+          message: msg,
+          author: { id: bot.id, kind: "bot", name: bot.name },
+        });
+      }
+      return { land: landed, session: serializeSession(updatedSession) };
+    }
+
+    const failedLand = this.db.updateLand(land.id, {
+      status: "failed",
+      base_sha: result.baseSha,
+      verify_output: result.verifyOutput,
+      error: result.error ?? "Land failed",
+    })!;
+    const failedSession = this.db.updateSession(session.id, { status: "failed" })!;
+    this.wsServer.broadcast({ type: "land.update", land: failedLand });
+    this.wsServer.broadcast({ type: "session.update", session: serializeSession(failedSession) });
+    if (conv) {
+      const msg = this.db.appendMessage({
+        conversationId: conv.id,
+        authorId: bot.id,
+        threadId: land.thread_id,
+        body: `Land blocked for \`${session.branch}\`:\n${result.error ?? result.verifyOutput}`,
+      });
+      this.wsServer.broadcastToConversation(conv, {
+        type: "message.new",
+        message: msg,
+        author: { id: bot.id, kind: "bot", name: bot.name },
+      });
+    }
+    return { land: failedLand, session: serializeSession(failedSession) };
   }
 
   getArtifactPayload(artifactId: string): { artifact: ArtifactRow; base64: string; mime_type: string } {
