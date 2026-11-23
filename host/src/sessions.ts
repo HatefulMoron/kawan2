@@ -1,0 +1,1140 @@
+import { spawn, type ChildProcess } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, type Server as NetServer, type Socket } from "node:net";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { KawanDb } from "./db.js";
+import { createSessionClone, ensureAllowedSigners } from "./git.js";
+import { composeSpawnSpec, materializeSessionAgentDir } from "./spawn.js";
+import type {
+  ArtifactRow,
+  ConversationRow,
+  MessageRow,
+  SessionRow,
+  UserRow,
+} from "./types.js";
+import type { KawanWsServer } from "./ws.js";
+
+const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
+const EXTENSION_ENTRY_PATH = resolve(
+  fileURLToPath(new URL("./extension/index.ts", import.meta.url)),
+);
+
+export interface PiTurnResult {
+  assistantText: string;
+  errorMessage: string | null;
+  aborted: boolean;
+}
+
+export class PiRpcProcess {
+  readonly cwd: string;
+  readonly env: Record<string, string>;
+  private readonly command: string;
+  private readonly args: string[];
+  private child: ChildProcess | null = null;
+  private stdoutBuffer = Buffer.alloc(0);
+  private stderrChunks: string[] = [];
+  private reqCounter = 0;
+  private pending = new Map<
+    string,
+    { resolve: (data: any) => void; reject: (err: Error) => void }
+  >();
+  private eventListeners = new Set<(ev: any) => void>();
+  private exitError: Error | null = null;
+  private closed = false;
+
+  constructor(spec: { command: string; args: string[]; cwd: string; env: Record<string, string> }) {
+    this.command = spec.command;
+    this.args = spec.args;
+    this.cwd = spec.cwd;
+    this.env = spec.env;
+  }
+
+  async start(): Promise<void> {
+    if (this.child) return;
+    const child = spawn(this.command, this.args, {
+      cwd: this.cwd,
+      env: this.env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    this.child = child;
+
+    child.stderr?.on("data", (chunk: Buffer) => {
+      this.stderrChunks.push(chunk.toString("utf8"));
+      if (this.stderrChunks.length > 100) {
+        this.stderrChunks.shift();
+      }
+    });
+
+    child.stdout?.on("data", (chunk: Buffer) => {
+      this.stdoutBuffer = Buffer.concat([this.stdoutBuffer, chunk]);
+      while (true) {
+        const nl = this.stdoutBuffer.indexOf(0x0a);
+        if (nl === -1) break;
+        const line = this.stdoutBuffer
+          .subarray(0, nl)
+          .toString("utf8")
+          .replace(/\r$/, "");
+        this.stdoutBuffer = this.stdoutBuffer.subarray(nl + 1);
+        if (line.trim().length > 0) {
+          this.handleLine(line);
+        }
+      }
+    });
+
+    child.once("exit", (code, signal) => {
+      const err = new Error(
+        `pi exited (code=${code}, signal=${signal}): ${this.getStderr().slice(-600)}`,
+      );
+      this.exitError = err;
+      this.child = null;
+      for (const [, p] of this.pending) {
+        p.reject(err);
+      }
+      this.pending.clear();
+      this.emit({ type: "_process_exit", error: err.message });
+    });
+
+    child.once("error", (err) => {
+      this.exitError = err;
+      for (const [, p] of this.pending) {
+        p.reject(err);
+      }
+      this.pending.clear();
+      this.emit({ type: "_process_exit", error: err.message });
+    });
+
+    // Quick startup check
+    await new Promise((r) => setTimeout(r, 80));
+    if (this.exitError) {
+      throw this.exitError;
+    }
+  }
+
+  get isAlive(): boolean {
+    return Boolean(this.child && this.child.exitCode === null && !this.closed);
+  }
+
+  getStderr(): string {
+    return this.stderrChunks.join("");
+  }
+
+  onEvent(listener: (ev: any) => void): () => void {
+    this.eventListeners.add(listener);
+    return () => {
+      this.eventListeners.delete(listener);
+    };
+  }
+
+  private emit(ev: any): void {
+    for (const listener of this.eventListeners) {
+      try {
+        listener(ev);
+      } catch {
+        // ignore listener error
+      }
+    }
+  }
+
+  private handleLine(line: string): void {
+    let parsed: any;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (parsed.type === "response" && typeof parsed.id === "string") {
+      const entry = this.pending.get(parsed.id);
+      if (entry) {
+        this.pending.delete(parsed.id);
+        if (parsed.success) {
+          entry.resolve(parsed.data);
+        } else {
+          entry.reject(new Error(parsed.error || `${parsed.command} failed`));
+        }
+      }
+      return;
+    }
+    this.emit(parsed);
+  }
+
+  sendCommand(type: string, payload: Record<string, unknown> = {}): Promise<any> {
+    if (!this.child || !this.child.stdin || this.exitError) {
+      return Promise.reject(this.exitError ?? new Error("pi process is not running"));
+    }
+    const id = `rpc-${++this.reqCounter}`;
+    const line = `${JSON.stringify({ id, type, ...payload })}\n`;
+    return new Promise((resolvePromise, rejectPromise) => {
+      this.pending.set(id, { resolve: resolvePromise, reject: rejectPromise });
+      this.child!.stdin!.write(line, "utf8", (err) => {
+        if (err) {
+          this.pending.delete(id);
+          rejectPromise(err);
+        }
+      });
+    });
+  }
+
+  async getState(): Promise<{
+    sessionFile?: string;
+    sessionId: string;
+    isStreaming: boolean;
+  }> {
+    return await this.sendCommand("get_state");
+  }
+
+  async getEntries(since?: string): Promise<{ entries: any[]; leafId: string | null }> {
+    return await this.sendCommand("get_entries", since ? { since } : {});
+  }
+
+  async steer(message: string): Promise<void> {
+    await this.sendCommand("steer", { message });
+  }
+
+  async runPrompt(message: string, timeoutMs = 180_000): Promise<PiTurnResult> {
+    let lastAssistantText = "";
+    let errorMessage: string | null = null;
+    let settled = false;
+
+    const settledPromise = new Promise<{ aborted: boolean }>((resolvePromise, rejectPromise) => {
+      const timer = setTimeout(() => {
+        unsub();
+        rejectPromise(new Error(`pi turn timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      const unsub = this.onEvent((ev) => {
+        if (ev.type === "message_end" && ev.message?.role === "assistant") {
+          const msg = ev.message;
+          if (msg.stopReason === "error" || msg.errorMessage) {
+            errorMessage = msg.errorMessage || "LLM provider error";
+          }
+          if (Array.isArray(msg.content)) {
+            const texts = msg.content
+              .filter((c: any) => c.type === "text" && typeof c.text === "string")
+              .map((c: any) => c.text);
+            if (texts.length > 0) {
+              lastAssistantText = texts.join("\n").trim();
+            }
+          }
+        } else if (ev.type === "auto_retry_end" && ev.success === false) {
+          errorMessage = ev.finalError || errorMessage || "Auto-retry failed";
+        } else if (ev.type === "extension_error") {
+          errorMessage = `Extension error (${ev.event}): ${ev.error}`;
+        } else if (ev.type === "agent_settled") {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          unsub();
+          resolvePromise({ aborted: Boolean(ev.aborted) });
+        } else if (ev.type === "_process_exit") {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          unsub();
+          rejectPromise(new Error(ev.error || "pi exited during turn"));
+        }
+      });
+
+      this.sendCommand("prompt", { message, streamingBehavior: "followUp" })
+        .then((data) => {
+          if (data?.disposition === "handled" && !settled) {
+            settled = true;
+            clearTimeout(timer);
+            unsub();
+            resolvePromise({ aborted: false });
+          }
+        })
+        .catch((err) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          unsub();
+          rejectPromise(err instanceof Error ? err : new Error(String(err)));
+        });
+    });
+
+    const { aborted } = await settledPromise;
+    return { assistantText: lastAssistantText, errorMessage, aborted };
+  }
+
+  async stop(): Promise<void> {
+    this.closed = true;
+    const child = this.child;
+    if (!child) return;
+
+    await new Promise<void>((resolvePromise) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(termTimer);
+        clearTimeout(killTimer);
+        resolvePromise();
+      };
+      child.once("exit", finish);
+      try {
+        child.stdin?.end();
+      } catch {
+        // ignore
+      }
+      const termTimer = setTimeout(() => {
+        if (child.exitCode === null) child.kill("SIGTERM");
+      }, 800);
+      const killTimer = setTimeout(() => {
+        if (child.exitCode === null) child.kill("SIGKILL");
+        finish();
+      }, 2000);
+    });
+    this.child = null;
+  }
+}
+
+export interface SoulHandlers {
+  getContext(session: SessionRow): { contextFiles: Array<{ path: string; content: string }> };
+  soulReplace(
+    session: SessionRow,
+    params: { anchor: string; text: string },
+  ): unknown;
+  soulWrite(session: SessionRow, params: { document: string }): unknown;
+}
+
+export function serializeSession(session: SessionRow): Omit<SessionRow, "token"> {
+  const { token: _token, ...pub } = session;
+  return pub;
+}
+
+export class SessionManager {
+  readonly dataDir: string;
+  readonly socketPath: string;
+  private readonly db: KawanDb;
+  private readonly wsServer: KawanWsServer;
+  private readonly disableSandbox: boolean;
+  private readonly soulHandlers?: SoulHandlers;
+  private socketServer: NetServer | null = null;
+  private processes = new Map<string, PiRpcProcess>();
+  private orchQueues = new Map<string, Promise<void>>();
+  private activeContexts = new Map<
+    string,
+    { conversationId: string; threadId: string | null; reportedInTurn: boolean }
+  >();
+  private workerRuns = new Map<string, Promise<void>>();
+
+  constructor(opts: {
+    dataDir: string;
+    db: KawanDb;
+    wsServer: KawanWsServer;
+    disableSandbox?: boolean;
+    soulHandlers?: SoulHandlers;
+  }) {
+    this.dataDir = opts.dataDir;
+    this.db = opts.db;
+    this.wsServer = opts.wsServer;
+    this.disableSandbox = Boolean(opts.disableSandbox);
+    this.soulHandlers = opts.soulHandlers;
+    this.socketPath = join(opts.dataDir, "host.sock");
+  }
+
+  async start(): Promise<void> {
+    rmSync(this.socketPath, { force: true });
+    this.socketServer = createServer((conn) => this.handleUnixConnection(conn));
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      this.socketServer!.once("error", rejectPromise);
+      this.socketServer!.listen(this.socketPath, () => resolvePromise());
+    });
+  }
+
+  async stopAll(): Promise<void> {
+    const procs = [...this.processes.values()];
+    this.processes.clear();
+    await Promise.all(procs.map((p) => p.stop()));
+    if (this.socketServer) {
+      await new Promise<void>((resolvePromise) => {
+        this.socketServer!.close(() => resolvePromise());
+      });
+      this.socketServer = null;
+    }
+    rmSync(this.socketPath, { force: true });
+  }
+
+  async stopSession(sessionId: string): Promise<void> {
+    const proc = this.processes.get(sessionId);
+    if (proc) {
+      this.processes.delete(sessionId);
+      await proc.stop();
+    }
+    const existing = this.db.getSession(sessionId);
+    if (existing && (existing.status === "running" || existing.status === "idle")) {
+      const updated = this.db.updateSession(sessionId, { status: "stopped" })!;
+      this.wsServer.broadcast({ type: "session.update", session: serializeSession(updated) });
+    }
+  }
+
+  async stopBotSessions(botId: string): Promise<void> {
+    const sessions = this.db.listSessions({ botId });
+    await Promise.all(sessions.map((s) => this.stopSession(s.id)));
+  }
+
+  private handleUnixConnection(conn: Socket): void {
+    let buf = Buffer.alloc(0);
+    conn.on("data", (chunk: Buffer) => {
+      buf = Buffer.concat([buf, chunk]);
+      while (true) {
+        const nl = buf.indexOf(0x0a);
+        if (nl === -1) break;
+        const line = buf.subarray(0, nl).toString("utf8").replace(/\r$/, "");
+        buf = buf.subarray(nl + 1);
+        if (line.trim().length > 0) {
+          void this.handleUnixLine(conn, line);
+        }
+      }
+    });
+  }
+
+  private async handleUnixLine(conn: Socket, line: string): Promise<void> {
+    let req: { id?: string; token?: string; tool?: string; params?: Record<string, unknown> };
+    try {
+      req = JSON.parse(line);
+    } catch {
+      conn.write(`${JSON.stringify({ ok: false, error: "Invalid JSON" })}\n`);
+      return;
+    }
+
+    const id = req.id;
+    try {
+      if (!req.token) throw new Error("Missing session token");
+      const session = this.db.getSessionByToken(req.token);
+      if (!session) throw new Error("Invalid session token");
+      const result = await this.executeHostTool(session, req.tool ?? "", req.params ?? {});
+      conn.write(`${JSON.stringify({ id, ok: true, result })}\n`);
+    } catch (err) {
+      conn.write(
+        `${JSON.stringify({
+          id,
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        })}\n`,
+      );
+    }
+  }
+
+  private async executeHostTool(
+    session: SessionRow,
+    tool: string,
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
+    switch (tool) {
+      case "get_context": {
+        if (this.soulHandlers) {
+          return this.soulHandlers.getContext(session);
+        }
+        const contextFiles: Array<{ path: string; content: string }> = [];
+        if (session.kind === "orchestrator") {
+          const soul = this.db.getLatestSoul(session.bot_id);
+          if (soul) {
+            contextFiles.push({ path: "kawan://soul.md", content: soul.content });
+          }
+          const workers = this.db.listSessions({ botId: session.bot_id, kind: "worker" });
+          if (workers.length > 0) {
+            const lines = workers.map(
+              (w) => `- ${w.id} [${w.status}] (${w.branch ?? "no-branch"}): ${w.task ?? ""} — ${w.last_report ?? "no report yet"}`,
+            );
+            contextFiles.push({
+              path: "kawan://sessions.md",
+              content: `## Active & recent worker sessions\n\n${lines.join("\n")}\n`,
+            });
+          }
+        } else if (session.soul_snapshot) {
+          contextFiles.push({ path: "kawan://soul.md", content: session.soul_snapshot });
+        }
+        return { contextFiles };
+      }
+
+      case "spawn_session": {
+        if (session.kind !== "orchestrator") {
+          throw new Error("Only the orchestrator session can spawn worker sessions");
+        }
+        const task = typeof params.task === "string" ? params.task.trim() : "";
+        if (!task) throw new Error("task is required");
+        return await this.spawnWorker(session, task);
+      }
+
+      case "session_status": {
+        if (session.kind !== "orchestrator") {
+          throw new Error("Only the orchestrator session can call session_status");
+        }
+        const workers = this.db.listSessions({ botId: session.bot_id, kind: "worker" });
+        return {
+          sessions: workers.map((w) => ({
+            id: w.id,
+            status: w.status,
+            branch: w.branch,
+            task: w.task,
+            last_report: w.last_report,
+            conversation_id: w.conversation_id,
+            thread_id: w.thread_id,
+            updated_at: w.updated_at,
+          })),
+        };
+      }
+
+      case "report": {
+        const text = typeof params.text === "string" ? params.text : "";
+        if (!text.trim()) throw new Error("report text cannot be empty");
+        const artifactParam =
+          params.artifact && typeof params.artifact === "object"
+            ? (params.artifact as { filename?: string; mime_type?: string; base64?: string })
+            : undefined;
+        return await this.handleReport(session, text, artifactParam);
+      }
+
+      case "land_request": {
+        if (session.kind !== "worker") {
+          throw new Error("Only worker sessions can call land_request");
+        }
+        const summary = typeof params.summary === "string" ? params.summary : "";
+        return await this.handleLandRequest(session, summary);
+      }
+
+      case "soul_replace": {
+        if (session.kind !== "orchestrator") {
+          throw new Error("Only orchestrator sessions can modify the soul");
+        }
+        if (!this.soulHandlers) {
+          throw new Error("Soul editing is not enabled");
+        }
+        return this.soulHandlers.soulReplace(session, {
+          anchor: String(params.anchor ?? ""),
+          text: String(params.text ?? ""),
+        });
+      }
+
+      case "soul_write": {
+        if (session.kind !== "orchestrator") {
+          throw new Error("Only orchestrator sessions can modify the soul");
+        }
+        if (!this.soulHandlers) {
+          throw new Error("Soul editing is not enabled");
+        }
+        return this.soulHandlers.soulWrite(session, {
+          document: String(params.document ?? ""),
+        });
+      }
+
+      default:
+        throw new Error(`Unknown host tool: ${tool}`);
+    }
+  }
+
+  private buildOrchestratorSystemPrompt(bot: UserRow): string {
+    return [
+      `You are ${bot.name}, an AI engineering orchestrator inside Kawan.`,
+      bot.persona ? `Persona: ${bot.persona}` : "Persona: Helpful, concise software engineer.",
+      "You coordinate work across channels and DMs using your host tools:",
+      "- spawn_session(task): delegate repository inspection, coding, tests, and git commits to an isolated worker session.",
+      "- session_status(): inspect your child worker sessions.",
+      "- report(text, artifact?): post an explicit update or attach evidence into the active conversation.",
+      "- soul_replace(anchor, text) and soul_write(document): maintain durable project knowledge in your soul.",
+      "Do not pretend to inspect or edit files directly — always delegate repo work to spawn_session(task).",
+      "Keep runs brief so channels stay responsive. When a normal chat turn completes without calling report(), your final reply is automatically posted in the conversation.",
+      "If you receive an internal [worker-report] notice and nothing needs to be posted to humans, end with exactly: NO_REPLY",
+    ].join("\n");
+  }
+
+  private buildWorkerSystemPrompt(bot: UserRow, session: SessionRow): string {
+    return [
+      `You are a worker agent for ${bot.name} inside an isolated git clone on branch ${session.branch}.`,
+      `Assigned task: ${session.task}`,
+      "Instructions:",
+      "1. Inspect the repository, make the requested changes or collect the requested information, and verify your work.",
+      "2. If you changed or created any files, you MUST run `git add` and `git commit` with a clear commit message, leaving `git status` clean.",
+      "3. Call `report(text, artifact?)` to share concrete results and attach any evidence artifact (summary text, logs, or screenshots).",
+      "4. If the task produced committed changes meant to be merged to the default branch, call `land_request(summary)` after committing so a human can approve landing.",
+    ].join("\n");
+  }
+
+  private async ensureOrchestratorProcess(bot: UserRow, session: SessionRow): Promise<PiRpcProcess> {
+    const existing = this.processes.get(session.id);
+    if (existing && existing.isAlive) return existing;
+
+    const settings = this.db.getHostSettings();
+    const sessionBase = join(this.dataDir, "sessions", session.id);
+    const agentDir = join(sessionBase, "agent");
+    const sessionDir = join(sessionBase, "pi-sessions");
+    const cwd = join(sessionBase, "work");
+    mkdirSync(cwd, { recursive: true });
+    materializeSessionAgentDir(agentDir, settings);
+
+    const spec = composeSpawnSpec({
+      role: "orchestrator",
+      bot,
+      settings,
+      agentDir,
+      sessionDir,
+      cwd,
+      socketPath: this.socketPath,
+      extensionPath: EXTENSION_ENTRY_PATH,
+      sessionToken: session.token,
+      systemPrompt: this.buildOrchestratorSystemPrompt(bot),
+      piSessionFile: session.pi_session_file,
+      disableSandbox: this.disableSandbox,
+    });
+
+    const proc = new PiRpcProcess(spec);
+    await proc.start();
+    this.processes.set(session.id, proc);
+
+    try {
+      const state = await proc.getState();
+      this.db.updateSession(session.id, {
+        agent_dir: agentDir,
+        pi_session_file: state.sessionFile ?? session.pi_session_file,
+      });
+    } catch {
+      // non-fatal
+    }
+
+    return proc;
+  }
+
+  async dispatch(params: {
+    bot: UserRow;
+    destination: string;
+    conversation: ConversationRow;
+    threadId: string | null;
+    messages: MessageRow[];
+  }): Promise<void> {
+    if (params.destination === "orchestrator") {
+      this.enqueueOrchestratorPrompt(params.bot, params.conversation, params.threadId, params.messages);
+      return;
+    }
+
+    if (params.destination.startsWith("session:")) {
+      const workerId = params.destination.slice("session:".length);
+      await this.dispatchToWorker(params.bot, workerId, params.conversation, params.messages);
+    }
+  }
+
+  private enqueueOrchestratorPrompt(
+    bot: UserRow,
+    conversation: ConversationRow,
+    threadId: string | null,
+    messages: MessageRow[],
+    isInternalNotice = false,
+    promptOverride?: string,
+  ): void {
+    const prev = this.orchQueues.get(bot.id) ?? Promise.resolve();
+    const next = prev
+      .catch(() => {})
+      .then(async () => {
+        const freshBot = this.db.getUser(bot.id);
+        if (!freshBot) return;
+        const orch = this.db.getActiveOrchestratorSession(bot.id);
+        if (!orch) return;
+
+        const runningOrch = this.db.updateSession(orch.id, { status: "running" })!;
+        this.wsServer.broadcast({ type: "session.update", session: serializeSession(runningOrch) });
+
+        const proc = await this.ensureOrchestratorProcess(freshBot, runningOrch);
+
+        const targetThreadId =
+          threadId ?? (conversation.kind === "channel" && messages.length > 0 ? messages[messages.length - 1].id : null);
+
+        this.activeContexts.set(orch.id, {
+          conversationId: conversation.id,
+          threadId: targetThreadId,
+          reportedInTurn: false,
+        });
+
+        const promptText =
+          promptOverride ??
+          this.formatHumanBatchPrompt(conversation, targetThreadId, messages);
+
+        try {
+          const turn = await proc.runPrompt(promptText);
+          try {
+            const st = await proc.getState();
+            const entries = await proc.getEntries();
+            this.db.updateSession(orch.id, {
+              pi_session_file: st.sessionFile ?? runningOrch.pi_session_file,
+              last_entry_id: entries.leafId,
+            });
+          } catch {
+            // ignore state sync errors
+          }
+
+          const ctx = this.activeContexts.get(orch.id);
+          this.activeContexts.delete(orch.id);
+
+          if (turn.errorMessage) {
+            this.wsServer.broadcastToConversation(conversation, {
+              type: "error",
+              conversation_id: conversation.id,
+              bot_id: freshBot.id,
+              message: `Orchestrator error: ${turn.errorMessage}`,
+            });
+          } else if (
+            !ctx?.reportedInTurn &&
+            turn.assistantText &&
+            turn.assistantText.trim() !== "NO_REPLY" &&
+            !isInternalNotice
+          ) {
+            const posted = this.db.appendMessage({
+              conversationId: conversation.id,
+              authorId: freshBot.id,
+              threadId: targetThreadId,
+              body: turn.assistantText.trim(),
+            });
+            this.wsServer.broadcastToConversation(conversation, {
+              type: "message.new",
+              message: posted,
+              author: { id: freshBot.id, kind: "bot", name: freshBot.name },
+            });
+          } else if (
+            isInternalNotice &&
+            !ctx?.reportedInTurn &&
+            turn.assistantText &&
+            turn.assistantText.trim() !== "NO_REPLY"
+          ) {
+            const posted = this.db.appendMessage({
+              conversationId: conversation.id,
+              authorId: freshBot.id,
+              threadId: targetThreadId,
+              body: turn.assistantText.trim(),
+            });
+            this.wsServer.broadcastToConversation(conversation, {
+              type: "message.new",
+              message: posted,
+              author: { id: freshBot.id, kind: "bot", name: freshBot.name },
+            });
+          }
+        } catch (err) {
+          this.activeContexts.delete(orch.id);
+          this.wsServer.broadcastToConversation(conversation, {
+            type: "error",
+            conversation_id: conversation.id,
+            bot_id: freshBot.id,
+            message: err instanceof Error ? err.message : String(err),
+          });
+        } finally {
+          const latestOrch = this.db.getSession(orch.id);
+          if (latestOrch && latestOrch.status === "running") {
+            const idle = this.db.updateSession(orch.id, { status: "idle" })!;
+            this.wsServer.broadcast({ type: "session.update", session: serializeSession(idle) });
+          }
+        }
+      });
+
+    this.orchQueues.set(bot.id, next);
+  }
+
+  private formatHumanBatchPrompt(
+    conversation: ConversationRow,
+    threadId: string | null,
+    messages: MessageRow[],
+  ): string {
+    const label =
+      conversation.kind === "dm" ? "DM" : `#${conversation.name ?? "channel"}`;
+    const lines = messages.map((m) => {
+      const author = this.db.getUser(m.author_id);
+      return `${author?.name ?? "human"}: ${m.body}`;
+    });
+    return [
+      `[Conversation: ${label} (${conversation.id})${threadId ? `, thread ${threadId}` : ""}]`,
+      ...lines,
+    ].join("\n");
+  }
+
+  private async spawnWorker(orchSession: SessionRow, task: string): Promise<{
+    session_id: string;
+    branch: string;
+    status: string;
+  }> {
+    const bot = this.db.getUser(orchSession.bot_id);
+    if (!bot || bot.kind !== "bot") {
+      throw new Error("Bot no longer exists");
+    }
+    const settings = this.db.getHostSettings();
+    if (!settings.repo?.bare_path || !existsSync(settings.repo.bare_path)) {
+      throw new Error("Cannot spawn session: no repository is attached");
+    }
+    const ctx = this.activeContexts.get(orchSession.id);
+    if (!ctx) {
+      throw new Error("No active conversation context for orchestrator");
+    }
+    if (!bot.signing_key_path) {
+      throw new Error("Bot is missing SSH signing key");
+    }
+
+    const sessionId = randomUUID();
+    const branch = `kawan/${sessionId}`;
+    const clonePath = join(this.dataDir, "workspaces", sessionId);
+    const sessionBase = join(this.dataDir, "sessions", sessionId);
+    const agentDir = join(sessionBase, "agent");
+    const sessionDir = join(sessionBase, "pi-sessions");
+
+    await createSessionClone({
+      barePath: settings.repo.bare_path,
+      clonePath,
+      defaultBranch: settings.repo.default_branch,
+      branchName: branch,
+      botName: bot.name,
+      botEmail: bot.email ?? `${bot.name.toLowerCase()}@kawan.local`,
+      signingKeyPath: bot.signing_key_path,
+    });
+    ensureAllowedSigners(this.dataDir, this.db.listUsers("bot"));
+    materializeSessionAgentDir(agentDir, settings);
+
+    const latestSoul = this.db.getLatestSoul(bot.id);
+    const soulSnapshot = latestSoul ? filterSoulForWorker(latestSoul.content) : null;
+
+    const workerSession = this.db.createSession({
+      id: sessionId,
+      botId: bot.id,
+      parentSessionId: orchSession.id,
+      kind: "worker",
+      conversationId: ctx.conversationId,
+      threadId: ctx.threadId,
+      task,
+      status: "running",
+      branch,
+      clonePath,
+      agentDir,
+      soulSnapshot,
+    });
+    this.wsServer.broadcast({ type: "session.update", session: serializeSession(workerSession) });
+
+    const spec = composeSpawnSpec({
+      role: "worker",
+      bot,
+      settings,
+      agentDir,
+      sessionDir,
+      cwd: clonePath,
+      socketPath: this.socketPath,
+      extensionPath: EXTENSION_ENTRY_PATH,
+      sessionToken: workerSession.token,
+      systemPrompt: this.buildWorkerSystemPrompt(bot, workerSession),
+      disableSandbox: this.disableSandbox,
+    });
+
+    const proc = new PiRpcProcess(spec);
+    await proc.start();
+    this.processes.set(workerSession.id, proc);
+    try {
+      const st = await proc.getState();
+      const updated = this.db.updateSession(workerSession.id, {
+        pi_session_file: st.sessionFile ?? null,
+      })!;
+      this.wsServer.broadcast({ type: "session.update", session: serializeSession(updated) });
+    } catch {
+      // non-fatal
+    }
+
+    const runPromise = this.runWorkerTurn(proc, workerSession, bot, task);
+    this.workerRuns.set(workerSession.id, runPromise);
+
+    return { session_id: workerSession.id, branch, status: "running" };
+  }
+
+  private async runWorkerTurn(
+    proc: PiRpcProcess,
+    session: SessionRow,
+    bot: UserRow,
+    promptText: string,
+  ): Promise<void> {
+    const conv = session.conversation_id
+      ? this.db.getConversation(session.conversation_id)
+      : null;
+
+    this.activeContexts.set(session.id, {
+      conversationId: session.conversation_id ?? "",
+      threadId: session.thread_id,
+      reportedInTurn: false,
+    });
+
+    try {
+      const turn = await proc.runPrompt(promptText);
+      try {
+        const st = await proc.getState();
+        const entries = await proc.getEntries();
+        this.db.updateSession(session.id, {
+          pi_session_file: st.sessionFile ?? session.pi_session_file,
+          last_entry_id: entries.leafId,
+        });
+      } catch {
+        // ignore
+      }
+
+      const ctx = this.activeContexts.get(session.id);
+      this.activeContexts.delete(session.id);
+
+      const latest = this.db.getSession(session.id) ?? session;
+      if (turn.errorMessage) {
+        const failed = this.db.updateSession(session.id, { status: "failed" })!;
+        this.wsServer.broadcast({ type: "session.update", session: serializeSession(failed) });
+        if (conv) {
+          this.wsServer.broadcastToConversation(conv, {
+            type: "error",
+            conversation_id: conv.id,
+            session_id: session.id,
+            message: `Worker ${session.id.slice(0, 8)} failed: ${turn.errorMessage}`,
+          });
+        }
+        return;
+      }
+
+      if (!ctx?.reportedInTurn && turn.assistantText && conv) {
+        const posted = this.db.appendMessage({
+          conversationId: conv.id,
+          authorId: bot.id,
+          threadId: latest.thread_id,
+          body: turn.assistantText,
+        });
+        this.wsServer.broadcastToConversation(conv, {
+          type: "message.new",
+          message: posted,
+          author: { id: bot.id, kind: "bot", name: bot.name },
+        });
+        this.db.updateSession(session.id, { last_report: turn.assistantText });
+      }
+
+      const refreshed = this.db.getSession(session.id)!;
+      if (refreshed.status === "running") {
+        const idle = this.db.updateSession(session.id, { status: "idle" })!;
+        this.wsServer.broadcast({ type: "session.update", session: serializeSession(idle) });
+      }
+
+      const reportSummary = refreshed.last_report ?? turn.assistantText;
+      if (conv && reportSummary) {
+        this.enqueueOrchestratorPrompt(
+          bot,
+          conv,
+          refreshed.thread_id,
+          [],
+          true,
+          `[worker-report from session ${session.id} (${refreshed.status})]\n${reportSummary}\n\nIf the worker uncovered a durable project fact, agreement, or decision, update your soul with soul_replace or soul_write. Otherwise respond with NO_REPLY.`,
+        );
+      }
+    } catch (err) {
+      this.activeContexts.delete(session.id);
+      const failed = this.db.updateSession(session.id, { status: "failed" });
+      if (failed) {
+        this.wsServer.broadcast({ type: "session.update", session: serializeSession(failed) });
+      }
+      if (conv) {
+        this.wsServer.broadcastToConversation(conv, {
+          type: "error",
+          conversation_id: conv.id,
+          session_id: session.id,
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+
+  private async dispatchToWorker(
+    bot: UserRow,
+    workerId: string,
+    conversation: ConversationRow,
+    messages: MessageRow[],
+  ): Promise<void> {
+    const worker = this.db.getSession(workerId);
+    if (!worker || worker.kind !== "worker") {
+      throw new Error(`Worker session not found: ${workerId}`);
+    }
+    if (!worker.clone_path || !existsSync(worker.clone_path)) {
+      throw new Error(`Worker clone is no longer available for session ${workerId}`);
+    }
+
+    const promptText = this.formatHumanBatchPrompt(conversation, worker.thread_id, messages);
+    let proc = this.processes.get(worker.id);
+    if (!proc || !proc.isAlive) {
+      const settings = this.db.getHostSettings();
+      const sessionBase = join(this.dataDir, "sessions", worker.id);
+      const agentDir = join(sessionBase, "agent");
+      const sessionDir = join(sessionBase, "pi-sessions");
+      materializeSessionAgentDir(agentDir, settings);
+
+      const spec = composeSpawnSpec({
+        role: "worker",
+        bot,
+        settings,
+        agentDir,
+        sessionDir,
+        cwd: worker.clone_path,
+        socketPath: this.socketPath,
+        extensionPath: EXTENSION_ENTRY_PATH,
+        sessionToken: worker.token,
+        systemPrompt: this.buildWorkerSystemPrompt(bot, worker),
+        piSessionFile: worker.pi_session_file,
+        disableSandbox: this.disableSandbox,
+      });
+      proc = new PiRpcProcess(spec);
+      await proc.start();
+      this.processes.set(worker.id, proc);
+    }
+
+    const state = await proc.getState();
+    if (state.isStreaming) {
+      await proc.steer(promptText);
+    } else {
+      const running = this.db.updateSession(worker.id, { status: "running" })!;
+      this.wsServer.broadcast({ type: "session.update", session: serializeSession(running) });
+      const runPromise = this.runWorkerTurn(proc, running, bot, promptText);
+      this.workerRuns.set(worker.id, runPromise);
+    }
+  }
+
+  private async handleReport(
+    session: SessionRow,
+    text: string,
+    artifactInput?: { filename?: string; mime_type?: string; base64?: string },
+  ): Promise<{ message_id: string; artifact_id: string | null }> {
+    const bot = this.db.getUser(session.bot_id);
+    if (!bot) throw new Error("Bot not found");
+
+    const ctx = this.activeContexts.get(session.id);
+    const conversationId = ctx?.conversationId || session.conversation_id;
+    const threadId = ctx ? ctx.threadId : session.thread_id;
+    if (!conversationId) {
+      throw new Error("No target conversation for report");
+    }
+    const conv = this.db.getConversation(conversationId);
+    if (!conv) {
+      throw new Error(`Conversation not found: ${conversationId}`);
+    }
+    if (ctx) {
+      ctx.reportedInTurn = true;
+    }
+
+    let artifactRow: ArtifactRow | null = null;
+    if (artifactInput?.base64) {
+      const bytes = Buffer.from(artifactInput.base64, "base64");
+      if (bytes.byteLength > MAX_ARTIFACT_BYTES) {
+        throw new Error(`Artifact exceeds 10 MB limit (${bytes.byteLength} bytes)`);
+      }
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      const artifactPath = join(this.dataDir, "artifacts", sha256);
+      if (!existsSync(artifactPath)) {
+        writeFileSync(artifactPath, bytes, { mode: 0o644 });
+      }
+      artifactRow = this.db.createArtifact({
+        sha256,
+        mimeType: artifactInput.mime_type || "text/plain",
+        byteSize: bytes.byteLength,
+        filename: artifactInput.filename ?? null,
+        sessionId: session.id,
+        conversationId: conv.id,
+      });
+      this.wsServer.broadcastToConversation(conv, {
+        type: "artifact.new",
+        artifact: artifactRow,
+      });
+    }
+
+    const msg = this.db.appendMessage({
+      conversationId: conv.id,
+      authorId: bot.id,
+      threadId,
+      body: text,
+      artifactId: artifactRow?.id ?? null,
+    });
+    if (artifactRow) {
+      this.db.linkArtifactMessage(artifactRow.id, msg.id);
+    }
+
+    const updatedSession = this.db.updateSession(session.id, { last_report: text })!;
+    this.wsServer.broadcastToConversation(conv, {
+      type: "message.new",
+      message: msg,
+      author: { id: bot.id, kind: "bot", name: bot.name },
+    });
+    this.wsServer.broadcast({ type: "session.update", session: serializeSession(updatedSession) });
+
+    return {
+      message_id: msg.id,
+      artifact_id: artifactRow?.id ?? null,
+    };
+  }
+
+  async handleLandRequest(session: SessionRow, _summary: string): Promise<{
+    land_id: string;
+    status: string;
+    branch: string | null;
+  }> {
+    const land = this.db.createLand({
+      sessionId: session.id,
+      conversationId: session.conversation_id!,
+      threadId: session.thread_id,
+    });
+    const updated = this.db.updateSession(session.id, { status: "review_requested" })!;
+    this.wsServer.broadcast({ type: "session.update", session: serializeSession(updated) });
+    this.wsServer.broadcast({ type: "land.update", land });
+    return { land_id: land.id, status: land.status, branch: updated.branch };
+  }
+
+  getArtifactPayload(artifactId: string): { artifact: ArtifactRow; base64: string; mime_type: string } {
+    const artifact = this.db.getArtifact(artifactId);
+    if (!artifact) throw new Error(`Artifact not found: ${artifactId}`);
+    if (artifact.byte_size > MAX_ARTIFACT_BYTES) {
+      throw new Error("Artifact exceeds 10 MB limit");
+    }
+    const diskPath = join(this.dataDir, "artifacts", artifact.sha256);
+    if (!existsSync(diskPath)) {
+      throw new Error(`Artifact bytes missing on disk: ${artifact.sha256}`);
+    }
+    const bytes = readFileSync(diskPath);
+    return {
+      artifact,
+      base64: bytes.toString("base64"),
+      mime_type: artifact.mime_type,
+    };
+  }
+
+  async openSessionDetail(sessionId: string): Promise<{
+    session: Omit<SessionRow, "token">;
+    artifacts: ArtifactRow[];
+    lands: ReturnType<KawanDb["listLands"]>;
+    entries: any[];
+  }> {
+    const session = this.db.getSession(sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+
+    let entries: any[] = [];
+    const liveProc = this.processes.get(sessionId);
+    if (liveProc && liveProc.isAlive) {
+      try {
+        const res = await liveProc.getEntries();
+        entries = res.entries;
+      } catch {
+        entries = [];
+      }
+    } else if (session.pi_session_file && existsSync(session.pi_session_file)) {
+      const raw = readFileSync(session.pi_session_file, "utf8");
+      entries = raw
+        .split(/\r?\n/)
+        .filter((l) => l.trim().length > 0)
+        .map((l) => JSON.parse(l));
+    }
+
+    return {
+      session: serializeSession(session),
+      artifacts: this.db.listArtifacts({ sessionId }),
+      lands: this.db.listLands({ sessionId }),
+      entries,
+    };
+  }
+}
+
+export function filterSoulForWorker(content: string): string {
+  const sections = content.split(/(?=^##\s+)/m);
+  const kept = sections.filter((sec) => {
+    const firstLine = sec.split(/\r?\n/, 1)[0].trim().toLowerCase();
+    return (
+      firstLine.startsWith("## working agreements") ||
+      firstLine.startsWith("## project facts")
+    );
+  });
+  return kept.join("\n").trim();
+}

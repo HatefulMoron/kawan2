@@ -12,6 +12,7 @@ import {
   type DecisionMode,
 } from "./decisions.js";
 import { attachRepository, ensureHostSshKey, generateBotKeypair } from "./git.js";
+import { serializeSession, SessionManager, type SoulHandlers } from "./sessions.js";
 import type {
   ConversationRow,
   HostSettings,
@@ -56,6 +57,8 @@ export interface StartHostOptions {
   recordProtocolPath?: string;
   decisionMode?: DecisionMode;
   decisionFixturePath?: string;
+  disableSandbox?: boolean;
+  soulHandlers?: SoulHandlers;
   onDispatch?: (event: DispatchEvent) => Promise<void> | void;
   quiet?: boolean;
 }
@@ -68,6 +71,7 @@ export interface KawanHost {
   bootstrapToken: string | null;
   db: KawanDb;
   wsServer: KawanWsServer;
+  sessionManager: SessionManager;
   httpServer: HttpServer;
   close(): Promise<void>;
 }
@@ -267,6 +271,15 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
   const url = `ws://${hostAddress}`;
 
   let wsServer!: KawanWsServer;
+  let sessionManager!: SessionManager;
+
+  const dispatchEvent = async (ev: DispatchEvent): Promise<void> => {
+    if (opts.onDispatch) {
+      await opts.onDispatch(ev);
+    } else {
+      await sessionManager.dispatch(ev);
+    }
+  };
 
   const extraHandlers: Record<string, CommandHandler> = {
     "settings.read": (_req, client) => {
@@ -470,10 +483,10 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
 
       const botPayload = serializeBot(db, bot);
       wsServer.broadcast({ type: "bot.update", bot: botPayload });
-      return { bot: botPayload, session };
+      return { bot: botPayload, session: serializeSession(session) };
     },
 
-    "bot.update": (req, client) => {
+    "bot.update": async (req, client) => {
       if (client.user.role !== "admin") {
         throw new Error("Only admins can update bots");
       }
@@ -486,6 +499,7 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
       const nextPersona =
         req.persona !== undefined ? (req.persona === null ? null : String(req.persona)) : existing.persona;
       const personaChanged = req.persona !== undefined && nextPersona !== existing.persona;
+      const prevOrch = personaChanged ? db.getActiveOrchestratorSession(botId) : null;
 
       const { bot, session } = db.transaction(() => {
         const updated = db.updateBot(botId, {
@@ -516,12 +530,37 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
         return { bot: updated, session: activeOrch };
       });
 
+      if (personaChanged && prevOrch) {
+        await sessionManager.stopSession(prevOrch.id);
+      }
+
       const botPayload = serializeBot(db, bot);
       wsServer.broadcast({ type: "bot.update", bot: botPayload });
       if (personaChanged && session) {
-        wsServer.broadcast({ type: "session.update", session });
+        wsServer.broadcast({ type: "session.update", session: serializeSession(session) });
       }
-      return { bot: botPayload, session };
+      return { bot: botPayload, session: session ? serializeSession(session) : null };
+    },
+
+    "session.list": (req) => {
+      const botId = typeof req.bot_id === "string" ? req.bot_id : undefined;
+      const conversationId =
+        typeof req.conversation_id === "string" ? req.conversation_id : undefined;
+      return {
+        sessions: db.listSessions({ botId, conversationId }).map(serializeSession),
+      };
+    },
+
+    "session.open": async (req) => {
+      const sessionId = String(req.session_id ?? "");
+      if (!sessionId) throw new Error("session_id is required");
+      return await sessionManager.openSessionDetail(sessionId);
+    },
+
+    "artifact.get": (req) => {
+      const artifactId = String(req.artifact_id ?? req.id ?? "");
+      if (!artifactId) throw new Error("artifact_id is required");
+      return sessionManager.getArtifactPayload(artifactId);
     },
 
     "decision.redirect": async (req, client) => {
@@ -549,11 +588,11 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
       const conv = db.getConversation(updated.conversation_id)!;
       wsServer.broadcastToConversation(conv, { type: "decision.new", decision: updated });
 
-      if (destination !== "none" && opts.onDispatch) {
+      if (destination !== "none") {
         const bot = db.getUser(updated.bot_id);
         const msg = db.getMessage(updated.message_id);
         if (bot && msg) {
-          await opts.onDispatch({
+          await dispatchEvent({
             bot,
             destination,
             conversation: conv,
@@ -668,9 +707,9 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
           decision,
         });
 
-        if (shouldDispatchNow && opts.onDispatch) {
+        if (shouldDispatchNow) {
           const batchMessages = [...heldRows.map((h) => h.message), message];
-          await opts.onDispatch({
+          await dispatchEvent({
             bot,
             destination: result.destination,
             conversation,
@@ -681,6 +720,15 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
       }
     },
   });
+
+  sessionManager = new SessionManager({
+    dataDir: opts.dataDir,
+    db,
+    wsServer,
+    disableSandbox: opts.disableSandbox,
+    soulHandlers: opts.soulHandlers,
+  });
+  await sessionManager.start();
 
   if (!opts.quiet) {
     if (bootstrapToken) {
@@ -698,8 +746,10 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
     bootstrapToken,
     db,
     wsServer,
+    sessionManager,
     httpServer,
     async close(): Promise<void> {
+      await sessionManager.stopAll();
       await new Promise<void>((resolve) => {
         for (const client of wss.clients) {
           client.terminate();

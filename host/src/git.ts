@@ -123,3 +123,82 @@ export async function attachRepository(
     }
   }
 }
+
+export async function createSessionClone(params: {
+  barePath: string;
+  clonePath: string;
+  defaultBranch: string;
+  branchName: string;
+  botName: string;
+  botEmail: string;
+  signingKeyPath: string;
+}): Promise<void> {
+  rmSync(params.clonePath, { recursive: true, force: true });
+  mkdirSync(join(params.clonePath, ".."), { recursive: true });
+  await runGit(["clone", "--local", params.barePath, params.clonePath]);
+  await runGit(
+    ["-C", params.clonePath, "checkout", "-B", params.branchName, `origin/${params.defaultBranch}`],
+  );
+  await runGit(["-C", params.clonePath, "config", "user.name", params.botName]);
+  await runGit(["-C", params.clonePath, "config", "user.email", params.botEmail]);
+  await runGit(["-C", params.clonePath, "config", "gpg.format", "ssh"]);
+  await runGit(["-C", params.clonePath, "config", "commit.gpgsign", "true"]);
+  await runGit(["-C", params.clonePath, "config", "user.signingkey", params.signingKeyPath]);
+}
+
+export function ensureAllowedSigners(
+  dataDir: string,
+  bots: Array<{ email: string | null; name: string; signing_pubkey: string | null }>,
+): string {
+  const path = join(dataDir, "allowed_signers");
+  const lines: string[] = [];
+  for (const bot of bots) {
+    if (!bot.signing_pubkey) continue;
+    const principal = bot.email || `${bot.name.toLowerCase()}@kawan.local`;
+    lines.push(`${principal} ${bot.signing_pubkey.trim()}`);
+  }
+  writeFileSync(path, lines.length > 0 ? `${lines.join("\n")}\n` : "", { mode: 0o644 });
+  return path;
+}
+
+export async function getBranchHead(repoDir: string, ref = "HEAD"): Promise<string> {
+  const { stdout } = await runGit(["-C", repoDir, "rev-parse", ref]);
+  return stdout.trim();
+}
+
+export async function isWorkingTreeClean(clonePath: string): Promise<boolean> {
+  const { stdout } = await runGit(["-C", clonePath, "status", "--porcelain"]);
+  return stdout.trim().length === 0;
+}
+
+export async function commitsAhead(clonePath: string, defaultBranch: string): Promise<number> {
+  const { stdout } = await runGit([
+    "-C",
+    clonePath,
+    "rev-list",
+    "--count",
+    `origin/${defaultBranch}..HEAD`,
+  ]);
+  return Number.parseInt(stdout.trim(), 10) || 0;
+}
+
+export async function verifyCommitSignature(
+  repoDir: string,
+  commitRef: string,
+  allowedSignersPath: string,
+): Promise<boolean> {
+  try {
+    await runGit([
+      "-c",
+      `gpg.ssh.allowedSignersFile=${allowedSignersPath}`,
+      "-C",
+      repoDir,
+      "verify-commit",
+      commitRef,
+    ]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+

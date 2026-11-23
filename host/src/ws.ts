@@ -635,7 +635,10 @@ export class KawanWsServer {
         }));
         const messages = db.listMessages(convId, since);
         const decisions = db.listDecisions(convId, since);
-        const sessions = db.listSessions({ conversationId: convId });
+        const sessions = db.listSessions({ conversationId: convId }).map((s) => {
+          const { token: _t, ...pub } = s;
+          return pub;
+        });
         const artifacts = db.listArtifacts({ conversationId: convId });
         const lands = db.listLands({ conversationId: convId });
         return {

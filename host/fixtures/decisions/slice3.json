@@ -1,0 +1,29 @@
+{
+  "2584956687c88311780ab710": {
+    "model": "subq-snap-1.2",
+    "answers": {
+      "destination": {
+        "type": "choice",
+        "choice": "orchestrator",
+        "probabilities": {
+          "none": 0.00015495563275180757,
+          "orchestrator": 0.999845027923584
+        },
+        "confidence": 0.999690055847168
+      },
+      "readiness": {
+        "type": "choice",
+        "choice": "dispatch",
+        "probabilities": {
+          "dispatch": 0.9821033477783203,
+          "hold": 0.017896631732583046
+        },
+        "confidence": 0.9642066955566406
+      }
+    },
+    "usage": {
+      "input_tokens": 556,
+      "output_tokens": 0
+    }
+  }
+}
