@@ -4,6 +4,7 @@ pub mod checklist;
 pub mod connect;
 pub mod conversation;
 pub mod issues;
+pub mod markdown;
 pub mod merge_queue;
 pub mod settings;
 pub mod status;

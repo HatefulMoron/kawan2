@@ -14,7 +14,7 @@ use crate::state::{
     FocusTarget, KawanApp, RightPanel, Screen, SessionDrawerTab, SettingsTab, WorkspacePage,
 };
 use crate::theme::{self, Theme};
-use crate::views::{short_id, status_color_hex};
+use crate::views::{markdown, short_id, status_color_hex};
 
 const EDITORIAL_MEASURE: f32 = 780.0;
 
@@ -1478,7 +1478,7 @@ fn message_row(
             div()
                 .w_full()
                 .min_w(px(0.0))
-                .child(theme::body(msg.body.clone(), 13.5, theme.ink)),
+                .child(markdown::render(&msg.body, 13.5, theme.ink, theme)),
         );
 
     if let Some(attachment) = render_message_attachment(app, msg, is_bot, mi, theme, cx) {
@@ -1658,8 +1658,7 @@ fn thread_tray(
         .unwrap_or(theme.vivid);
     let is_open = app.right_panel == RightPanel::Thread(parent_msg_id.to_string());
     let open_tid = parent_msg_id.to_string();
-    let single_line = last_reply
-        .body
+    let single_line = markdown::plain_text(&last_reply.body)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
@@ -2669,11 +2668,12 @@ fn thread_drawer_body(
                                         .child(theme::micro("ROOT", 8.0, theme.fg_tertiary))
                                 })),
                         )
-                        .child(div().w_full().min_w(px(0.0)).child(theme::body(
-                            m.body.clone(),
-                            12.5,
-                            theme.ink,
-                        )));
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w(px(0.0))
+                                .child(markdown::render(&m.body, 12.5, theme.ink, theme)),
+                        );
 
                     if let Some(attachment) =
                         render_message_attachment(app, m, is_bot, card_idx, theme, cx)
