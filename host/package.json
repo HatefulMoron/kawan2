@@ -6,7 +6,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "start": "tsx src/index.ts",
-    "test": "tsx --test test/slice1.test.ts",
+    "test": "tsx --test test/slice1.test.ts test/slice2.test.ts",
     "test:routing": "tsx test/routing-harness.ts"
   },
   "dependencies": {

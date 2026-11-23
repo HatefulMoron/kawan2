@@ -7,6 +7,52 @@ import { WebSocket } from "ws";
 
 const execFileAsync = promisify(execFile);
 
+export async function createFixtureBareRepo(
+  files: Record<string, string> = { "README.md": "# Fixture Repo\n" },
+  opts: { verifyScript?: string; defaultBranch?: string } = {},
+): Promise<{
+  dir: string;
+  barePath: string;
+  defaultBranch: string;
+  initialHead: string;
+  cleanup: () => void;
+}> {
+  const dir = mkdtempSync(join(tmpdir(), "kawan-repo-"));
+  const workDir = join(dir, "work");
+  const barePath = join(dir, "origin.git");
+  const defaultBranch = opts.defaultBranch ?? "main";
+
+  await execFileAsync("git", ["init", "-b", defaultBranch, workDir], { timeout: 10_000 });
+  await execFileAsync("git", ["config", "user.name", "Fixture Author"], { cwd: workDir, timeout: 10_000 });
+  await execFileAsync("git", ["config", "user.email", "fixture@kawan.local"], { cwd: workDir, timeout: 10_000 });
+
+  for (const [rel, content] of Object.entries(files)) {
+    const full = join(workDir, rel);
+    const parent = join(full, "..");
+    await import("node:fs/promises").then((fs) => fs.mkdir(parent, { recursive: true }));
+    writeFileSync(full, content, "utf8");
+  }
+  if (opts.verifyScript) {
+    const scriptPath = join(workDir, "verify.sh");
+    writeFileSync(scriptPath, opts.verifyScript, { mode: 0o755 });
+  }
+
+  await execFileAsync("git", ["add", "-A"], { cwd: workDir, timeout: 10_000 });
+  await execFileAsync("git", ["commit", "-m", "Initial commit"], { cwd: workDir, timeout: 10_000 });
+  const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workDir, timeout: 10_000 });
+  const initialHead = stdout.trim();
+
+  await execFileAsync("git", ["clone", "--bare", workDir, barePath], { timeout: 10_000 });
+
+  return {
+    dir,
+    barePath,
+    defaultBranch,
+    initialHead,
+    cleanup: () => rmSync(dir, { recursive: true, force: true }),
+  };
+}
+
 export class TestKeyPair {
   readonly dir: string;
   readonly privatePath: string;

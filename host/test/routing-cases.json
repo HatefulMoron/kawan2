@@ -1,0 +1,204 @@
+[
+  {
+    "id": "direct-task-channel",
+    "botName": "kawan",
+    "conversation": { "kind": "channel", "name": "general" },
+    "activeSessions": [],
+    "recentMessages": [],
+    "heldMessages": [],
+    "incoming": { "author": "alice", "inThread": false, "body": "@kawan please add a hello.txt file with 'hi' and commit it" },
+    "expected": { "destination": "orchestrator", "readiness": "dispatch" }
+  },
+  {
+    "id": "direct-question-channel",
+    "botName": "kawan",
+    "conversation": { "kind": "channel", "name": "engineering" },
+    "activeSessions": [],
+    "recentMessages": [],
+    "heldMessages": [],
+    "incoming": { "author": "bob", "inThread": false, "body": "@kawan what does the test command look like in this repo?" },
+    "expected": { "destination": "orchestrator", "readiness": "dispatch" }
+  },
+  {
+    "id": "dm-request",
+    "botName": "kawan",
+    "conversation": { "kind": "dm", "name": "dm" },
+    "activeSessions": [],
+    "recentMessages": [],
+    "heldMessages": [],
+    "incoming": { "author": "alice", "inThread": false, "body": "Can you summarize the open branches?" },
+    "expected": { "destination": "orchestrator", "readiness": "dispatch" }
+  },
+  {
+    "id": "fragment-ping-hey",
+    "botName": "kawan",
+    "conversation": { "kind": "channel", "name": "general" },
+    "activeSessions": [],
+    "recentMessages": [],
+    "heldMessages": [],
+    "incoming": { "author": "alice", "inThread": false, "body": "@kawan hey" },
+    "expected": { "destination": "orchestrator", "readiness": "hold" }
+  },
+  {
+    "id": "fragment-quick-question",
+    "botName": "kawan",
+    "conversation": { "kind": "channel", "name": "general" },
+    "activeSessions": [],
+    "recentMessages": [],
+    "heldMessages": [],
+    "incoming": { "author": "bob", "inThread": false, "body": "@kawan quick question" },
+    "expected": { "destination": "orchestrator", "readiness": "hold" }
+  },
+  {
+    "id": "fragment-completion",
+    "botName": "kawan",
+    "conversation": { "kind": "channel", "name": "general" },
+    "activeSessions": [],
+    "recentMessages": [{ "author": "alice", "kind": "human", "threadId": null, "body": "@kawan hey" }],
+    "heldMessages": [{ "author": "alice", "body": "@kawan hey" }],
+    "incoming": { "author": "alice", "inThread": false, "body": "can you check why the cargo build is failing on linux?" },
+    "expected": { "destination": "orchestrator", "readiness": "dispatch" }
+  },
+  {
+    "id": "human-aside-coffee",
+    "botName": "kawan",
+    "conversation": { "kind": "channel", "name": "general" },
+    "activeSessions": [],
+    "recentMessages": [
+      { "author": "alice", "kind": "human", "threadId": null, "body": "Did anyone look at the release notes?" }
+    ],
+    "heldMessages": [],
+    "incoming": { "author": "bob", "inThread": false, "body": "alice: grabbing coffee, back in 10 mins" },
+    "expected": { "destination": "none", "readiness": "dispatch" }
+  },
+  {
+    "id": "human-to-human-question",
+    "botName": "kawan",
+    "conversation": { "kind": "channel", "name": "general" },
+    "activeSessions": [],
+    "recentMessages": [],
+    "heldMessages": [],
+    "incoming": { "author": "alice", "inThread": false, "body": "@bob did you push your PR yet?" },
+    "expected": { "destination": "none", "readiness": "dispatch" }
+  },
+  {
+    "id": "acknowledgement-thanks",
+    "botName": "kawan",
+    "conversation": { "kind": "channel", "name": "general" },
+    "activeSessions": [],
+    "recentMessages": [
+      { "author": "kawan", "kind": "bot", "threadId": null, "body": "I landed the fix on main." }
+    ],
+    "heldMessages": [],
+    "incoming": { "author": "alice", "inThread": false, "body": "thanks!" },
+    "expected": { "destination": "none", "readiness": "dispatch" }
+  },
+  {
+    "id": "acknowledgement-lgtm",
+    "botName": "kawan",
+    "conversation": { "kind": "channel", "name": "general" },
+    "activeSessions": [],
+    "recentMessages": [
+      { "author": "kawan", "kind": "bot", "threadId": null, "body": "Posted the benchmark screenshot above." }
+    ],
+    "heldMessages": [],
+    "incoming": { "author": "bob", "inThread": false, "body": "lgtm" },
+    "expected": { "destination": "none", "readiness": "dispatch" }
+  },
+  {
+    "id": "worker-thread-followup",
+    "botName": "kawan",
+    "conversation": { "kind": "channel", "name": "general" },
+    "activeSessions": [
+      {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "status": "running",
+        "task": "Fix flaky CI test in auth module",
+        "thread_id": "thread-1",
+        "last_report": "Found race condition in nonce cleanup, writing test now."
+      }
+    ],
+    "recentMessages": [
+      { "author": "kawan", "kind": "bot", "threadId": "thread-1", "body": "Found race condition in nonce cleanup, writing test now." }
+    ],
+    "heldMessages": [],
+    "incoming": { "author": "alice", "inThread": true, "matchesThreadSessionId": "11111111-1111-4111-8111-111111111111", "body": "Make sure you also check expired nonces in that test." },
+    "expected": { "destination": "session:11111111-1111-4111-8111-111111111111", "readiness": "dispatch" }
+  },
+  {
+    "id": "worker-thread-answer-question",
+    "botName": "kawan",
+    "conversation": { "kind": "channel", "name": "general" },
+    "activeSessions": [
+      {
+        "id": "22222222-2222-4222-8222-222222222222",
+        "status": "idle",
+        "task": "Update footer styling",
+        "thread_id": "thread-2",
+        "last_report": "Should the footer use 12px or 14px text?"
+      }
+    ],
+    "recentMessages": [
+      { "author": "kawan", "kind": "bot", "threadId": "thread-2", "body": "Should the footer use 12px or 14px text?" }
+    ],
+    "heldMessages": [],
+    "incoming": { "author": "alice", "inThread": true, "matchesThreadSessionId": "22222222-2222-4222-8222-222222222222", "body": "Use 12px and keep it muted gray." },
+    "expected": { "destination": "session:22222222-2222-4222-8222-222222222222", "readiness": "dispatch" }
+  },
+  {
+    "id": "unrelated-new-task-while-worker-active",
+    "botName": "kawan",
+    "conversation": { "kind": "channel", "name": "general" },
+    "activeSessions": [
+      {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "status": "running",
+        "task": "Fix flaky CI test in auth module",
+        "thread_id": "thread-1",
+        "last_report": "Working on auth test."
+      }
+    ],
+    "recentMessages": [],
+    "heldMessages": [],
+    "incoming": { "author": "bob", "inThread": false, "body": "@kawan please create a new worker to update README.md with setup instructions" },
+    "expected": { "destination": "orchestrator", "readiness": "dispatch" }
+  },
+  {
+    "id": "human-aside-while-worker-active",
+    "botName": "kawan",
+    "conversation": { "kind": "channel", "name": "general" },
+    "activeSessions": [
+      {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "status": "running",
+        "task": "Fix flaky CI test in auth module",
+        "thread_id": "thread-1",
+        "last_report": "Working on auth test."
+      }
+    ],
+    "recentMessages": [
+      { "author": "alice", "kind": "human", "threadId": null, "body": "Standup starts in 5 minutes" }
+    ],
+    "heldMessages": [],
+    "incoming": { "author": "bob", "inThread": false, "body": "On my way to the standup room" },
+    "expected": { "destination": "none", "readiness": "dispatch" }
+  },
+  {
+    "id": "bot-status-query",
+    "botName": "kawan",
+    "conversation": { "kind": "channel", "name": "general" },
+    "activeSessions": [
+      {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "status": "running",
+        "task": "Fix flaky CI test in auth module",
+        "thread_id": "thread-1",
+        "last_report": "Running tests"
+      }
+    ],
+    "recentMessages": [],
+    "heldMessages": [],
+    "incoming": { "author": "alice", "inThread": false, "body": "@kawan what are your workers currently doing?" },
+    "expected": { "destination": "orchestrator", "readiness": "dispatch" }
+  }
+]

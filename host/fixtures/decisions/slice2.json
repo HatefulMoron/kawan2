@@ -1,0 +1,110 @@
+{
+  "10715158d30f2dd29ee28d5f": {
+    "model": "subq-snap-1.2",
+    "answers": {
+      "destination": {
+        "type": "choice",
+        "choice": "orchestrator",
+        "probabilities": {
+          "none": 0.00020173723169136792,
+          "orchestrator": 0.9997982382774353
+        },
+        "confidence": 0.9995964765548706
+      },
+      "readiness": {
+        "type": "choice",
+        "choice": "dispatch",
+        "probabilities": {
+          "dispatch": 0.9885819554328918,
+          "hold": 0.011418032459914684
+        },
+        "confidence": 0.9771639108657837
+      }
+    },
+    "usage": {
+      "input_tokens": 524,
+      "output_tokens": 0
+    }
+  },
+  "85f6865a6eba3cae0839baf1": {
+    "model": "subq-snap-1.2",
+    "answers": {
+      "destination": {
+        "type": "choice",
+        "choice": "orchestrator",
+        "probabilities": {
+          "none": 0.00195971317589283,
+          "orchestrator": 0.9980402588844299
+        },
+        "confidence": 0.9960805177688599
+      },
+      "readiness": {
+        "type": "choice",
+        "choice": "hold",
+        "probabilities": {
+          "dispatch": 0.0006405257154256105,
+          "hold": 0.9993594288825989
+        },
+        "confidence": 0.9987188577651978
+      }
+    },
+    "usage": {
+      "input_tokens": 550,
+      "output_tokens": 0
+    }
+  },
+  "78f2f40d4965364f83c3349a": {
+    "model": "subq-snap-1.2",
+    "answers": {
+      "destination": {
+        "type": "choice",
+        "choice": "orchestrator",
+        "probabilities": {
+          "none": 0.0031127335969358683,
+          "orchestrator": 0.9968872666358948
+        },
+        "confidence": 0.9937745332717896
+      },
+      "readiness": {
+        "type": "choice",
+        "choice": "dispatch",
+        "probabilities": {
+          "dispatch": 0.9865031242370605,
+          "hold": 0.013496828265488148
+        },
+        "confidence": 0.9730062484741211
+      }
+    },
+    "usage": {
+      "input_tokens": 595,
+      "output_tokens": 0
+    }
+  },
+  "65acb599d2de05fe4b1c5bc4": {
+    "model": "subq-snap-1.2",
+    "answers": {
+      "destination": {
+        "type": "choice",
+        "choice": "none",
+        "probabilities": {
+          "none": 0.9930194020271301,
+          "orchestrator": 0.006980626378208399
+        },
+        "confidence": 0.9860388040542603
+      },
+      "readiness": {
+        "type": "choice",
+        "choice": "dispatch",
+        "probabilities": {
+          "dispatch": 0.9971615076065063,
+          "hold": 0.002838563174009323
+        },
+        "confidence": 0.9943230152130127
+      }
+    },
+    "usage": {
+      "input_tokens": 614,
+      "output_tokens": 0
+    }
+  }
+}

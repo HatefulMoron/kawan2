@@ -72,7 +72,7 @@ export function computeSetupStatus(db: KawanDb): SetupStatus {
 
 export type CommandHandler = (
   req: ClientRequest,
-  client: { user: UserRow },
+  client: { user: UserRow; emitError: (message: string, extra?: Record<string, unknown>) => void },
 ) => Promise<unknown> | unknown;
 
 export interface WsServerOptions {
@@ -422,7 +422,7 @@ export class KawanWsServer {
 
     // Authenticated commands
     try {
-      const data = await this.dispatchAuthenticated(conn.user, req);
+      const data = await this.dispatchAuthenticated(conn, req);
       this.sendFrame(conn.ws, {
         ...(reqId ? { id: reqId } : {}),
         type: "response",
@@ -442,11 +442,21 @@ export class KawanWsServer {
     }
   }
 
-  private async dispatchAuthenticated(user: UserRow, req: ClientRequest): Promise<unknown> {
+  private async dispatchAuthenticated(conn: ClientConn, req: ClientRequest): Promise<unknown> {
+    const user = conn.user!;
     const db = this.opts.db;
     const extra = this.opts.extraHandlers?.[req.type];
     if (extra) {
-      return await extra(req, { user });
+      return await extra(req, {
+        user,
+        emitError: (message, extraFields) => {
+          this.sendFrame(conn.ws, {
+            type: "error",
+            message,
+            ...(extraFields ?? {}),
+          });
+        },
+      });
     }
 
     switch (req.type) {
