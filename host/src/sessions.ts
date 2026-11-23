@@ -16,6 +16,7 @@ import {
   removeClone,
   runGit,
 } from "./git.js";
+import { REVIEW_CARD_SUMMARY_RULES } from "./prompts.js";
 import { composeSpawnSpec, materializeSessionAgentDir } from "./spawn.js";
 import { filterSoulForWorker } from "./soul.js";
 import type {
@@ -940,7 +941,9 @@ export class SessionManager {
       "- When delegating in a channel/DM, reply with at most one brief acknowledgement (e.g. 'On it.') or output NO_REPLY — live task status is already shown in the UI.",
       "- When collaborating with another bot in chat, reply only when you have substantive answers, feedback, or requested work; output NO_REPLY rather than sending empty pleasantries.",
       "- When a worker calls you with a question you can answer from conversation context or kawan://soul.md, reply to it directly with message_session(session_id, answer) and output NO_REPLY. Only ask the human in chat if you do not know.",
-      "- When a worker finishes or requests landing, post ONE concise human-friendly summary of what changed and how it was verified (and note it is ready for review/approval if awaiting land). Never mention internal session IDs, git branch names, commit hashes, or git plumbing unless explicitly asked.",
+      "- When a worker finishes or requests landing, write ONE review-card summary: rewrite the worker's implementation notes into the user-visible outcome, and note it is ready for review/approval if awaiting land. Follow the review-card summary rules below.",
+      "",
+      REVIEW_CARD_SUMMARY_RULES,
       "- Always check kawan://soul.md before claiming you do not know a project fact — durable project facts learned in earlier sessions live there.",
       "- If you receive an internal [worker-report] notice and nothing needs to be posted to humans, output exactly: NO_REPLY",
     ].join("\n");
@@ -952,10 +955,12 @@ export class SessionManager {
       `Task: ${_session.task}`,
       "Instructions:",
       "1. Inspect the repository, make the requested changes or collect the requested information, and verify your work.",
-      "2. You report ONLY to your orchestrator — your assistant text, report(), and land_request() calls are never shown directly to humans.",
+      "2. You report to your orchestrator, but the summary you give is what humans see in the Status view and approval cards. Write it for the person deciding whether to approve, not for a code reviewer.",
       "3. If blocked on an ambiguity or need human input, call `report(question)` and stop your turn so your orchestrator can answer or ask humans.",
-      "4. For code changes meant to land on the default branch, commit on your current branch (`git add` && `git commit`), verify cleanly (`git status`), and call `land_request(summary)` with a concise summary of what changed and how it was verified. Do NOT create/switch branches and do NOT run `git push`.",
-      "5. Call `report(text, artifact?)` if you are answering a read-only question, sharing findings, or attaching an evidence artifact.",
+      "4. For code changes meant to land on the default branch, commit on your current branch (`git add` && `git commit`), verify cleanly (`git status`), and call `land_request(summary)` using the review-card summary rules below. Do NOT create/switch branches and do NOT run `git push`.",
+      "5. Call `report(text, artifact?)` if you are answering a read-only question, sharing findings, or attaching an evidence artifact. When you finish, call `report()` with the summary or end your turn with it; otherwise your final assistant text becomes the review card.",
+      "",
+      REVIEW_CARD_SUMMARY_RULES,
     ].join("\n");
   }
 
@@ -966,12 +971,15 @@ export class SessionManager {
       "- You speak directly inside Issue #" + issue.number + " via report(text, artifact?) or normal replies.",
       "- Latest issue details, branch state, and checks are always attached at `kawan://issue.md`.",
       "- Humans or reviewer bots may critique changes, post findings, or update `kawan://issue.md`. Adapt cleanly, verify, commit on your branch, and reply concisely.",
+      "- Your final update also becomes the review card humans approve from, so close with the user-visible outcome even when the room discussion is technical. Follow the review-card summary rules below.",
       "- Do NOT call `land_request()` inside an issue session — commit on your branch, share your update, and let humans click Land when ready.",
       "- Keep the issue spec aligned with agreed changes using `update_issue(title?, body_md?)` when helpful.",
       "- Use `review_issue(focus?)` only if explicitly asked to launch a fresh read-only review pass against your own branch.",
       "- Use `ask_owner(question)` ONLY if blocked on an owner decision so the owner is pinged directly.",
       "- Use `sync_with_main()` when requested or if behind default branch.",
       "- Do NOT create/switch branches or run git push.",
+      "",
+      REVIEW_CARD_SUMMARY_RULES,
       `Current specification:\n${issue.body_md || "(No markdown specification provided yet.)"}`,
     ].join("\n");
   }
@@ -2058,7 +2066,9 @@ export class SessionManager {
             "Remember: ONLY you represent the bot in chat (this report was not shown to humans).",
             "- If the worker asked a question you can answer from conversation context or kawan://soul.md, call `message_session(session_id, answer)` and output NO_REPLY.",
             "- If you need human input to unblock the worker, ask concisely in chat.",
-            "- If the worker completed the task or requested landing (`land_approval=pending`), share ONE concise human-friendly summary (prefer 1-3 sentences of plain prose; mention it is ready for review/approval if pending). If there are detailed multi-file changes or verification logs worth inspecting, you can attach them via `report(summary, { filename: 'report.md', mime_type: 'text/markdown', content: details })` so they open in an expandable report card. Omit internal session IDs, branch names, commit hashes, and git plumbing.",
+            "- If the worker completed the task or requested landing (`land_approval=pending`), write ONE review-card summary using the rules below; mention it is ready for review/approval if pending. If the worker attached a screenshot or image, just call `report()` normally; the most recent worker artifact is linked to your message automatically.",
+            "",
+            REVIEW_CARD_SUMMARY_RULES,
             "- If a durable project fact, agreement, or decision was uncovered, save it via `soul_replace` or `soul_write`.",
           ].join("\n"),
           session.id,

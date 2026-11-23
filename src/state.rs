@@ -845,8 +845,14 @@ impl KawanApp {
                     }
                     for art in res.artifacts {
                         let aid = art.id.clone();
+                        let is_image = art.mime_type.starts_with("image/");
+                        let belongs_to_worker = art
+                            .session_id
+                            .as_deref()
+                            .and_then(|sid| self.sessions_by_id.get(sid))
+                            .is_some_and(|sess| sess.kind == "worker");
                         let should_fetch = !self.loaded_artifacts.contains_key(&aid)
-                            && !art.mime_type.starts_with("image/");
+                            && (!is_image || belongs_to_worker);
                         self.artifacts_by_id.insert(aid.clone(), art);
                         if should_fetch && !self.is_mock {
                             self.send_cmd("artifact.get", json!({ "artifact_id": aid }));

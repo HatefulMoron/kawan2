@@ -2,7 +2,7 @@
 //! (Needs You, Waiting to Land, In Flight, Shipped) sharing the conversation chrome.
 
 use gpui::prelude::*;
-use gpui::{AnyElement, Context, Div, div, px, relative};
+use gpui::{AnyElement, Context, Div, div, img, px, relative};
 
 use crate::kit;
 use crate::protocol::{Artifact, IssueSummary, Land, SessionSummary};
@@ -75,6 +75,31 @@ fn find_report_artifact<'a>(
             std::cmp::Reverse(a.created_at),
         )
     });
+    candidates.into_iter().next()
+}
+
+fn find_evidence_image<'a>(
+    app: &'a KawanApp,
+    sess: &SessionSummary,
+    land: Option<&Land>,
+) -> Option<&'a Artifact> {
+    let mut candidates: Vec<&Artifact> = app
+        .artifacts_by_id
+        .values()
+        .filter(|a| {
+            a.session_id.as_deref() == Some(sess.id.as_str()) && a.mime_type.starts_with("image/")
+        })
+        .collect();
+    if candidates.is_empty()
+        && let Some(mid) = land.and_then(|l| l.message_id.as_deref())
+    {
+        candidates = app
+            .artifacts_by_id
+            .values()
+            .filter(|a| a.message_id.as_deref() == Some(mid) && a.mime_type.starts_with("image/"))
+            .collect();
+    }
+    candidates.sort_by_key(|a| std::cmp::Reverse(a.created_at));
     candidates.into_iter().next()
 }
 
@@ -473,6 +498,19 @@ fn expandable_report_block(app: &KawanApp, artifact: &Artifact, theme: &Theme) -
     )
 }
 
+fn evidence_image_block(app: &KawanApp, artifact: &Artifact, theme: &Theme) -> Option<Div> {
+    let image = app.loaded_artifacts.get(&artifact.id)?.image.as_ref()?;
+    Some(
+        div()
+            .w_full()
+            .p(px(10.0))
+            .bg(theme.surface)
+            .border_t_1()
+            .border_color(theme.border_subtle)
+            .child(img(image.clone()).w_full().max_h(px(240.0))),
+    )
+}
+
 fn status_issue_needs_input_card(
     app: &KawanApp,
     idx: usize,
@@ -581,6 +619,7 @@ fn status_task_card(
         .and_then(|l| l.thread_id.as_deref())
         .or(sess.thread_id.as_deref());
     let report_art = find_report_artifact(app, sess, land);
+    let evidence_image = find_evidence_image(app, sess, land);
     let sid_changes = sess.id.clone();
     let sid_inspect = sess.id.clone();
     let sid_promote = sess.id.clone();
@@ -668,6 +707,12 @@ fn status_task_card(
         && let Some(preview) = expandable_report_block(app, art, theme)
     {
         card = card.child(preview);
+    }
+
+    if let Some(art) = evidence_image
+        && let Some(block) = evidence_image_block(app, art, theme)
+    {
+        card = card.child(block);
     }
 
     let report_btn_id = if prefix == "st-needs" {
@@ -1018,6 +1063,7 @@ fn status_shipped_card(
             .unwrap_or_else(|| "Landed".to_string())
     };
     let report_art = sess.and_then(|s| find_report_artifact(app, s, Some(land)));
+    let evidence_image = sess.and_then(|s| find_evidence_image(app, s, Some(land)));
     let sid_changes = land.session_id.clone();
     let sid_inspect = land.session_id.clone();
 
@@ -1072,6 +1118,12 @@ fn status_shipped_card(
         && let Some(preview) = expandable_report_block(app, art, theme)
     {
         card = card.child(preview);
+    }
+
+    if let Some(art) = evidence_image
+        && let Some(block) = evidence_image_block(app, art, theme)
+    {
+        card = card.child(block);
     }
 
     let mut footer_actions = div().flex().items_center().gap(px(6.0));

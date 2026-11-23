@@ -228,7 +228,7 @@ pub fn populate_mock(app: &mut KawanApp) {
             pi_session_file: None,
             last_entry_id: None,
             last_report: Some(
-                "Added live countdown chip and immediate dispatch button.".to_string(),
+                "Hold expiry now counts down on screen, with a Send Now button to dispatch immediately.".to_string(),
             ),
             soul_snapshot: None,
             created_at: 40,
@@ -254,7 +254,7 @@ pub fn populate_mock(app: &mut KawanApp) {
             pi_session_file: None,
             last_entry_id: None,
             last_report: Some(
-                "All 42 unit tests pass; open FD count dropped from 312 to 18.".to_string(),
+                "Finished runs now release their connections, so long sessions no longer leak file handles. Checks pass.".to_string(),
             ),
             soul_snapshot: None,
             created_at: 100,
@@ -278,7 +278,7 @@ pub fn populate_mock(app: &mut KawanApp) {
             agent_dir: None,
             pi_session_file: None,
             last_entry_id: None,
-            last_report: Some("03-test failed on bare repo allowed_signers check".to_string()),
+            last_report: Some("Signature verification is failing on the bare repository; landing stays blocked until it is fixed.".to_string()),
             soul_snapshot: None,
             created_at: 210,
             updated_at: 220,
@@ -803,7 +803,7 @@ pub fn populate_mock(app: &mut KawanApp) {
             pi_session_file: None,
             last_entry_id: None,
             last_report: Some(
-                "Split stdout/stderr buffers; one timeout test still failing.".to_string(),
+                "Check output is captured cleanly, but one timeout case still fails.".to_string(),
             ),
             soul_snapshot: None,
             created_at: 250,
@@ -828,7 +828,7 @@ pub fn populate_mock(app: &mut KawanApp) {
             pi_session_file: None,
             last_entry_id: None,
             last_report: Some(
-                "Implemented token budget ledger and warning notifications.".to_string(),
+                "Sessions now track token budgets and warn before they run out.".to_string(),
             ),
             soul_snapshot: None,
             created_at: 240,
@@ -852,7 +852,9 @@ pub fn populate_mock(app: &mut KawanApp) {
             agent_dir: None,
             pi_session_file: None,
             last_entry_id: None,
-            last_report: Some("Added .kawan/checks/00-fmt.sh and landed on main.".to_string()),
+            last_report: Some(
+                "Formatting is now checked automatically before changes land.".to_string(),
+            ),
             soul_snapshot: None,
             created_at: 230,
             updated_at: 235,

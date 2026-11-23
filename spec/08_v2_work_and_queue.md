@@ -106,14 +106,22 @@ ad-hoc chat work, arranged top to bottom by attention priority:
    `ask_owner` question, failed sessions/lands, pending spawn approvals, or a
    paused Merge Queue banner linking into `#merge-queue`.
 2. **Waiting to Land:** finished ad-hoc sessions requesting land and Merge Queue
-   items currently `queued` / `rebasing` / `verifying`, showing checks, an
+   items currently `queued` / `rebasing` / `verifying`, leading with a concise
+   user-facing changelog summary (user-visible outcome, not file-level
+   implementation) plus any attached screenshot evidence, showing checks, an
    expandable `report.md`, origin link, and one-click `Approve Land` / queue links.
 3. **In Flight:** currently running or active worker sessions and open active
    issues (including active read-only reviewer passes), showing concrete activity
    (working, reviewing, idle branch with commits/checks) and click-to-inspect.
-4. **Shipped:** reverse-chronological changelog of landed work centered on task
-   title, participants, timestamp, origin link, and expandable `report.md`—keeping
+4. **Shipped:** reverse-chronological changelog of landed work centered on a
+   short user-facing outcome summary, task title, participants, timestamp, origin
+   link, screenshot evidence when attached, and an expandable `report.md`—keeping
    raw branches and commit SHAs tucked behind on-demand inspection.
+
+Every review card is written for the person approving from the card, not for
+someone reading the diff: 1-3 sentences of plain-language change, with file
+names, markup, logs, branches, and commits left to `report.md` or the Changes
+drawer. Visual changes carry a screenshot artifact on the card.
 
 ### Two-Tier Unread & Attention (`read_cursors`)
 
