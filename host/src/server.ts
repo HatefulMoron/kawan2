@@ -13,6 +13,7 @@ import {
 } from "./decisions.js";
 import { attachRepository, ensureHostSshKey, generateBotKeypair } from "./git.js";
 import { serializeSession, SessionManager, type SoulHandlers } from "./sessions.js";
+import { createSoulHandlers, INITIAL_SOUL_DOCUMENT } from "./soul.js";
 import type {
   ConversationRow,
   HostSettings,
@@ -22,23 +23,6 @@ import type {
   UserRow,
 } from "./types.js";
 import { computeSetupStatus, KawanWsServer, type CommandHandler } from "./ws.js";
-
-export const INITIAL_SOUL_DOCUMENT = `## Working agreements
-
-- Keep changes focused, commit with clear messages, and verify before requesting land.
-
-## Project facts
-
-- Repository facts discovered during sessions go here.
-
-## Decisions
-
-- Key architectural choices and tradeoffs go here.
-
-## Preferences
-
-- Human communication and workflow preferences go here.
-`;
 
 export interface DispatchEvent {
   bot: UserRow;
@@ -739,7 +723,7 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
     db,
     wsServer,
     disableSandbox: opts.disableSandbox,
-    soulHandlers: opts.soulHandlers,
+    soulHandlers: opts.soulHandlers ?? createSoulHandlers(db),
   });
   await sessionManager.start();
 

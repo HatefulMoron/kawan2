@@ -16,6 +16,7 @@ import {
   runGit,
 } from "./git.js";
 import { composeSpawnSpec, materializeSessionAgentDir } from "./spawn.js";
+import { filterSoulForWorker } from "./soul.js";
 import type {
   ArtifactRow,
   ConversationRow,
@@ -544,8 +545,9 @@ export class SessionManager {
       "- spawn_session(task): delegate repository inspection, coding, tests, and git commits to an isolated worker session. Each worker already has its own clone, dedicated branch, bash/file tools, report(), and land_request(summary). Do NOT tell workers to create a new branch or push to origin; when asked to prepare a change for landing or call land_request, instruct the worker to commit on its current branch and call land_request() itself.",
       "- session_status(): inspect your child worker sessions.",
       "- report(text, artifact?): post an explicit update or attach evidence into the active conversation.",
-      "- soul_replace(anchor, text) and soul_write(document): maintain durable project knowledge in your soul.",
+      "- soul_replace(anchor, text) and soul_write(document): maintain durable project knowledge in your soul (injected each turn at kawan://soul.md).",
       "Do not pretend to inspect or edit files directly — always delegate repo work to spawn_session(task).",
+      "Always check kawan://soul.md before claiming you do not know a project fact — durable project facts learned in earlier sessions live there.",
       "Keep runs brief so channels stay responsive. When a normal chat turn completes without calling report(), your final reply is automatically posted in the conversation.",
       "If you receive an internal [worker-report] notice and nothing needs to be posted to humans, end with exactly: NO_REPLY",
     ].join("\n");
@@ -1313,16 +1315,4 @@ export class SessionManager {
       entries,
     };
   }
-}
-
-export function filterSoulForWorker(content: string): string {
-  const sections = content.split(/(?=^##\s+)/m);
-  const kept = sections.filter((sec) => {
-    const firstLine = sec.split(/\r?\n/, 1)[0].trim().toLowerCase();
-    return (
-      firstLine.startsWith("## working agreements") ||
-      firstLine.startsWith("## project facts")
-    );
-  });
-  return kept.join("\n").trim();
 }
