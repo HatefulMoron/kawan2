@@ -428,7 +428,7 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
           : defaultRole.thinking_level ?? "medium";
       const persona = typeof req.persona === "string" ? req.persona : null;
       const sandboxEnabled = req.sandbox_enabled === undefined ? true : Boolean(req.sandbox_enabled);
-      const sandboxNetwork = req.sandbox_network === undefined ? false : Boolean(req.sandbox_network);
+      const sandboxNetwork = req.sandbox_network === undefined ? true : Boolean(req.sandbox_network);
 
       const botId = randomUUID();
       const slug = name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-") || "bot";
@@ -483,21 +483,34 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
       const nextPersona =
         req.persona !== undefined ? (req.persona === null ? null : String(req.persona)) : existing.persona;
       const personaChanged = req.persona !== undefined && nextPersona !== existing.persona;
-      const prevOrch = personaChanged ? db.getActiveOrchestratorSession(botId) : null;
+      const nextModel =
+        typeof req.model === "string" && req.model.trim() ? req.model.trim() : undefined;
+      const nextThinking =
+        typeof req.thinking_level === "string" && req.thinking_level.trim()
+          ? req.thinking_level.trim()
+          : undefined;
+      const nextSandboxEnabled =
+        req.sandbox_enabled !== undefined ? Boolean(req.sandbox_enabled) : undefined;
+      const nextSandboxNetwork =
+        req.sandbox_network !== undefined ? Boolean(req.sandbox_network) : undefined;
+      const runtimeChanged =
+        (nextModel !== undefined && nextModel !== existing.model) ||
+        (nextThinking !== undefined && nextThinking !== existing.thinking_level) ||
+        (nextSandboxEnabled !== undefined &&
+          nextSandboxEnabled !== Boolean(existing.sandbox_enabled)) ||
+        (nextSandboxNetwork !== undefined &&
+          nextSandboxNetwork !== Boolean(existing.sandbox_network));
+      const prevOrch =
+        personaChanged || runtimeChanged ? db.getActiveOrchestratorSession(botId) : null;
 
       const { bot, session } = db.transaction(() => {
         const updated = db.updateBot(botId, {
           name: typeof req.name === "string" && req.name.trim() ? req.name.trim() : undefined,
           persona: req.persona !== undefined ? nextPersona : undefined,
-          model: typeof req.model === "string" && req.model.trim() ? req.model.trim() : undefined,
-          thinking_level:
-            typeof req.thinking_level === "string" && req.thinking_level.trim()
-              ? req.thinking_level.trim()
-              : undefined,
-          sandbox_enabled:
-            req.sandbox_enabled !== undefined ? Boolean(req.sandbox_enabled) : undefined,
-          sandbox_network:
-            req.sandbox_network !== undefined ? Boolean(req.sandbox_network) : undefined,
+          model: nextModel,
+          thinking_level: nextThinking,
+          sandbox_enabled: nextSandboxEnabled,
+          sandbox_network: nextSandboxNetwork,
         })!;
 
         let activeOrch = db.getActiveOrchestratorSession(botId);
@@ -514,7 +527,7 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
         return { bot: updated, session: activeOrch };
       });
 
-      if (personaChanged && prevOrch) {
+      if ((personaChanged || runtimeChanged) && prevOrch) {
         await sessionManager.stopSession(prevOrch.id);
       }
 

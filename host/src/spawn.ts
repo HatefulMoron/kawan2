@@ -171,7 +171,21 @@ export function composeSpawnSpec(params: ComposeSpawnParams): ComposedSpawnSpec 
     }
   }
 
-  if (!params.bot.sandbox_network) {
+  if (params.bot.sandbox_network) {
+    try {
+      const resolvedResolv = realpathSync("/etc/resolv.conf");
+      if (!resolvedResolv.startsWith("/etc/") && existsSync(resolvedResolv)) {
+        const resolvDir = dirname(resolvedResolv);
+        if (resolvDir.startsWith("/run/")) {
+          bwrapArgs.push("--ro-bind", resolvDir, resolvDir);
+        } else {
+          bwrapArgs.push("--ro-bind", resolvedResolv, resolvedResolv);
+        }
+      }
+    } catch {
+      // /etc/resolv.conf absent or unreadable
+    }
+  } else {
     bwrapArgs.push("--unshare-net");
   }
 

@@ -110,3 +110,84 @@ test("bwrap spawn wrapper isolates host ~/.pi and launches pi inside sandbox", a
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("bwrap with sandbox_network enabled exposes /etc/resolv.conf and omits --unshare-net", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "kawan-bwrap-net-"));
+  const agentDir = join(dir, "agent");
+  const sessionDir = join(dir, "pi-sessions");
+  const cwd = join(dir, "work");
+  const sockDir = join(dir, "sock");
+  mkdirSync(cwd, { recursive: true });
+  mkdirSync(sockDir, { recursive: true });
+
+  const settings = {
+    providers: {
+      stub: {
+        baseUrl: "http://127.0.0.1:9999/v1",
+        api: "openai-completions" as const,
+        apiKey: "test-key",
+        models: [
+          {
+            id: "stub-model",
+            name: "stub-model",
+            reasoning: false,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 128000,
+            maxTokens: 16384,
+          },
+        ],
+      },
+    },
+    roles: {
+      default: { provider: "stub", model: "stub-model", thinking_level: "medium" },
+    },
+  };
+
+  materializeSessionAgentDir(agentDir, settings);
+
+  const spec = composeSpawnSpec({
+    role: "worker",
+    bot: {
+      id: "bot-net",
+      kind: "bot",
+      role: "member",
+      name: "kawan",
+      email: "kawan@kawan.local",
+      persona: null,
+      model: "stub/stub-model",
+      thinking_level: "medium",
+      sandbox_enabled: 1,
+      sandbox_network: 1,
+      signing_key_path: null,
+      signing_pubkey: null,
+      created_at: 0,
+    },
+    settings,
+    agentDir,
+    sessionDir,
+    cwd,
+    socketPath: join(sockDir, "host.sock"),
+    extensionPath: resolve("src/extension/index.ts"),
+    sessionToken: "tok",
+    systemPrompt: "test",
+    disableSandbox: false,
+  });
+
+  try {
+    assert.equal(spec.command, "bwrap");
+    assert.ok(!spec.args.includes("--unshare-net"));
+
+    const sepIdx = spec.args.indexOf("--");
+    assert.ok(sepIdx >= 0);
+    const resolvArgs = [
+      ...spec.args.slice(0, sepIdx + 1),
+      "/bin/sh",
+      "-c",
+      "test -r /etc/resolv.conf && grep -q nameserver /etc/resolv.conf && echo ok",
+    ];
+    const res = await execFileAsync("bwrap", resolvArgs, { env: spec.env, timeout: 10_000 });
+    assert.equal(res.stdout.trim(), "ok");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

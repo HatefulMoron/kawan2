@@ -35,7 +35,7 @@ const SCHEMA_MIGRATIONS: Array<{ version: number; sql: string }> = [
         model TEXT,
         thinking_level TEXT,
         sandbox_enabled INTEGER NOT NULL DEFAULT 1,
-        sandbox_network INTEGER NOT NULL DEFAULT 0,
+        sandbox_network INTEGER NOT NULL DEFAULT 1,
         signing_key_path TEXT,
         signing_pubkey TEXT,
         created_at INTEGER NOT NULL
@@ -317,7 +317,7 @@ export class KawanDb {
         input.model ?? null,
         input.thinking_level ?? null,
         input.sandbox_enabled === false ? 0 : 1,
-        input.sandbox_network ? 1 : 0,
+        input.sandbox_network === false ? 0 : 1,
         input.signing_key_path ?? null,
         input.signing_pubkey ?? null,
         now,

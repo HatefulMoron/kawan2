@@ -238,7 +238,7 @@ impl KawanApp {
             bot_model_input: String::new(),
             bot_thinking_input: "medium".to_string(),
             bot_sandbox_enabled: true,
-            bot_sandbox_network: false,
+            bot_sandbox_network: true,
 
             invite_note_input: String::new(),
             last_invite_link: None,
