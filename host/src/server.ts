@@ -587,6 +587,9 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
         mergeQueue.ensureConversation();
         mergeQueue.broadcastSnapshot();
       }
+      for (const openIssue of db.listIssues({ status: "open" })) {
+        db.addMember(openIssue.conversation_id, bot.id);
+      }
       wsServer.broadcast({ type: "bot.update", bot: botPayload });
       return { bot: botPayload, session: serializeSession(session) };
     },
@@ -851,9 +854,6 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
     "issue.create": (req, client) => {
       const title = String(req.title ?? "").trim();
       if (!title) throw new Error("title is required");
-      const reviewers = Array.isArray(req.reviewers)
-        ? (req.reviewers as Array<{ bot_id: string; focus?: string | null }>)
-        : undefined;
       return issueManager.createIssue({
         title,
         bodyMd: typeof req.body_md === "string" ? req.body_md : "",
@@ -861,13 +861,6 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
         implementerBotId:
           typeof req.implementer_bot_id === "string" ? req.implementer_bot_id : null,
         parentIssueId: typeof req.parent_issue_id === "string" ? req.parent_issue_id : null,
-        autoStartReview: Boolean(req.auto_start_review),
-        landingMode:
-          req.landing_mode === "auto" || req.landing_mode === "manual"
-            ? req.landing_mode
-            : undefined,
-        maxRounds: typeof req.max_rounds === "number" ? req.max_rounds : undefined,
-        reviewers,
       });
     },
 
@@ -880,9 +873,6 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
     "issue.update": (req) => {
       const ref = (req.issue_id ?? req.number ?? "") as string | number;
       if (!ref) throw new Error("issue_id or number is required");
-      const reviewers = Array.isArray(req.reviewers)
-        ? (req.reviewers as Array<{ bot_id: string; focus?: string | null }>)
-        : undefined;
       const issue = issueManager.updateIssue(ref, {
         title: typeof req.title === "string" ? req.title : undefined,
         body_md: typeof req.body_md === "string" ? req.body_md : undefined,
@@ -893,39 +883,8 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
             : (req.implementer_bot_id as string | null),
         parent_issue_id:
           req.parent_issue_id === undefined ? undefined : (req.parent_issue_id as string | null),
-        auto_start_review:
-          typeof req.auto_start_review === "boolean" ? req.auto_start_review : undefined,
-        landing_mode:
-          req.landing_mode === "auto" || req.landing_mode === "manual"
-            ? req.landing_mode
-            : undefined,
-        max_rounds: typeof req.max_rounds === "number" ? req.max_rounds : undefined,
-        reviewers,
       });
       return { issue };
-    },
-
-    "issue.assign": async (req, client) => {
-      const ref = (req.issue_id ?? req.number ?? "") as string | number;
-      if (!ref) throw new Error("issue_id or number is required");
-      const reviewers = Array.isArray(req.reviewers)
-        ? (req.reviewers as Array<{ bot_id: string; focus?: string | null }>)
-        : undefined;
-      return await issueManager.assignAndRun({
-        issueRef: ref,
-        implementerBotId:
-          typeof req.implementer_bot_id === "string" ? req.implementer_bot_id : undefined,
-        ownerId: typeof req.owner_id === "string" ? req.owner_id : client.user.id,
-        autoStartReview:
-          typeof req.auto_start_review === "boolean" ? req.auto_start_review : undefined,
-        landingMode:
-          req.landing_mode === "auto" || req.landing_mode === "manual"
-            ? req.landing_mode
-            : undefined,
-        maxRounds: typeof req.max_rounds === "number" ? req.max_rounds : undefined,
-        reviewers,
-        prompt: typeof req.prompt === "string" ? req.prompt : undefined,
-      });
     },
 
     "issue.promote": async (req, client) => {
@@ -945,16 +904,10 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
       return await issueManager.syncWithMain(ref);
     },
 
-    "issue.start_review": async (req) => {
+    "issue.land": async (req, client) => {
       const ref = (req.issue_id ?? req.number ?? "") as string | number;
       if (!ref) throw new Error("issue_id or number is required");
-      return await issueManager.startReviewCycle(ref);
-    },
-
-    "issue.return_to_collaborate": (req) => {
-      const ref = (req.issue_id ?? req.number ?? "") as string | number;
-      if (!ref) throw new Error("issue_id or number is required");
-      return { issue: issueManager.returnToCollaborate(ref) };
+      return await issueManager.landIssue(ref, client.user.id);
     },
 
     "issue.stop": async (req) => {
@@ -970,153 +923,172 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
     },
   };
 
+  const routeIncomingMessage = async ({
+    conversation,
+    message,
+    author,
+  }: {
+    conversation: ConversationRow;
+    message: MessageRow;
+    author: UserRow;
+  }): Promise<void> => {
+    if (conversation.kind === "merge_queue" && author.kind !== "human") return;
+    if (
+      author.kind === "human" &&
+      conversation.kind === "merge_queue" &&
+      mergeQueue.tryRouteIncidentMessage(conversation, message, author)
+    ) {
+      return;
+    }
+    if (
+      author.kind === "human" &&
+      conversation.kind === "issue" &&
+      issueManager.tryRouteNeedsInputReply(conversation, message, author)
+    ) {
+      return;
+    }
+    const members = db.listMembers(conversation.id);
+    const bots = members.filter((m) => m.kind === "bot");
+    if (bots.length === 0) return;
+
+    const settings = db.getHostSettings();
+    const decisionConfig = settings.roles.decision;
+
+    for (const bot of bots) {
+      if (bot.id === author.id) continue;
+      if (!decisionConfig?.baseUrl || !decisionConfig?.model || !decisionConfig?.apiKey) {
+        wsServer.broadcastToConversation(conversation, {
+          type: "error",
+          conversation_id: conversation.id,
+          message_id: message.id,
+          bot_id: bot.id,
+          message: `Bot ${bot.name} cannot route message: decision model is not configured`,
+        });
+        continue;
+      }
+
+      const recentRows = db.listRecentMessages(conversation.id, 15).filter((m) => m.id !== message.id);
+      const recentMessages = recentRows.map((m) => {
+        const u = db.getUser(m.author_id);
+        return {
+          message: m,
+          authorName: u?.name ?? "unknown",
+          authorKind: u?.kind ?? "human",
+        };
+      });
+      const heldRows = db.listHeldDecisions(conversation.id, bot.id);
+      const heldMessages = heldRows.map((h) => {
+        const u = db.getUser(h.message.author_id);
+        return {
+          message: h.message,
+          authorName: u?.name ?? "unknown",
+        };
+      });
+      const activeSessions = db.listActiveWorkerSessions(bot.id, conversation.id);
+
+      let result;
+      try {
+        result = await routeMessage({
+          decisionConfig,
+          bot,
+          conversation,
+          incomingMessage: message,
+          incomingAuthor: author,
+          recentMessages,
+          heldMessages,
+          activeSessions,
+          mode: decisionMode,
+          fixtureStore,
+        });
+      } catch (err) {
+        wsServer.broadcastToConversation(conversation, {
+          type: "error",
+          conversation_id: conversation.id,
+          message_id: message.id,
+          bot_id: bot.id,
+          message: err instanceof Error ? err.message : String(err),
+        });
+        continue;
+      }
+
+      const shouldDispatchNow =
+        result.destination !== "none" && result.readiness === "dispatch";
+      const isHeld = result.destination !== "none" && result.readiness === "hold";
+      const heldBatchId =
+        shouldDispatchNow && heldRows.length > 0 ? randomUUID() : null;
+      const holdExpiresAt = isHeld && holdTimeoutMs > 0 ? Date.now() + holdTimeoutMs : null;
+
+      let updatedHeld: DecisionRow[] = [];
+      const decision = db.transaction(() => {
+        if (shouldDispatchNow && heldRows.length > 0) {
+          updatedHeld = db.markDecisionsDispatched(
+            heldRows.map((h) => h.id),
+            heldBatchId,
+          );
+        } else if (isHeld && heldRows.length > 0) {
+          updatedHeld = db.updateHeldExpiry(
+            heldRows.map((h) => h.id),
+            holdExpiresAt,
+          );
+        }
+        return db.createDecision({
+          conversationId: conversation.id,
+          messageId: message.id,
+          botId: bot.id,
+          decisionType: "route_message",
+          destination: result.destination,
+          readiness: result.readiness,
+          confidence: result.confidence,
+          reason: result.reason,
+          rawJson: result.rawJson,
+          heldBatchId,
+          dispatched: !isHeld,
+          holdExpiresAt,
+          explicitWorkStart: result.explicitWorkStart,
+          workRequest: result.workRequest,
+        });
+      });
+
+      wsServer.broadcastToConversation(conversation, {
+        type: "decision.new",
+        decision,
+      });
+      for (const hd of updatedHeld) {
+        wsServer.broadcastToConversation(conversation, {
+          type: "decision.new",
+          decision: hd,
+        });
+      }
+
+      if (isHeld && holdTimeoutMs > 0) {
+        scheduleHoldTimer(conversation.id, bot.id, holdTimeoutMs);
+      }
+
+      if (shouldDispatchNow) {
+        cancelHoldTimer(conversation.id, bot.id);
+        const batchMessages = [...heldRows.map((h) => h.message), message];
+        await dispatchEvent({
+          bot,
+          destination: result.destination,
+          conversation,
+          threadId: message.thread_id,
+          messages: batchMessages,
+          spawnIntent: {
+            explicitWorkStart: result.explicitWorkStart,
+            workRequest: result.workRequest,
+          },
+        });
+      }
+    }
+  };
+
   wsServer = new KawanWsServer(wss, {
     db,
     hostNamespace: opts.hostNamespace ?? hostAddress,
     hostAddress,
     recordProtocolPath: opts.recordProtocolPath,
     extraHandlers,
-    onMessageCreated: async ({ conversation, message, author }) => {
-      if (author.kind !== "human") return;
-      if (conversation.kind === "merge_queue" && mergeQueue.tryRouteIncidentMessage(conversation, message, author)) {
-        return;
-      }
-      if (conversation.kind === "issue" && issueManager.tryRouteNeedsInputReply(conversation, message, author)) {
-        return;
-      }
-      const members = db.listMembers(conversation.id);
-      const bots = members.filter((m) => m.kind === "bot");
-      if (bots.length === 0) return;
-
-      const settings = db.getHostSettings();
-      const decisionConfig = settings.roles.decision;
-
-      for (const bot of bots) {
-        if (!decisionConfig?.baseUrl || !decisionConfig?.model || !decisionConfig?.apiKey) {
-          wsServer.broadcastToConversation(conversation, {
-            type: "error",
-            conversation_id: conversation.id,
-            message_id: message.id,
-            bot_id: bot.id,
-            message: `Bot ${bot.name} cannot route message: decision model is not configured`,
-          });
-          continue;
-        }
-
-        const recentRows = db.listRecentMessages(conversation.id, 15).filter((m) => m.id !== message.id);
-        const recentMessages = recentRows.map((m) => {
-          const u = db.getUser(m.author_id);
-          return {
-            message: m,
-            authorName: u?.name ?? "unknown",
-            authorKind: u?.kind ?? "human",
-          };
-        });
-        const heldRows = db.listHeldDecisions(conversation.id, bot.id);
-        const heldMessages = heldRows.map((h) => {
-          const u = db.getUser(h.message.author_id);
-          return {
-            message: h.message,
-            authorName: u?.name ?? "unknown",
-          };
-        });
-        const activeSessions = db.listActiveWorkerSessions(bot.id, conversation.id);
-
-        let result;
-        try {
-          result = await routeMessage({
-            decisionConfig,
-            bot,
-            conversation,
-            incomingMessage: message,
-            incomingAuthor: author,
-            recentMessages,
-            heldMessages,
-            activeSessions,
-            mode: decisionMode,
-            fixtureStore,
-          });
-        } catch (err) {
-          wsServer.broadcastToConversation(conversation, {
-            type: "error",
-            conversation_id: conversation.id,
-            message_id: message.id,
-            bot_id: bot.id,
-            message: err instanceof Error ? err.message : String(err),
-          });
-          continue;
-        }
-
-        const shouldDispatchNow =
-          result.destination !== "none" && result.readiness === "dispatch";
-        const isHeld = result.destination !== "none" && result.readiness === "hold";
-        const heldBatchId =
-          shouldDispatchNow && heldRows.length > 0 ? randomUUID() : null;
-        const holdExpiresAt = isHeld && holdTimeoutMs > 0 ? Date.now() + holdTimeoutMs : null;
-
-        let updatedHeld: DecisionRow[] = [];
-        const decision = db.transaction(() => {
-          if (shouldDispatchNow && heldRows.length > 0) {
-            updatedHeld = db.markDecisionsDispatched(
-              heldRows.map((h) => h.id),
-              heldBatchId,
-            );
-          } else if (isHeld && heldRows.length > 0) {
-            updatedHeld = db.updateHeldExpiry(
-              heldRows.map((h) => h.id),
-              holdExpiresAt,
-            );
-          }
-          return db.createDecision({
-            conversationId: conversation.id,
-            messageId: message.id,
-            botId: bot.id,
-            decisionType: "route_message",
-            destination: result.destination,
-            readiness: result.readiness,
-            confidence: result.confidence,
-            reason: result.reason,
-            rawJson: result.rawJson,
-            heldBatchId,
-            dispatched: !isHeld,
-            holdExpiresAt,
-            explicitWorkStart: result.explicitWorkStart,
-            workRequest: result.workRequest,
-          });
-        });
-
-        wsServer.broadcastToConversation(conversation, {
-          type: "decision.new",
-          decision,
-        });
-        for (const hd of updatedHeld) {
-          wsServer.broadcastToConversation(conversation, {
-            type: "decision.new",
-            decision: hd,
-          });
-        }
-
-        if (isHeld && holdTimeoutMs > 0) {
-          scheduleHoldTimer(conversation.id, bot.id, holdTimeoutMs);
-        }
-
-        if (shouldDispatchNow) {
-          cancelHoldTimer(conversation.id, bot.id);
-          const batchMessages = [...heldRows.map((h) => h.message), message];
-          await dispatchEvent({
-            bot,
-            destination: result.destination,
-            conversation,
-            threadId: message.thread_id,
-            messages: batchMessages,
-            spawnIntent: {
-              explicitWorkStart: result.explicitWorkStart,
-              workRequest: result.workRequest,
-            },
-          });
-        }
-      }
-    },
+    onMessageCreated: routeIncomingMessage,
   });
 
   sessionManager = new SessionManager({
@@ -1126,6 +1098,7 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
     disableSandbox: opts.disableSandbox,
     soulHandlers: opts.soulHandlers ?? createSoulHandlers(db),
   });
+  sessionManager.setBotMessageCallback(routeIncomingMessage);
   await sessionManager.start();
   mergeQueue = new MergeQueueManager({
     dataDir: opts.dataDir,

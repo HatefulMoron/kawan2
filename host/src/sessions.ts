@@ -23,9 +23,7 @@ import type {
   ConversationRow,
   IssueRow,
   LandRow,
-  LandingMode,
   MessageRow,
-  ReviewVerdict,
   SessionDiffSummary,
   SessionRow,
   UserRow,
@@ -47,9 +45,6 @@ export interface IssueToolHandlers {
       owner_id?: string;
       implementer_bot_id?: string;
       parent_issue_id?: string;
-      auto_start_review?: boolean;
-      landing_mode?: LandingMode;
-      max_rounds?: number;
     },
   ): Promise<unknown>;
   updateIssue(
@@ -58,21 +53,19 @@ export interface IssueToolHandlers {
       issue_ref: string;
       title?: string;
       body_md?: string;
-      owner_id?: string;
       implementer_bot_id?: string | null;
       parent_issue_id?: string | null;
-      auto_start_review?: boolean;
-      landing_mode?: LandingMode;
-      max_rounds?: number;
     },
   ): Promise<unknown>;
   listIssues(status?: string): unknown;
   askOwner(session: SessionRow, question: string): Promise<unknown>;
   syncWithMain(session: SessionRow): Promise<unknown>;
-  submitReview(
-    session: SessionRow,
-    input: { verdict: ReviewVerdict; summary: string; notes_md?: string },
-  ): Promise<unknown>;
+  bindWorkerSession(issueId: string, botId: string, sessionId: string): void;
+  startReadOnlyReview(input: {
+    issueRef: string | number;
+    bot: UserRow;
+    focus?: string | null;
+  }): Promise<{ session_id: string; issue_id: string; number: number; status: string }>;
   onIssueWorkerTurnCompleted?(issue: IssueRow, session: SessionRow): Promise<void>;
 }
 
@@ -135,6 +128,10 @@ export class PiRpcProcess {
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.child = child;
+
+    child.stdin?.on("error", () => {
+      // Ignore EPIPE/write-after-end during shutdown
+    });
 
     child.stderr?.on("data", (chunk: Buffer) => {
       this.stderrChunks.push(chunk.toString("utf8"));
@@ -236,7 +233,13 @@ export class PiRpcProcess {
   }
 
   sendCommand(type: string, payload: Record<string, unknown> = {}): Promise<any> {
-    if (!this.child || !this.child.stdin || this.exitError) {
+    if (
+      this.closed ||
+      !this.child ||
+      !this.child.stdin ||
+      this.child.stdin.writableEnded ||
+      this.exitError
+    ) {
       return Promise.reject(this.exitError ?? new Error("pi process is not running"));
     }
     const id = `rpc-${++this.reqCounter}`;
@@ -395,6 +398,11 @@ export class SessionManager {
   private readonly soulHandlers?: SoulHandlers;
   private queueHandlers?: QueueToolHandlers;
   private issueHandlers?: IssueToolHandlers;
+  private onBotMessageCallback?: (ev: {
+    conversation: ConversationRow;
+    message: MessageRow;
+    author: UserRow;
+  }) => Promise<void> | void;
   private socketServer: NetServer | null = null;
   private processes = new Map<string, PiRpcProcess>();
   private orchQueues = new Map<string, Promise<void>>();
@@ -467,6 +475,12 @@ export class SessionManager {
 
   setIssueHandlers(handlers: IssueToolHandlers): void {
     this.issueHandlers = handlers;
+  }
+
+  setBotMessageCallback(
+    cb: (ev: { conversation: ConversationRow; message: MessageRow; author: UserRow }) => Promise<void> | void,
+  ): void {
+    this.onBotMessageCallback = cb;
   }
 
   markTurnReported(sessionId: string): void {
@@ -600,27 +614,44 @@ export class SessionManager {
   ): Promise<unknown> {
     switch (tool) {
       case "get_context": {
+        let contextFiles: Array<{ path: string; content: string }>;
         if (this.soulHandlers) {
-          return this.soulHandlers.getContext(session);
-        }
-        const contextFiles: Array<{ path: string; content: string }> = [];
-        if (session.kind === "orchestrator") {
-          const soul = this.db.getLatestSoul(session.bot_id);
-          if (soul) {
-            contextFiles.push({ path: "kawan://soul.md", content: soul.content });
+          contextFiles = [...this.soulHandlers.getContext(session).contextFiles];
+        } else {
+          contextFiles = [];
+          if (session.kind === "orchestrator") {
+            const soul = this.db.getLatestSoul(session.bot_id);
+            if (soul) {
+              contextFiles.push({ path: "kawan://soul.md", content: soul.content });
+            }
+            const workers = this.db.listSessions({ botId: session.bot_id, kind: "worker" });
+            if (workers.length > 0) {
+              const lines = workers.map(
+                (w) =>
+                  `- ${w.id} [${w.status}] (${w.branch ?? "no-branch"}): ${w.task ?? ""} — ${w.last_report ?? "no report yet"}`,
+              );
+              contextFiles.push({
+                path: "kawan://sessions.md",
+                content: `## Active & recent worker sessions\n\n${lines.join("\n")}\n`,
+              });
+            }
+          } else if (session.soul_snapshot) {
+            contextFiles.push({ path: "kawan://soul.md", content: session.soul_snapshot });
           }
-          const workers = this.db.listSessions({ botId: session.bot_id, kind: "worker" });
-          if (workers.length > 0) {
-            const lines = workers.map(
-              (w) => `- ${w.id} [${w.status}] (${w.branch ?? "no-branch"}): ${w.task ?? ""} — ${w.last_report ?? "no report yet"}`,
-            );
+        }
+
+        const convId =
+          session.kind === "orchestrator"
+            ? this.activeContexts.get(session.id)?.conversationId ?? null
+            : session.conversation_id;
+        if (convId) {
+          const issue = this.db.getIssueByConversationId(convId);
+          if (issue) {
             contextFiles.push({
-              path: "kawan://sessions.md",
-              content: `## Active & recent worker sessions\n\n${lines.join("\n")}\n`,
+              path: "kawan://issue.md",
+              content: this.formatIssueContext(issue, session),
             });
           }
-        } else if (session.soul_snapshot) {
-          contextFiles.push({ path: "kawan://soul.md", content: session.soul_snapshot });
         }
         return { contextFiles };
       }
@@ -786,7 +817,7 @@ export class SessionManager {
       case "ask_owner": {
         if (!this.issueHandlers) throw new Error("Issue handlers are not registered");
         if (session.kind === "reviewer") {
-          throw new Error("Reviewer sessions should call submit_review with verdict 'needs_owner'");
+          throw new Error("Reviewer sessions can post questions directly to the issue room via report()");
         }
         const question = typeof params.question === "string" ? params.question : "";
         if (!question.trim()) throw new Error("question is required");
@@ -801,22 +832,31 @@ export class SessionManager {
         return await this.issueHandlers.syncWithMain(session);
       }
 
-      case "submit_review": {
-        if (session.kind !== "reviewer") {
-          throw new Error("Only reviewer sessions can call submit_review");
+      case "review_issue": {
+        if (session.kind === "reviewer") {
+          throw new Error("Reviewer sessions cannot spawn nested reviews");
         }
         if (!this.issueHandlers) throw new Error("Issue handlers are not registered");
-        const verdict = typeof params.verdict === "string" ? params.verdict.trim() : "";
-        if (verdict !== "approve" && verdict !== "request_changes" && verdict !== "needs_owner") {
-          throw new Error("verdict must be 'approve', 'request_changes', or 'needs_owner'");
+        const bot = this.db.getUser(session.bot_id);
+        if (!bot || bot.kind !== "bot") {
+          throw new Error("Bot no longer exists");
         }
-        const summary = typeof params.summary === "string" ? params.summary.trim() : "";
-        if (!summary) throw new Error("summary is required");
-        const notesMd = typeof params.notes_md === "string" ? params.notes_md : undefined;
-        return await this.issueHandlers.submitReview(session, {
-          verdict,
-          summary,
-          notes_md: notesMd,
+        const ctx = this.activeContexts.get(session.id);
+        const convId = ctx?.conversationId || session.conversation_id;
+        const activeIssue = convId ? this.db.getIssueByConversationId(convId) : null;
+        const issueRef =
+          (typeof params.issue_ref === "string" && params.issue_ref.trim()) ||
+          activeIssue?.id ||
+          "";
+        if (!issueRef) {
+          throw new Error("issue_ref is required when not inside an issue conversation");
+        }
+        const focus =
+          typeof params.focus === "string" && params.focus.trim() ? params.focus.trim() : null;
+        return await this.issueHandlers.startReadOnlyReview({
+          issueRef,
+          bot,
+          focus,
         });
       }
 
@@ -825,26 +865,82 @@ export class SessionManager {
     }
   }
 
+  private formatIssueContext(issue: IssueRow, session: SessionRow): string {
+    const owner = this.db.getUser(issue.owner_id);
+    const implBot = issue.implementer_bot_id ? this.db.getUser(issue.implementer_bot_id) : null;
+    const activeSess = issue.active_session_id ? this.db.getSession(issue.active_session_id) : null;
+    const branchLine = activeSess?.branch
+      ? `${activeSess.branch} (owner: @${implBot?.name ?? "bot"}, ${issue.commits_ahead} commit${issue.commits_ahead === 1 ? "" : "s"} ahead, ${issue.behind_main} behind main)`
+      : "No branch yet";
+
+    let checkLine = `${issue.checks_status}${issue.checks_summary ? ` (${issue.checks_summary})` : ""}`;
+    if (issue.touches_kawan) {
+      checkLine += " [Modifies .kawan/ checks]";
+    }
+
+    let checkExcerpt = "";
+    if (issue.checks_status === "failed" && issue.checks_artifact_id) {
+      const art = this.db.getArtifact(issue.checks_artifact_id);
+      if (art) {
+        const p = join(this.dataDir, "artifacts", art.sha256);
+        if (existsSync(p)) {
+          const tail = readFileSync(p, "utf8").slice(-1500).trim();
+          if (tail) {
+            checkExcerpt = `\nLatest failure output:\n\`\`\`\n${tail}\n\`\`\`\n`;
+          }
+        }
+      }
+    }
+
+    let ownershipHint = "";
+    if (session.kind === "orchestrator" && activeSess && activeSess.bot_id !== session.bot_id) {
+      ownershipHint = `- Role note: @${implBot?.name ?? "another bot"} owns the writable branch on this issue. Use \`review_issue()\` to inspect read-only and post findings; do not modify the repo.\n`;
+    } else if (session.kind === "reviewer") {
+      ownershipHint = `- Role note: Read-only reviewer on @${implBot?.name ?? "implementer"}'s branch. Post findings directly in the room via \`report()\`.\n`;
+    }
+
+    return [
+      `# Issue #${issue.number}: ${issue.title}`,
+      "",
+      `- Status: ${issue.status}`,
+      `- Owner: @${owner?.name ?? "owner"}`,
+      `- Branch: ${branchLine}`,
+      `- Checks: ${checkLine}`,
+      ...(issue.needs_input_question ? [`- Pending owner question: ${issue.needs_input_question}`] : []),
+      ...(ownershipHint ? [ownershipHint.trimEnd()] : []),
+      ...(checkExcerpt ? [checkExcerpt.trimEnd()] : []),
+      "",
+      "## Markdown Specification",
+      "",
+      issue.body_md || "(Empty specification)",
+      "",
+    ].join("\n");
+  }
+
   private buildOrchestratorSystemPrompt(bot: UserRow): string {
     return [
       `You are ${bot.name}, an AI engineering orchestrator inside Kawan.`,
       bot.persona ? `Persona: ${bot.persona}` : "Persona: Helpful, concise software engineer.",
-      `Only you speak in chat for ${bot.name}. Worker sessions run quietly in isolated clones and never post directly to humans.`,
+      `Only you speak in chat for ${bot.name}. Channel/DM worker sessions run quietly in isolated clones and never post directly to humans (while issue-bound workers and read-only reviewers speak directly inside their issue room).`,
       "Host tools:",
-      "- spawn_session(title?, task, in_thread?): delegate repository inspection, coding, tests, and git commits to a worker session. Pass a short 3-6 word `title` for the Tasks UI. Each worker already has its own clone, dedicated branch, bash/file tools, report(), and land_request(). Do NOT tell workers to create a new branch or push to origin.",
+      "- spawn_session(title?, task, in_thread?): delegate repository inspection, coding, tests, and git commits to a worker session. Pass a short 3-6 word `title` for the Tasks UI. Each worker already has its own clone, dedicated branch, bash/file tools, report(), and land_request(). Inside an issue room, spawning claims the writable branch (or runs a read-only review if another bot owns it).",
       "- message_session(session_id, message): answer a worker's question or steer an existing worker directly.",
       "- session_status(): inspect your child worker sessions.",
       "- report(text, artifact?, in_thread?): post a message or attach evidence/reports into the active conversation.",
+      "- create_issue / update_issue / list_issues: create and maintain Issue (#N) markdown specifications (`kawan://issue.md`).",
+      "- review_issue(issue_ref?, focus?): launch a fresh read-only reviewer session against an issue's branch clone; findings are posted directly to the issue room.",
       "- soul_replace(anchor, text) and soul_write(document): maintain durable project knowledge in your soul (injected each turn at kawan://soul.md).",
       "Thread & formatting guidance:",
       "- Casual top-level channel Q&A defaults to a regular top-level channel reply. Use a thread (`in_thread: true` on `report()`, or the default on `spawn_session` in channels) when delegating a task or having a multi-turn discussion that belongs grouped under the triggering message, or pass `in_thread: false` to reply top-level in the channel. When a human writes inside a thread, stay in that thread.",
       "- Prefer concise plain prose in chat (usually 1-3 sentences) rather than long markdown walls or nested bullet lists.",
-      "- When a task produces detailed multi-file breakdowns, verification logs, or lengthy technical notes, prefer attaching those details as an expandable `report.md` artifact via `report(short_summary, { filename: 'report.md', mime_type: 'text/markdown', content: full_details })` while keeping the chat message brief. For simple tasks or quick answers, a brief reply alone is fine.",
+      "- When a task produces detailed multi-file breakdowns, verification logs, or lengthy technical notes, prefer attaching those details as an expandable `report.md` artifact via `report(short_summary, { filename: 'report.md', mime_type: 'text/markdown', content: full_details })` while keeping the chat message brief.",
       "Workflow rules:",
-      "- Do not pretend to inspect or edit files directly — delegate repository work via spawn_session().",
-      "- When delegating, reply with at most one brief acknowledgement (e.g. 'On it.') or output NO_REPLY — live task status is already shown in the Tasks UI.",
+      "- Do not pretend to inspect or edit files directly — delegate repository work via spawn_session() or review_issue().",
+      "- In an issue room: consult `kawan://issue.md`. When initiating a review via review_issue() (or spawn_session when another bot owns the branch), output NO_REPLY or a brief acknowledgement since the reviewer posts findings directly.",
+      "- When delegating in a channel/DM, reply with at most one brief acknowledgement (e.g. 'On it.') or output NO_REPLY — live task status is already shown in the UI.",
+      "- When collaborating with another bot in chat, reply only when you have substantive answers, feedback, or requested work; output NO_REPLY rather than sending empty pleasantries.",
       "- When a worker calls you with a question you can answer from conversation context or kawan://soul.md, reply to it directly with message_session(session_id, answer) and output NO_REPLY. Only ask the human in chat if you do not know.",
-      "- When a worker finishes or requests landing, post ONE concise human-friendly summary of what changed and how it was verified (and note it is ready for review/approval if awaiting land). Never mention internal session IDs, git branch names, commit hashes, or git plumbing ('working tree clean', 'not pushed') unless explicitly asked.",
+      "- When a worker finishes or requests landing, post ONE concise human-friendly summary of what changed and how it was verified (and note it is ready for review/approval if awaiting land). Never mention internal session IDs, git branch names, commit hashes, or git plumbing unless explicitly asked.",
       "- Always check kawan://soul.md before claiming you do not know a project fact — durable project facts learned in earlier sessions live there.",
       "- If you receive an internal [worker-report] notice and nothing needs to be posted to humans, output exactly: NO_REPLY",
     ].join("\n");
@@ -868,39 +964,16 @@ export class SessionManager {
       `You are the collaborative implementer for ${bot.name} on Issue #${issue.number}: "${issue.title}" inside an isolated git clone.`,
       "Conversation & collaboration:",
       "- You speak directly inside Issue #" + issue.number + " via report(text, artifact?) or normal replies.",
-      "- Humans can brainstorm, critique artifacts, request changes, or ask questions mid-implementation. Adapt cleanly and commit your work on your branch.",
-      "- Keep the issue spec aligned with agreed changes using update_issue(title?, body_md?) when helpful.",
-      "- Use ask_owner(question) ONLY if blocked on an owner decision so the issue pauses cleanly in needs_input until the owner answers.",
-      "- Use sync_with_main() when requested or if behind default branch.",
+      "- Latest issue details, branch state, and checks are always attached at `kawan://issue.md`.",
+      "- Humans or reviewer bots may critique changes, post findings, or update `kawan://issue.md`. Adapt cleanly, verify, commit on your branch, and reply concisely.",
+      "- Do NOT call `land_request()` inside an issue session — commit on your branch, share your update, and let humans click Land when ready.",
+      "- Keep the issue spec aligned with agreed changes using `update_issue(title?, body_md?)` when helpful.",
+      "- Use `review_issue(focus?)` only if explicitly asked to launch a fresh read-only review pass against your own branch.",
+      "- Use `ask_owner(question)` ONLY if blocked on an owner decision so the owner is pinged directly.",
+      "- Use `sync_with_main()` when requested or if behind default branch.",
       "- Do NOT create/switch branches or run git push.",
       `Current specification:\n${issue.body_md || "(No markdown specification provided yet.)"}`,
     ].join("\n");
-  }
-
-  async launchIssueImplementer(params: {
-    issue: IssueRow;
-    bot: UserRow;
-    extraPrompt?: string;
-  }): Promise<SessionRow> {
-    const sessionId = randomUUID();
-    const latestSoul = this.db.getLatestSoul(params.bot.id);
-    const soulSnapshot = latestSoul ? filterSoulForWorker(latestSoul.content) : null;
-    const task =
-      params.extraPrompt?.trim() ||
-      `Implement Issue #${params.issue.number}: ${params.issue.title}\n\n${params.issue.body_md || "(No markdown specification provided yet.)"}`;
-    const branch = `kawan/issue-${params.issue.number}-${sessionId.slice(0, 8)}`;
-    return await this.launchWorkerCloneAndProcess({
-      sessionId,
-      bot: params.bot,
-      parentSessionId: null,
-      conversationId: params.issue.conversation_id,
-      threadId: null,
-      title: `#${params.issue.number}: ${params.issue.title}`,
-      task,
-      soulSnapshot,
-      branchOverride: branch,
-      systemPromptOverride: this.buildIssueWorkerSystemPrompt(params.bot, params.issue),
-    });
   }
 
   async resumeIssueWorker(sessionId: string, promptText: string): Promise<void> {
@@ -947,7 +1020,7 @@ export class SessionManager {
       kind: "reviewer",
       conversationId: params.issue.conversation_id,
       threadId: null,
-      title: `Review #${params.issue.number} R${params.round}${focusSuffix}`,
+      title: `Review #${params.issue.number}${focusSuffix}`,
       task: params.focus ?? "Code review",
       status: "running",
       branch: null,
@@ -983,14 +1056,39 @@ export class SessionManager {
       if (this.closed || this.db.getSession(sessionId)?.status === "stopped") {
         aborted = true;
       } else {
+        this.activeContexts.set(sessionId, {
+          conversationId: params.issue.conversation_id,
+          threadId: null,
+          reportedInTurn: false,
+        });
         const turn = await proc.runPrompt(params.promptText);
+        const ctx = this.activeContexts.get(sessionId);
+        this.activeContexts.delete(sessionId);
         assistantText = turn.assistantText;
         errorMessage = turn.errorMessage;
         aborted = turn.aborted;
+
+        if (!ctx?.reportedInTurn && !errorMessage && !aborted && assistantText) {
+          const trimmed = assistantText.trim();
+          if (trimmed && trimmed !== "NO_REPLY") {
+            const upd = this.db.updateSession(sessionId, { last_report: trimmed })!;
+            this.wsServer.broadcast({ type: "session.update", session: serializeSession(upd) });
+            const conv = this.db.getConversation(params.issue.conversation_id);
+            if (conv) {
+              this.publishOrchestratorMessage({
+                bot: params.bot,
+                conversation: conv,
+                threadId: null,
+                body: trimmed,
+              });
+            }
+          }
+        }
       }
     } catch (err) {
       errorMessage = err instanceof Error ? err.message : String(err);
     } finally {
+      this.activeContexts.delete(sessionId);
       if (this.processes.get(sessionId) === proc) {
         this.processes.delete(sessionId);
       }
@@ -1173,6 +1271,24 @@ export class SessionManager {
       message: posted,
       author: { id: params.bot.id, kind: "bot", name: params.bot.name },
     });
+    if (!this.closed && this.onBotMessageCallback) {
+      void Promise.resolve(
+        this.onBotMessageCallback({
+          conversation: params.conversation,
+          message: posted,
+          author: params.bot,
+        }),
+      ).catch((err) => {
+        if (!this.closed) {
+          this.wsServer.broadcastToConversation(params.conversation, {
+            type: "error",
+            conversation_id: params.conversation.id,
+            message_id: posted.id,
+            message: err instanceof Error ? err.message : String(err),
+          });
+        }
+      });
+    }
     return posted;
   }
 
@@ -1228,6 +1344,10 @@ export class SessionManager {
 
         try {
           const turn = await proc.runPrompt(promptText);
+          if (this.closed) {
+            this.activeContexts.delete(orch.id);
+            return;
+          }
           try {
             const st = await proc.getState();
             const entries = await proc.getEntries();
@@ -1302,7 +1422,8 @@ export class SessionManager {
           : ", top-level";
     const lines = messages.map((m) => {
       const author = this.db.getUser(m.author_id);
-      return `${author?.name ?? "human"}: ${m.body}`;
+      const suffix = author?.kind === "bot" ? " (bot)" : "";
+      return `${author?.name ?? "human"}${suffix}: ${m.body}`;
     });
     return [
       `[Conversation: ${label} (${conversation.id})${scope}]`,
@@ -1338,6 +1459,39 @@ export class SessionManager {
       throw new Error("Bot is missing SSH signing key");
     }
 
+    const conv = this.db.getConversation(ctx.conversationId);
+    const issue = conv?.kind === "issue" ? this.db.getIssueByConversationId(conv.id) : null;
+    if (issue) {
+      if (issue.status !== "open") {
+        throw new Error(`Issue #${issue.number} is ${issue.status}; only open issues can run sessions`);
+      }
+      const existingWorker = issue.active_session_id ? this.db.getSession(issue.active_session_id) : null;
+      const hasLiveBranch = Boolean(
+        existingWorker &&
+          existingWorker.clone_path &&
+          existsSync(existingWorker.clone_path) &&
+          existingWorker.status !== "landed" &&
+          existingWorker.status !== "archived",
+      );
+      if (hasLiveBranch && existingWorker && existingWorker.bot_id !== bot.id) {
+        if (!this.issueHandlers) {
+          throw new Error("Issue handlers are not registered");
+        }
+        const rev = await this.issueHandlers.startReadOnlyReview({
+          issueRef: issue.id,
+          bot,
+          focus: explicitTitle?.trim() || null,
+        });
+        return {
+          session_id: rev.session_id,
+          title: explicitTitle?.trim() || `Review #${issue.number}`,
+          status: "running",
+          thread_id: null,
+          message: "Another bot owns the writable branch; started a read-only review pass instead.",
+        };
+      }
+    }
+
     const explicitStart = ctx.spawnIntent?.explicitWorkStart ?? "yes";
     const workReq = ctx.spawnIntent?.workRequest ?? "yes";
     if (explicitStart === "no" && workReq === "no") {
@@ -1346,9 +1500,30 @@ export class SessionManager {
       );
     }
 
-    const conv = this.db.getConversation(ctx.conversationId);
-    const workerThreadId =
-      inThread === false
+    if (issue && issue.active_session_id) {
+      const existingWorker = this.db.getSession(issue.active_session_id);
+      if (
+        existingWorker &&
+        existingWorker.bot_id === bot.id &&
+        existingWorker.clone_path &&
+        existsSync(existingWorker.clone_path) &&
+        existingWorker.status !== "landed" &&
+        existingWorker.status !== "archived"
+      ) {
+        await this.sendPromptToWorker(bot, existingWorker, task);
+        return {
+          session_id: existingWorker.id,
+          title: existingWorker.title ?? `#${issue.number}: ${issue.title}`,
+          status: "running",
+          thread_id: null,
+          message: "Resumed existing issue branch session.",
+        };
+      }
+    }
+
+    const workerThreadId = issue
+      ? null
+      : inThread === false
         ? null
         : ctx.threadId
           ? ctx.threadId
@@ -1362,7 +1537,9 @@ export class SessionManager {
     }
 
     const sessionId = randomUUID();
-    const title = deriveTaskTitle(task, explicitTitle);
+    const title = issue
+      ? `#${issue.number}: ${explicitTitle?.trim() || issue.title}`
+      : deriveTaskTitle(task, explicitTitle);
     const latestSoul = this.db.getLatestSoul(bot.id);
     const soulSnapshot = latestSoul ? filterSoulForWorker(latestSoul.content) : null;
 
@@ -1399,7 +1576,16 @@ export class SessionManager {
       title,
       task,
       soulSnapshot,
+      ...(issue
+        ? {
+            branchOverride: `kawan/issue-${issue.number}-${sessionId.slice(0, 8)}`,
+            systemPromptOverride: this.buildIssueWorkerSystemPrompt(bot, issue),
+          }
+        : {}),
     });
+    if (issue) {
+      this.issueHandlers?.bindWorkerSession(issue.id, bot.id, workerSession.id);
+    }
     ctx.spawnedSessionId = workerSession.id;
 
     return { session_id: workerSession.id, title, status: "running", thread_id: workerThreadId };
@@ -1516,17 +1702,40 @@ export class SessionManager {
     if (!bot || bot.kind !== "bot") throw new Error("Bot no longer exists");
     const task = existing.task ?? "";
     const title = deriveTaskTitle(task, existing.title);
+    const issue = existing.conversation_id
+      ? this.db.getIssueByConversationId(existing.conversation_id)
+      : null;
+    if (issue) {
+      if (issue.status !== "open") {
+        throw new Error(`Issue #${issue.number} is ${issue.status}`);
+      }
+      if (issue.active_session_id && issue.active_session_id !== existing.id) {
+        const ownerSess = this.db.getSession(issue.active_session_id);
+        if (ownerSess?.clone_path && existsSync(ownerSess.clone_path) && ownerSess.status !== "archived") {
+          throw new Error(`Issue #${issue.number} already has an active branch session`);
+        }
+      }
+    }
     const updated = await this.launchWorkerCloneAndProcess({
       sessionId: existing.id,
       bot,
       parentSessionId: existing.parent_session_id,
       conversationId: existing.conversation_id,
-      threadId: existing.thread_id,
-      title,
+      threadId: issue ? null : existing.thread_id,
+      title: issue ? `#${issue.number}: ${issue.title}` : title,
       task,
       soulSnapshot: existing.soul_snapshot,
       existingRow: existing,
+      ...(issue
+        ? {
+            branchOverride: `kawan/issue-${issue.number}-${existing.id.slice(0, 8)}`,
+            systemPromptOverride: this.buildIssueWorkerSystemPrompt(bot, issue),
+          }
+        : {}),
     });
+    if (issue) {
+      this.issueHandlers?.bindWorkerSession(issue.id, bot.id, updated.id);
+    }
     return { session: serializeSession(updated) };
   }
 
@@ -1927,6 +2136,7 @@ export class SessionManager {
       const sessionDir = join(sessionBase, "pi-sessions");
       materializeSessionAgentDir(agentDir, settings);
 
+      const linkedIssue = this.db.getIssueBySessionId(worker.id);
       const spec = composeSpawnSpec({
         role: "worker",
         bot,
@@ -1937,7 +2147,9 @@ export class SessionManager {
         socketPath: this.socketPath,
         extensionPath: EXTENSION_ENTRY_PATH,
         sessionToken: worker.token,
-        systemPrompt: this.buildWorkerSystemPrompt(bot, worker),
+        systemPrompt: linkedIssue
+          ? this.buildIssueWorkerSystemPrompt(bot, linkedIssue)
+          : this.buildWorkerSystemPrompt(bot, worker),
         piSessionFile: worker.pi_session_file,
         disableSandbox: this.disableSandbox,
       });
@@ -2009,7 +2221,8 @@ export class SessionManager {
             : session.id,
         conversationId: conv.id,
       });
-      if (session.kind === "worker" && !this.db.getIssueBySessionId(session.id)) {
+      const isIssueWorker = session.kind === "worker" && Boolean(this.db.getIssueBySessionId(session.id));
+      if (session.kind === "worker" && !isIssueWorker) {
         this.wsServer.broadcastToConversation(conv, {
           type: "artifact.new",
           artifact: artifactRow,
@@ -2018,6 +2231,7 @@ export class SessionManager {
     }
 
     const linkedIssue = session.kind === "worker" ? this.db.getIssueBySessionId(session.id) : null;
+    const isIssuePublisher = Boolean(linkedIssue) || session.kind === "reviewer";
 
     const updatedSession = this.db.updateSession(session.id, { last_report: text })!;
     this.wsServer.broadcast({ type: "session.update", session: serializeSession(updatedSession) });
@@ -2032,7 +2246,7 @@ export class SessionManager {
     const msg = this.publishOrchestratorMessage({
       bot,
       conversation: conv,
-      threadId: linkedIssue ? null : effectiveThreadId,
+      threadId: isIssuePublisher ? null : effectiveThreadId,
       body: text,
       artifactRow,
       sourceWorkerId: linkedIssue ? session.id : ctx?.sourceWorkerId,
@@ -2083,6 +2297,11 @@ export class SessionManager {
     }
 
     const linkedIssue = this.db.getIssueBySessionId(session.id);
+    if (linkedIssue) {
+      throw new Error(
+        "Issue worker sessions cannot call land_request; commit changes on your branch and report in the issue room. Humans trigger landing via the Land button.",
+      );
+    }
 
     const existing = this.db
       .listLands({ sessionId: session.id })
@@ -2100,9 +2319,9 @@ export class SessionManager {
 
     const land = this.db.createLand({
       sessionId: session.id,
-      conversationId: linkedIssue ? linkedIssue.conversation_id : session.conversation_id!,
-      threadId: linkedIssue ? null : session.thread_id,
-      issueId: linkedIssue?.id ?? null,
+      conversationId: session.conversation_id!,
+      threadId: session.thread_id,
+      issueId: null,
     });
     const trimmedSummary = summary.trim();
     const updated = this.db.updateSession(session.id, {
@@ -2111,33 +2330,6 @@ export class SessionManager {
     })!;
     this.wsServer.broadcast({ type: "session.update", session: serializeSession(updated) });
     this.wsServer.broadcast({ type: "land.update", land: serializeLand(land) });
-
-    if (linkedIssue) {
-      const bot = this.db.getUser(session.bot_id);
-      const issueConv = this.db.getConversation(linkedIssue.conversation_id);
-      if (
-        linkedIssue.status !== "queued" &&
-        linkedIssue.status !== "landed" &&
-        linkedIssue.status !== "closed"
-      ) {
-        const nextIssue = this.db.updateIssue(linkedIssue.id, { status: "ready_to_land" })!;
-        this.wsServer.broadcast({ type: "issue.update", issue: this.db.serializeIssue(nextIssue) });
-      }
-      if (bot && issueConv) {
-        const msg = this.db.appendMessage({
-          conversationId: issueConv.id,
-          authorId: bot.id,
-          body: trimmedSummary
-            ? `${trimmedSummary}\n\nReady to start review cycle or approve land.`
-            : "Changes committed — ready to start review cycle or approve land.",
-        });
-        this.wsServer.broadcastToConversation(issueConv, {
-          type: "message.new",
-          message: msg,
-          author: { id: bot.id, kind: "bot", name: bot.name },
-        });
-      }
-    }
 
     const ctx = this.activeContexts.get(session.id);
     if (ctx) ctx.reportedInTurn = true;

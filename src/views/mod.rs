@@ -16,15 +16,13 @@ pub fn short_id(id: &str) -> String {
 
 pub fn status_color_hex(status: &str) -> u32 {
     match status {
-        "running" | "verifying" | "rebasing" | "implementing" | "reviewing" => {
-            theme::CATEGORY_INDUSTRY
-        }
-        "review_requested" | "requested" | "queued" | "pending_approval" | "ready_to_land" => {
+        "running" | "verifying" | "rebasing" | "open" => theme::CATEGORY_INDUSTRY,
+        "review_requested" | "requested" | "queued" | "pending_approval" => {
             theme::CATEGORY_ACADEMIC
         }
-        "landed" | "idle" => 0x284D32,
-        "failed" | "stopped" | "paused" | "needs_input" => theme::CATEGORY_VALS,
-        "backlog" | "closed" => theme::UMBER_VIVID,
+        "landed" | "idle" | "passed" => 0x284D32,
+        "failed" | "stopped" | "paused" => theme::CATEGORY_VALS,
+        "closed" => theme::UMBER_VIVID,
         _ => theme::UMBER_VIVID,
     }
 }

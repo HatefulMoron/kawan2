@@ -49,11 +49,7 @@ pub(crate) fn short_status_label(status: &str) -> &'static str {
     match status {
         "running" => "running",
         "pending_approval" => "proposed",
-        "backlog" => "backlog",
-        "implementing" => "implementing",
-        "reviewing" => "reviewing",
-        "needs_input" => "needs input",
-        "ready_to_land" => "ready",
+        "open" => "open",
         "closed" => "closed",
         "queued" => "queued",
         "rebasing" => "rebasing",
@@ -255,12 +251,12 @@ pub fn left_rail(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
     let open_issues_count = app
         .issues_by_id
         .values()
-        .filter(|i| !matches!(i.status.as_str(), "landed" | "closed"))
+        .filter(|i| i.status == "open")
         .count();
     let needs_input_issues_count = app
         .issues_by_id
         .values()
-        .filter(|i| i.status == "needs_input")
+        .filter(|i| i.status == "open" && i.needs_input_question.is_some())
         .count();
     let issues_unread = app.issues_by_id.values().any(|i| {
         let open_here = matches!(
@@ -1037,7 +1033,11 @@ pub(crate) fn conversation_stream_and_composer(
             ),
         );
 
-    let placeholder = format!("Message {title}...");
+    let placeholder = if let Some(issue) = app.issue_by_conv(active_cid) {
+        format!("Message #{}… (@bot to implement or review)", issue.number)
+    } else {
+        format!("Message {title}...")
+    };
     let focused = app.focus_target == FocusTarget::Composer;
     let composer = div()
         .flex_none()
@@ -2532,12 +2532,21 @@ pub(crate) fn right_drawer(app: &KawanApp, theme: &Theme, cx: &mut Context<Kawan
                 .unwrap_or_else(|| "TASK".to_string());
             format!("TASK · {sess_title}")
         }
+        RightPanel::Artifact(aid) => {
+            let fname = app
+                .artifacts_by_id
+                .get(aid)
+                .and_then(|a| a.filename.clone())
+                .unwrap_or_else(|| short_id(aid));
+            format!("ARTIFACT · {fname}")
+        }
         RightPanel::None => String::new(),
     };
 
     let body: AnyElement = match &app.right_panel {
         RightPanel::Thread(tid) => thread_drawer_body(app, tid, theme, cx).into_any_element(),
         RightPanel::Session(sid) => session_drawer_body(app, sid, theme, cx).into_any_element(),
+        RightPanel::Artifact(aid) => artifact_drawer_body(app, aid, theme).into_any_element(),
         RightPanel::None => div().into_any_element(),
     };
 
@@ -3397,4 +3406,103 @@ fn session_diff_tab(
     }
 
     col.into_any_element()
+}
+
+fn artifact_drawer_body(app: &KawanApp, artifact_id: &str, theme: &Theme) -> gpui::Stateful<Div> {
+    let artifact = app.artifacts_by_id.get(artifact_id);
+    let loaded = app.loaded_artifacts.get(artifact_id);
+    let fname = artifact
+        .and_then(|a| a.filename.clone())
+        .unwrap_or_else(|| short_id(artifact_id));
+    let mime = artifact
+        .map(|a| a.mime_type.clone())
+        .unwrap_or_else(|| "text/plain".to_string());
+    let size_bytes = artifact.map_or(0, |a| a.byte_size);
+
+    let mut content_el: AnyElement = theme::body(
+        "Loading artifact contents...".to_string(),
+        12.0,
+        theme.fg_tertiary,
+    )
+    .into_any_element();
+
+    if let Some(loaded) = loaded {
+        if let Some(image) = &loaded.image {
+            content_el = div()
+                .w_full()
+                .rounded(px(2.0))
+                .border_1()
+                .border_color(theme.border_subtle)
+                .overflow_hidden()
+                .child(img(image.clone()).w_full().max_h(px(420.0)))
+                .into_any_element();
+        } else if let Some(txt) = &loaded.text_preview {
+            let lines: Vec<&str> = txt.lines().collect();
+            let remaining = lines.len().saturating_sub(240);
+            content_el = div()
+                .w_full()
+                .min_w(px(0.0))
+                .p(px(10.0))
+                .rounded(px(2.0))
+                .border_1()
+                .border_color(theme.border_subtle)
+                .bg(theme.strip)
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .children(lines.into_iter().take(240).map(|line| {
+                    div()
+                        .w_full()
+                        .min_w(px(0.0))
+                        .font_family(theme::MONO)
+                        .text_size(px(11.0))
+                        .line_height(px(15.5))
+                        .text_color(theme.ink)
+                        .child(if line.is_empty() {
+                            " ".to_string()
+                        } else {
+                            line.to_string()
+                        })
+                }))
+                .children((remaining > 0).then(|| {
+                    theme::numeric(
+                        format!("… ({remaining} more lines)"),
+                        10.0,
+                        theme.fg_tertiary,
+                    )
+                }))
+                .into_any_element();
+        } else {
+            content_el =
+                theme::numeric("Binary artifact", 11.0, theme.fg_tertiary).into_any_element();
+        }
+    }
+
+    div()
+        .id("drawer-artifact-scroll")
+        .flex_1()
+        .min_h(px(0.0))
+        .overflow_y_scroll()
+        .p(px(16.0))
+        .flex()
+        .flex_col()
+        .gap(px(12.0))
+        .child(
+            div()
+                .p(px(10.0))
+                .rounded(px(2.0))
+                .border_1()
+                .border_color(theme.border_subtle)
+                .bg(theme.strip)
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
+                .child(theme::label(fname, 13.0, theme.ink))
+                .child(theme::numeric(
+                    format!("{mime} · {size_bytes} B"),
+                    10.5,
+                    theme.fg_tertiary,
+                )),
+        )
+        .child(content_el)
 }

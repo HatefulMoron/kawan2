@@ -2,8 +2,8 @@
 
 Kawan's UI is a GPUI desktop client connected to a single-machine host. It uses
 a **chat-first orchestration** model: humans and bots share channels, threads,
-and direct messages, while bots manage isolated virtual environments and `pi`
-agent sessions behind the scenes.
+direct messages, and issue rooms, while bots manage isolated virtual
+environments and `pi` agent sessions behind the scenes.
 
 ## Bot & Session Hierarchy
 
@@ -18,11 +18,11 @@ agent sessions behind the scenes.
   make are authored and signed by it. Bots never log in; they exist so that
   agent work has an owner and an author.
 - **Orchestrator (`@bot`):** A persistent bot identity that can be added to any
-  channel or messaged directly. Talking to `@bot` talks to the orchestrator,
+  conversation or messaged directly. Talking to `@bot` talks to the orchestrator,
   which can spawn, inspect, summarize, and instruct its child sessions. One
-  orchestrator session serves every channel and DM the bot is in, which keeps its
-  view of the work unified; it is expected to delegate rather than do work itself
-  so its runs stay short and channels do not queue behind each other.
+  orchestrator session serves every channel, DM, and issue room the bot is in,
+  which keeps its view of the work unified; it delegates coding to isolated
+  worker sessions so its orchestrator turns stay short.
 - **Worker sessions:** Individual `pi` agent sessions spawned for concrete
   tasks, owned by the bot that spawned them. Each worker owns an isolated
   **virtual environment** (its own clone, working tree, and sandbox). Git
@@ -39,32 +39,53 @@ A decision model is a separate class of model from the one running the agents: a
 fixed question over a large supplied context, answered inside a fixed answer space,
 with structured output and no tools. The same kind of call is made wherever Kawan
 needs a cheap judgement rather than an agent run — routing a message, extracting
-facts, reading a review, triaging a merge conflict. These calls gate attention, not
-action: they can only pick between next steps the host already allows, and the
-thinking itself remains with the agent in the session.
+facts, triaging a merge conflict. These calls gate attention, not action: they can
+only pick between next steps the host already allows, and the thinking itself
+remains with the agent in the session.
 
-Routing answers one question about each message: where does this belong, and is
-there enough in it to act on yet? Two fields, one judgement:
+Routing answers three parts in one structured judgement about each message — where
+it belongs, whether there is enough context to act on yet, and whether work was
+actually requested:
 
-- **Destination** — `none` (an acknowledgement, an aside, humans talking to each
-  other), `orchestrator` (a turn for the bot's own session), or `session(id)` (the
-  message belongs to a worker session already in flight).
+- **Destination** — `none` (an acknowledgement, an aside, chatter/sign-offs not
+  needing a response), `orchestrator` (a turn for the bot's own session), or
+  `session(id)` (the message belongs to a worker session already in flight).
 - **Readiness** — `dispatch` (act now) or `hold` (relevant, but the message does
   not yet carry enough to act on; it waits visibly for the next one). Held
   messages wait per `(conversation, bot)` and are included in `route_message`
   context on the next message, dispatching together as one turn when `dispatch`
   fires.
+- **Spawn intent (`explicit_work_start`, `work_request`)** — two binary `yes`/`no`
+  choices gating `spawn_session` mechanically on the host (`work_request` stays
+  strictly `no` for questions, brainstorming, and hypotheticals so it never fires
+  on a hair trigger):
+  - `yes / yes` — start immediately and render an inline `[ Stop ]` task card (or
+    attach a writable branch if inside an issue room without one).
+  - `no / yes` — hold behind an inline `[ Start ] [ Dismiss ]` proposal card (zero
+    clone or worker tokens until confirmed; `[ Dismiss ]` notes the back-off in
+    orchestrator context).
+  - `no / no` — block `spawn_session` and instruct the orchestrator to reply
+    conversationally with no proposal card.
 
-There are no guardrails. Every message in conversations the bot is a member of
-goes to the decision model, including direct addresses. Nothing is
-short-circuited in code, no message is dropped silently, and no rule overrides
-the model.
+**Bot-to-bot messaging everywhere:** Conversational messages from both humans and
+bots flow through `route_message` in channels, DMs, and issue rooms alike. Two
+mechanical boundaries prevent noise without premature turn-cap or batching
+heuristics: a bot never routes its own messages, and host-generated system/status
+notices never enter routing. When the incoming author is a bot, `route_message`
+receives `author_kind: "bot"` and treats polite closings/acknowledgements/approvals
+as `none`, while routing genuine review findings, questions, or direct `@` requests
+cleanly.
+
+Aside from those mechanical boundaries, there are no secret fast-paths. Every
+conversational message in conversations the bot is a member of goes to the
+decision model, including direct addresses. Nothing is short-circuited in code,
+no conversational message is dropped silently, and no rule overrides the model.
 
 That is deliberate, and it makes the failure mode legible rather than impossible: a
-message the model judges wrong is visible in the channel, with the decision and the
-reason beside it, and redirecting it is one click. A missing or failing decision
-model is a hard error shown in the conversation, not a quiet fallback to something
-dumber.
+message the model judges wrong is visible in the conversation, with the decision
+and the reason beside it, and redirecting it is one click. A missing or failing
+decision model is a hard error shown in the conversation, not a quiet fallback to
+something dumber.
 
 ## Repository Status
 
@@ -73,45 +94,56 @@ git branches or scrolling through channels, Kawan provides a unified **Status**
 view covering both ad-hoc chat tasks and formal issues (`Needs You`,
 `Waiting to Land`, `In Flight`, `Shipped`). Every entry centers on its human title,
 status, participants, and expandable `report.md` artifact, keeping raw branch and
-commit identifiers tucked away unless inspected.
+commit identifiers tucked away unless inspected. Two-tier `read_cursors` track
+quiet unread dots separately from loud action badges (`@you`, `Waiting to Land`,
+`Merge Queue paused`).
 
 ## Issues & Epics
 
 To prevent bugs, backlog items, and epics from getting lost in chat scrollback
-(without requiring a separate tool like Linear), Kawan includes lightweight issues
-(`#id`) backed by special conversations (`kind = 'issue'`) rendered with trimmed-down
-PR chrome:
+(without requiring a separate tool like Linear), Kawan models an **Issue (`#N`)**
+simply as a specialized room (`kind = 'issue'`) built around a central,
+continuously editable Markdown document (`kawan://issue.md`) and an attached
+branch once a bot begins implementing:
 
-- An issue holds a markdown spec alongside a full Kawan conversation and thread
-  stream, an explicit owner, an implementer bot, `0..N` reviewer slots (distinct
-  bots or the same bot assigned with distinct review focuses), configurable
-  `manual` vs `auto` landing, and optional parent/child links for epics.
-- Issues operate across three gears (**Collaborate → Review Cycle → Merge Queue**):
-  - **Collaborate** (drafting and implementation): stays a normal SubQ Snap–routed
-    Kawan conversation where humans discuss artifacts, push the implementer in new
-    directions, and evolve the spec and implementation together. Before assignment,
-    `@bot` is the orchestrator; once assigned, bot-directed feedback routes to the
-    issue's implementer session while human-to-human discussion stays `none`.
-  - **Review Cycle**: the automated, programmatic gear (`CI → parallel reviewers →
-    revise → ready_to_land / queued`, with `needs_input` `@owner` pauses and round
-    caps), entered either manually via `Start Review Cycle` (interactive mode) or
-    automatically after the implementer's first pass (autonomous mode), with an
-    escape hatch back to Collaborate if direction changes.
-- Issues default to a grouped flat list (with an optional 2D board view scoped to
-  active pipeline columns). See `08_v2_work_and_queue.md`.
+- **Shared room + live document:** Every issue has a title, an editable Markdown
+  document (`kawan://issue.md`, injected on every turn in the room alongside
+  `kawan://soul.md`), optional `parent_issue_id`, coarse status
+  (`open` | `landed` | `closed`), and a normal Kawan chat stream. Ad-hoc chat
+  sessions can also be converted in place with one-click **Promote to Issue**.
+- **Chat-first implementation & multi-bot review:** You do everything in chat using
+  the same primitives as anywhere else in Kawan:
+  - `@coder implement this` routes through SubQ Snap (and the spawn-intent gate)
+    to bind one writable branch (`kawan/issue-N-...`) and isolated worker clone to
+    the issue. Follow-up steering routes to that session.
+  - `@reviewer1 @reviewer2 review this` spawns read-only reviewer sessions over
+    the issue's branch clone and `kawan://issue.md` (with no write/edit/bash
+    rights). Reviewers post their findings back into the room as themselves;
+    via bot-to-bot routing, `@coder` sees the feedback, fixes it on its branch,
+    and replies back naturally. In a single-bot workspace, `review_issue()` runs a
+    fresh read-only review pass against the bot's own branch.
+- **Concrete live state & implicit `.kawan/checks/*`:** After commits or rebases,
+  the host runs `.kawan/checks/*` implicitly in the background sandbox (never
+  auto-retrying on failure) and displays concrete state in a compact branch bar:
+  branch owner, working/reviewing indicator, commit count, divergence from
+  `default_branch` (`Sync with main`), `Checks ✓/✗`, `[ Changes ]`, and one-click
+  **`[ Land ]`** whenever commits exist.
+- **Soul learning loop:** After an issue lands, a concise post-landing digest
+  returns to the implementer bot's orchestrator so durable repository lessons fold
+  into `kawan://soul.md` (`06_memory.md`). See `08_v2_work_and_queue.md`.
 
 ## Artifact Review & Merge Queue
 
-- **Artifact-first review & CI:** When a worker finishes, the host runs repo-defined
-  `.kawan/checks/*` verification scripts inside the sandbox (falling back to the
-  configured host verify command when absent) before waking reviewers. Review focuses
-  on evidence—`report.md` wrap-ups, check logs, screenshots, and review summaries—with
-  full diffs and session logs accessible on demand. Branches touching `.kawan/*`
-  disable auto-land and require explicit human approval.
-- **Merge queue & `#merge-queue`:** Approving a session (or auto-landing after
-  checks and reviewer sign-offs pass) enqueues it into a serialized FIFO merge queue
-  backed by a dedicated `#merge-queue` conversation (`kind = 'merge_queue'`) with a
-  pinned Merge Train header and an assigned Queue Bot. Clean rebases with passing
-  checks land via a deterministic host fast-path; any conflict or check regression
-  pauses the queue and opens an incident thread in `#merge-queue` where humans and
-  the Queue Bot reconcile multi-turn before resuming. See `08_v2_work_and_queue.md`.
+- **Repo checks & inspection:** `.kawan/checks/*` (or `.kawan/ci` / host
+  `verify_command`) runs implicitly on issue branches as commits arrive and
+  deterministically pre-land in the Merge Queue after rebase. Review focuses on
+  artifacts, diffs, and check logs (`Changes` drawer and expandable log
+  artifacts). Branches touching `.kawan/*` surface a `Modifies .kawan/ checks`
+  warning.
+- **Merge queue & `#merge-queue`:** Clicking `Approve Land` / `Land` enqueues the
+  branch into a serialized FIFO merge queue backed by a dedicated `#merge-queue`
+  conversation (`kind = 'merge_queue'`) with a pinned Merge Train header and an
+  assigned Queue Bot. Clean rebases with passing checks land via a deterministic
+  host fast-path; any conflict or check regression pauses the queue and opens an
+  incident thread in `#merge-queue` where humans and the Queue Bot reconcile
+  multi-turn before resuming. See `08_v2_work_and_queue.md`.

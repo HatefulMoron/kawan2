@@ -112,80 +112,111 @@ export default function (pi: ExtensionAPI) {
         })
       : Type.Object({
           text: Type.String({
-            description: "Report, question, or result to send back to your orchestrator",
+            description:
+              role === "reviewer"
+                ? "Review findings or concise approval to post directly in the issue conversation"
+                : "Report, question, or result (sent to your orchestrator, or directly to the issue room if working on an issue)",
           }),
           artifact: artifactParamSchema,
         });
 
-  if (role !== "reviewer") {
+  pi.registerTool({
+    name: "report",
+    label: "Report",
+    description:
+      role === "orchestrator"
+        ? "Post a message into the active conversation and optionally attach a text, markdown, or image artifact."
+        : role === "reviewer"
+          ? "Post read-only code review findings or approval directly into the issue conversation and optionally attach a markdown artifact."
+          : "Send a summary, progress note, blocking question, or artifact (to your orchestrator, or directly into the issue room when bound to an issue).",
+    parameters: reportParameters,
+    async execute(_toolCallId, params) {
+      try {
+        let artifactPayload: Record<string, unknown> | undefined;
+        if (params.artifact && typeof params.artifact === "object") {
+          const a = params.artifact as {
+            filename?: string;
+            mime_type?: string;
+            content?: string;
+            base64?: string;
+            path?: string;
+          };
+          if (a.path) {
+            const abs = resolve(process.cwd(), a.path);
+            const st = statSync(abs);
+            if (st.size > 10 * 1024 * 1024) {
+              return textResult(`Artifact exceeds 10 MB limit (${st.size} bytes)`, true);
+            }
+            const bytes = readFileSync(abs);
+            const ext = abs.toLowerCase();
+            const inferredMime = ext.endsWith(".png")
+              ? "image/png"
+              : ext.endsWith(".jpg") || ext.endsWith(".jpeg")
+                ? "image/jpeg"
+                : ext.endsWith(".webp")
+                  ? "image/webp"
+                  : ext.endsWith(".md") || ext.endsWith(".markdown")
+                    ? "text/markdown"
+                    : "text/plain";
+            artifactPayload = {
+              filename: a.filename ?? basename(abs),
+              mime_type: a.mime_type ?? inferredMime,
+              base64: bytes.toString("base64"),
+            };
+          } else if (typeof a.base64 === "string") {
+            artifactPayload = {
+              filename: a.filename ?? "artifact.bin",
+              mime_type: a.mime_type ?? "application/octet-stream",
+              base64: a.base64,
+            };
+          } else if (typeof a.content === "string") {
+            const fname = a.filename ?? "report.txt";
+            const lowerName = fname.toLowerCase();
+            const inferredMime =
+              lowerName.endsWith(".md") || lowerName.endsWith(".markdown")
+                ? "text/markdown"
+                : "text/plain";
+            artifactPayload = {
+              filename: fname,
+              mime_type: a.mime_type ?? inferredMime,
+              base64: Buffer.from(a.content, "utf8").toString("base64"),
+            };
+          }
+        }
+        const inThread = (params as { in_thread?: unknown }).in_thread;
+        const res = await callHost("report", {
+          text: params.text,
+          ...(artifactPayload ? { artifact: artifactPayload } : {}),
+          ...(role === "orchestrator" && typeof inThread === "boolean"
+            ? { in_thread: inThread }
+            : {}),
+        });
+        return textResult(res);
+      } catch (err) {
+        return textResult(err instanceof Error ? err.message : String(err), true);
+      }
+    },
+  });
+
+  if (role === "orchestrator" || role === "worker") {
     pi.registerTool({
-      name: "report",
-      label: "Report",
+      name: "review_issue",
+      label: "Review Issue",
       description:
-        role === "orchestrator"
-          ? "Post a message into the active conversation and optionally attach a text, markdown, or image artifact."
-          : "Send a summary, progress note, blocking question, or artifact back to your orchestrator (never posted directly to humans).",
-      parameters: reportParameters,
+        "Launch a fresh read-only reviewer session against the issue's active branch clone; findings are posted directly to the issue conversation.",
+      parameters: Type.Object({
+        issue_ref: Type.Optional(
+          Type.String({ description: "Issue ID or #number (defaults to current issue room)" }),
+        ),
+        focus: Type.Optional(
+          Type.String({ description: "Optional review focus (e.g. 'Security', 'Edge cases')" }),
+        ),
+      }),
       async execute(_toolCallId, params) {
         try {
-          let artifactPayload: Record<string, unknown> | undefined;
-          if (params.artifact && typeof params.artifact === "object") {
-            const a = params.artifact as {
-              filename?: string;
-              mime_type?: string;
-              content?: string;
-              base64?: string;
-              path?: string;
-            };
-            if (a.path) {
-              const abs = resolve(process.cwd(), a.path);
-              const st = statSync(abs);
-              if (st.size > 10 * 1024 * 1024) {
-                return textResult(`Artifact exceeds 10 MB limit (${st.size} bytes)`, true);
-              }
-              const bytes = readFileSync(abs);
-              const ext = abs.toLowerCase();
-              const inferredMime = ext.endsWith(".png")
-                ? "image/png"
-                : ext.endsWith(".jpg") || ext.endsWith(".jpeg")
-                  ? "image/jpeg"
-                  : ext.endsWith(".webp")
-                    ? "image/webp"
-                    : ext.endsWith(".md") || ext.endsWith(".markdown")
-                      ? "text/markdown"
-                      : "text/plain";
-              artifactPayload = {
-                filename: a.filename ?? basename(abs),
-                mime_type: a.mime_type ?? inferredMime,
-                base64: bytes.toString("base64"),
-              };
-            } else if (typeof a.base64 === "string") {
-              artifactPayload = {
-                filename: a.filename ?? "artifact.bin",
-                mime_type: a.mime_type ?? "application/octet-stream",
-                base64: a.base64,
-              };
-            } else if (typeof a.content === "string") {
-              const fname = a.filename ?? "report.txt";
-              const lowerName = fname.toLowerCase();
-              const inferredMime =
-                lowerName.endsWith(".md") || lowerName.endsWith(".markdown")
-                  ? "text/markdown"
-                  : "text/plain";
-              artifactPayload = {
-                filename: fname,
-                mime_type: a.mime_type ?? inferredMime,
-                base64: Buffer.from(a.content, "utf8").toString("base64"),
-              };
-            }
-          }
-          const inThread = (params as { in_thread?: unknown }).in_thread;
-          const res = await callHost("report", {
-            text: params.text,
-            ...(artifactPayload ? { artifact: artifactPayload } : {}),
-            ...(role === "orchestrator" && typeof inThread === "boolean"
-              ? { in_thread: inThread }
-              : {}),
+          const res = await callHost("review_issue", {
+            ...(params.issue_ref ? { issue_ref: params.issue_ref } : {}),
+            ...(params.focus ? { focus: params.focus } : {}),
           });
           return textResult(res);
         } catch (err) {
@@ -409,44 +440,12 @@ export default function (pi: ExtensionAPI) {
         }
       },
     });
-  } else if (role === "reviewer") {
-    pi.registerTool({
-      name: "submit_review",
-      label: "Submit Review",
-      description:
-        "Submit your final review verdict ('approve', 'request_changes', or 'needs_owner') and summary for this issue.",
-      parameters: Type.Object({
-        verdict: Type.String({
-          description: "Review verdict: 'approve', 'request_changes', or 'needs_owner'",
-        }),
-        summary: Type.String({
-          description: "Concise 1-3 sentence summary of your review verdict and key findings",
-        }),
-        notes_md: Type.Optional(
-          Type.String({
-            description: "Optional detailed markdown review notes saved as an artifact",
-          }),
-        ),
-      }),
-      async execute(_toolCallId, params) {
-        try {
-          const res = await callHost("submit_review", {
-            verdict: params.verdict,
-            summary: params.summary,
-            ...(params.notes_md ? { notes_md: params.notes_md } : {}),
-          });
-          return textResult(res);
-        } catch (err) {
-          return textResult(err instanceof Error ? err.message : String(err), true);
-        }
-      },
-    });
-  } else {
+  } else if (role !== "reviewer") {
     pi.registerTool({
       name: "land_request",
       label: "Request Land",
       description:
-        "Mark this worker session's committed changes as ready for human approval in the Tasks UI and notify your orchestrator (does not post directly to chat).",
+        "Mark this worker session's committed changes as ready for human approval in the Tasks UI and notify your orchestrator (for ad-hoc chat tasks only; not used inside issues).",
       parameters: Type.Object({
         summary: Type.Optional(Type.String({ description: "Short summary of the committed changes ready to land" })),
       }),
@@ -464,7 +463,7 @@ export default function (pi: ExtensionAPI) {
       name: "ask_owner",
       label: "Ask Issue Owner",
       description:
-        "Pause this issue session in needs_input status and ping the issue owner directly with a question.",
+        "Flag a blocking question for the issue owner and ping @owner directly (keeps the issue open).",
       parameters: Type.Object({
         question: Type.String({ description: "Clear question for the issue owner" }),
       }),

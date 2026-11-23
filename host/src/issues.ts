@@ -1,9 +1,11 @@
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import type { KawanDb } from "./db.js";
 import {
   branchTouchesKawanDir,
   commitsAhead,
   commitsBehindMain,
+  getHeadSha,
   getSessionDiff,
   isWorkingTreeClean,
   runRepoChecks,
@@ -13,38 +15,19 @@ import type { MergeQueueManager } from "./merge-queue.js";
 import type { SessionManager } from "./sessions.js";
 import { deriveTaskTitle } from "./sessions.js";
 import type {
-  CheckRunItem,
+  ActiveReviewerInfo,
   ConversationRow,
-  HostSettings,
-  IssueReviewRow,
-  IssueReviewerRow,
   IssueRow,
   IssueStatus,
-  LandingMode,
   LandRow,
   MessageRow,
-  ReviewVerdict,
   SerializedIssue,
+  SerializedLand,
   SessionRow,
   UserRow,
 } from "./types.js";
 import { serializeLand } from "./types.js";
 import type { KawanWsServer } from "./ws.js";
-
-export interface IssueReviewerInput {
-  bot_id: string;
-  focus?: string | null;
-}
-
-interface ReviewerRunState {
-  issueId: string;
-  round: number;
-  slotId: string;
-  botId: string;
-  focus: string | null;
-  submitted?: IssueReviewRow;
-  notesMd?: string;
-}
 
 export class IssueManager {
   private readonly dataDir: string;
@@ -54,12 +37,9 @@ export class IssueManager {
   private readonly mergeQueue: MergeQueueManager;
   private readonly disableSandbox: boolean;
   private closed = false;
-  private runningReviewCycles = new Set<string>();
-  private activeCycleTokens = new Map<string, symbol>();
-  private pendingAutoReview = new Map<string, { nextRound: number }>();
-  private consecutiveCheckFails = new Map<string, number>();
-  private activeReviewerSessions = new Map<string, Set<string>>();
-  private reviewerRunState = new Map<string, ReviewerRunState>();
+  private activeReviewers = new Map<string, Map<string, ActiveReviewerInfo>>();
+  private activeReviewerRuns = new Set<Promise<void>>();
+  private runningChecks = new Map<string, Promise<void>>();
 
   constructor(opts: {
     dataDir: string;
@@ -84,9 +64,6 @@ export class IssueManager {
           ownerId: input.owner_id,
           implementerBotId: input.implementer_bot_id,
           parentIssueId: input.parent_issue_id,
-          autoStartReview: input.auto_start_review,
-          landingMode: input.landing_mode,
-          maxRounds: input.max_rounds,
           actingBotId: session.bot_id,
         });
         return { issue: res.issue };
@@ -95,21 +72,15 @@ export class IssueManager {
         const issue = this.updateIssue(input.issue_ref, {
           title: input.title,
           body_md: input.body_md,
-          owner_id: input.owner_id,
           implementer_bot_id: input.implementer_bot_id,
           parent_issue_id: input.parent_issue_id,
-          auto_start_review: input.auto_start_review,
-          landing_mode: input.landing_mode,
-          max_rounds: input.max_rounds,
           actingBotId: session.bot_id,
         });
         return { issue };
       },
       listIssues: (status) => {
         return {
-          issues: this.db.listIssues(status ? { status: status as IssueStatus } : undefined).map((i) =>
-            this.db.serializeIssue(i),
-          ),
+          issues: this.listIssues(status ? { status: status as IssueStatus } : undefined),
         };
       },
       askOwner: async (session, question) => {
@@ -122,8 +93,11 @@ export class IssueManager {
         }
         return await this.syncWithMain(issue.id, { fromWorkerTool: true });
       },
-      submitReview: async (session, input) => {
-        return await this.handleSubmitReview(session, input);
+      bindWorkerSession: (issueId, botId, sessionId) => {
+        this.bindWorkerSession(issueId, botId, sessionId);
+      },
+      startReadOnlyReview: async (input) => {
+        return await this.startReadOnlyReview(input);
       },
       onIssueWorkerTurnCompleted: async (issue, session) => {
         await this.onWorkerTurnCompleted(issue, session);
@@ -137,96 +111,33 @@ export class IssueManager {
 
   async close(): Promise<void> {
     this.closed = true;
-    const issueIds = new Set<string>([
-      ...this.runningReviewCycles,
-      ...this.activeReviewerSessions.keys(),
-    ]);
-    await Promise.all([...issueIds].map((id) => this.cancelActiveReviewers(id)));
+    const issueIds = [...this.activeReviewers.keys()];
+    await Promise.all(issueIds.map((id) => this.cancelActiveReviewers(id)));
+    await Promise.allSettled([...this.activeReviewerRuns, ...this.runningChecks.values()]);
+  }
+
+  serializeIssue(issue: IssueRow): SerializedIssue {
+    const base = this.db.serializeIssue(issue);
+    const reviewersMap = this.activeReviewers.get(issue.id);
+    return {
+      ...base,
+      active_reviewers: reviewersMap ? [...reviewersMap.values()] : [],
+    };
   }
 
   private async cancelActiveReviewers(issueId: string): Promise<void> {
-    this.pendingAutoReview.delete(issueId);
-    const active = this.activeReviewerSessions.get(issueId);
+    const active = this.activeReviewers.get(issueId);
     if (!active || active.size === 0) {
-      this.activeReviewerSessions.delete(issueId);
+      this.activeReviewers.delete(issueId);
       return;
     }
-    this.activeReviewerSessions.delete(issueId);
-    await Promise.allSettled([...active].map((sid) => this.sessionManager.stopSession(sid)));
-  }
-
-  private async handleSubmitReview(
-    session: SessionRow,
-    input: { verdict: ReviewVerdict; summary: string; notes_md?: string },
-  ): Promise<{ review: IssueReviewRow }> {
-    const state = this.reviewerRunState.get(session.id);
-    if (!state) {
-      throw new Error("Reviewer session is no longer active");
+    const sessionIds = [...active.keys()];
+    this.activeReviewers.delete(issueId);
+    await Promise.allSettled(sessionIds.map((sid) => this.sessionManager.stopSession(sid)));
+    const refreshed = this.db.getIssue(issueId);
+    if (refreshed && !this.closed) {
+      this.broadcastIssue(this.serializeIssue(refreshed));
     }
-    if (state.submitted) {
-      return { review: state.submitted };
-    }
-    const issue = this.db.getIssue(state.issueId);
-    if (!issue) {
-      throw new Error("Issue no longer exists");
-    }
-    let notesArtifactId: string | null = null;
-    const cleanNotes = input.notes_md?.trim() || "";
-    if (cleanNotes) {
-      const conv = this.db.getConversation(issue.conversation_id);
-      const art = this.sessionManager.createTextArtifact({
-        content: cleanNotes,
-        filename: `review-r${state.round}-${state.slotId.slice(0, 6)}.md`,
-        mimeType: "text/markdown",
-        sessionId: session.id,
-        conversationId: issue.conversation_id,
-      });
-      notesArtifactId = art.id;
-      if (conv) {
-        this.wsServer.broadcastToConversation(conv, { type: "artifact.new", artifact: art });
-      }
-    }
-
-    const review = this.db.createIssueReview({
-      issueId: state.issueId,
-      round: state.round,
-      reviewerSlotId: state.slotId,
-      sessionId: session.id,
-      verdict: input.verdict,
-      summary: input.summary.trim(),
-      notesArtifactId,
-    });
-    state.submitted = review;
-    if (cleanNotes) {
-      state.notesMd = cleanNotes;
-    }
-    this.broadcastIssue(this.db.serializeIssue(this.db.getIssue(issue.id)!));
-    return { review };
-  }
-
-  private async onWorkerTurnCompleted(issue: IssueRow, session: SessionRow): Promise<void> {
-    if (this.closed) return;
-    if (issue.status !== "implementing" || session.status !== "idle") return;
-    if (this.runningReviewCycles.has(issue.id)) return;
-
-    const pending = this.pendingAutoReview.get(issue.id);
-    const shouldAutoFirstPass = !pending && Boolean(issue.auto_start_review) && issue.current_round === 0;
-    if (!pending && !shouldAutoFirstPass) return;
-
-    const settings = this.db.getHostSettings();
-    if (!settings.repo?.bare_path || !session.clone_path || !existsSync(session.clone_path)) {
-      return;
-    }
-    const clean = await isWorkingTreeClean(session.clone_path);
-    const ahead = clean ? await commitsAhead(session.clone_path, settings.repo.default_branch) : 0;
-    if (!clean || ahead < 1) {
-      // Implementer paused cleanly without committing new code (or left dirty state); stay in Collaborate
-      this.pendingAutoReview.delete(issue.id);
-      return;
-    }
-
-    this.pendingAutoReview.delete(issue.id);
-    await this.startReviewCycle(issue.id, { round: pending?.nextRound, isAuto: true });
   }
 
   resolveIssueRef(ref: string | number): IssueRow {
@@ -295,16 +206,48 @@ export class IssueManager {
     return msg;
   }
 
+  private async refreshGitMetrics(issue: IssueRow): Promise<{
+    issue: IssueRow;
+    clean: boolean;
+    headSha: string | null;
+  }> {
+    const sess = issue.active_session_id ? this.db.getSession(issue.active_session_id) : null;
+    const settings = this.db.getHostSettings();
+    if (!sess?.clone_path || !existsSync(sess.clone_path) || !settings.repo?.bare_path) {
+      return { issue, clean: true, headSha: null };
+    }
+    const defaultBranch = settings.repo.default_branch;
+    const [clean, ahead, behind, headSha, touchesKawan] = await Promise.all([
+      isWorkingTreeClean(sess.clone_path),
+      commitsAhead(sess.clone_path, defaultBranch),
+      commitsBehindMain(settings.repo.bare_path, sess.clone_path, defaultBranch),
+      getHeadSha(sess.clone_path),
+      branchTouchesKawanDir(sess.clone_path, defaultBranch),
+    ]);
+
+    const changed =
+      ahead !== issue.commits_ahead ||
+      behind !== issue.behind_main ||
+      Boolean(touchesKawan) !== Boolean(issue.touches_kawan);
+
+    if (changed) {
+      const updated = this.db.updateIssue(issue.id, {
+        commits_ahead: ahead,
+        behind_main: behind,
+        touches_kawan: touchesKawan,
+      })!;
+      this.broadcastIssue(this.serializeIssue(updated));
+      return { issue: updated, clean, headSha };
+    }
+    return { issue, clean, headSha };
+  }
+
   createIssue(input: {
     title: string;
     bodyMd?: string;
     ownerId?: string | null;
     implementerBotId?: string | null;
     parentIssueId?: string | null;
-    autoStartReview?: boolean;
-    landingMode?: LandingMode;
-    maxRounds?: number;
-    reviewers?: IssueReviewerInput[];
     actingBotId?: string | null;
   }): { issue: SerializedIssue; conversation: ConversationRow } {
     const title = input.title.trim();
@@ -320,26 +263,9 @@ export class IssueManager {
     }
 
     const parentId = input.parentIssueId ? this.resolveIssueRef(input.parentIssueId).id : null;
-    const settings = this.db.getHostSettings();
-    const defaultLandingMode: LandingMode =
-      input.landingMode ?? settings.merge_queue?.default_landing_mode ?? "manual";
-
-    const humans = this.db.listUsers("human").map((u) => u.id);
-    const botMembers = new Set<string>();
-    if (implBotId) {
-      botMembers.add(implBotId);
-    } else if (input.actingBotId) {
-      botMembers.add(input.actingBotId);
-    } else {
-      for (const b of this.db.listUsers("bot")) {
-        botMembers.add(b.id);
-      }
-    }
-    for (const r of input.reviewers ?? []) {
-      if (this.db.getUser(r.bot_id)?.kind === "bot") {
-        botMembers.add(r.bot_id);
-      }
-    }
+    const memberIds = new Set<string>(this.db.listUsers().map((u) => u.id));
+    if (implBotId) memberIds.add(implBotId);
+    if (input.actingBotId) memberIds.add(input.actingBotId);
 
     const { issueRow, conv } = this.db.transaction(() => {
       const num = this.db.nextIssueNumber();
@@ -347,31 +273,22 @@ export class IssueManager {
         kind: "issue",
         name: `issue-${num}`,
         topic: title,
-        memberIds: [...humans, ...botMembers],
+        memberIds: [...memberIds],
       });
       const created = this.db.createIssue({
         number: num,
         conversationId: conversation.id,
         title,
         bodyMd: input.bodyMd ?? "",
-        status: "backlog",
+        status: "open",
         ownerId,
         implementerBotId: implBotId,
-        autoStartReview: Boolean(input.autoStartReview),
-        landingMode: defaultLandingMode,
-        maxRounds: Math.max(1, input.maxRounds ?? 3),
         parentIssueId: parentId,
       });
-      if (input.reviewers) {
-        this.db.setIssueReviewers(
-          created.id,
-          input.reviewers.map((r) => ({ botId: r.bot_id, focus: r.focus ?? null })),
-        );
-      }
       return { issueRow: created, conv: conversation };
     });
 
-    const serialized = this.db.serializeIssue(issueRow);
+    const serialized = this.serializeIssue(issueRow);
     this.wsServer.broadcastToConversation(conv, {
       type: "conversation.new",
       conversation: this.buildIssueConvPayload(conv),
@@ -381,7 +298,7 @@ export class IssueManager {
   }
 
   listIssues(filter?: { status?: IssueStatus; ownerId?: string }): SerializedIssue[] {
-    return this.db.listIssues(filter).map((i) => this.db.serializeIssue(i));
+    return this.db.listIssues(filter).map((i) => this.serializeIssue(i));
   }
 
   updateIssue(
@@ -392,10 +309,6 @@ export class IssueManager {
       owner_id?: string;
       implementer_bot_id?: string | null;
       parent_issue_id?: string | null;
-      auto_start_review?: boolean;
-      landing_mode?: LandingMode;
-      max_rounds?: number;
-      reviewers?: IssueReviewerInput[];
       actingBotId?: string | null;
     },
   ): SerializedIssue {
@@ -429,30 +342,36 @@ export class IssueManager {
         owner_id: patch.owner_id,
         implementer_bot_id: patch.implementer_bot_id,
         parent_issue_id: parentId,
-        auto_start_review: patch.auto_start_review,
-        landing_mode: patch.landing_mode,
-        max_rounds: patch.max_rounds !== undefined ? Math.max(1, patch.max_rounds) : undefined,
       })!;
       if (patch.title !== undefined) {
         this.db.updateConversationTopic(existing.conversation_id, nextTitle);
       }
-      if (patch.reviewers) {
-        this.db.setIssueReviewers(
-          existing.id,
-          patch.reviewers.map((r) => ({ botId: r.bot_id, focus: r.focus ?? null })),
-        );
-        for (const r of patch.reviewers) {
-          if (this.db.getUser(r.bot_id)?.kind === "bot") {
-            this.db.addMember(existing.conversation_id, r.bot_id);
-          }
-        }
-      }
       return row;
     });
 
-    const serialized = this.db.serializeIssue(updated);
+    const serialized = this.serializeIssue(updated);
     this.broadcastIssue(serialized);
     return serialized;
+  }
+
+  bindWorkerSession(issueId: string, botId: string, sessionId: string): void {
+    const issue = this.db.getIssue(issueId);
+    if (!issue) return;
+    this.db.addMember(issue.conversation_id, botId);
+    const updated = this.db.updateIssue(issue.id, {
+      implementer_bot_id: botId,
+      active_session_id: sessionId,
+      behind_main: 0,
+      commits_ahead: 0,
+      checks_status: "none",
+      checks_sha: null,
+      checks_summary: null,
+      checks_json: null,
+      checks_artifact_id: null,
+      touches_kawan: false,
+      needs_input_question: null,
+    })!;
+    this.broadcastIssue(this.serializeIssue(updated));
   }
 
   async openIssue(issueRef: string | number, userId: string) {
@@ -460,20 +379,21 @@ export class IssueManager {
     const conv = this.db.getConversation(issue.conversation_id);
     if (!conv) throw new Error(`Conversation missing for issue #${issue.number}`);
 
-    const sess = issue.active_session_id ? this.db.getSession(issue.active_session_id) : null;
-    const settings = this.db.getHostSettings();
-    if (sess?.clone_path && existsSync(sess.clone_path) && settings.repo?.bare_path) {
-      const behind = await commitsBehindMain(
-        settings.repo.bare_path,
-        sess.clone_path,
-        settings.repo.default_branch,
-      );
-      if (behind !== issue.behind_main) {
-        issue = this.db.updateIssue(issue.id, { behind_main: behind })!;
-        this.broadcastIssue(this.db.serializeIssue(issue));
-      }
+    const refreshed = await this.refreshGitMetrics(issue);
+    issue = refreshed.issue;
+
+    if (
+      issue.status === "open" &&
+      refreshed.clean &&
+      issue.commits_ahead >= 1 &&
+      refreshed.headSha &&
+      refreshed.headSha !== issue.checks_sha &&
+      !this.runningChecks.has(issue.id)
+    ) {
+      void this.runImplicitChecks(issue.id).catch(() => {});
     }
 
+    const sess = issue.active_session_id ? this.db.getSession(issue.active_session_id) : null;
     const lastSeq = conv.next_seq - 1;
     const cursor = this.db.markConversationRead(userId, conv.id, lastSeq);
     const unreadCount = Math.max(0, lastSeq - cursor.last_read_seq);
@@ -509,7 +429,7 @@ export class IssueManager {
     const lands = this.db.listLands({ conversationId: conv.id }).map(serializeLand);
 
     return {
-      issue: this.db.serializeIssue(issue),
+      issue: this.serializeIssue(issue),
       conversation: {
         ...conv,
         last_seq: lastSeq,
@@ -525,91 +445,299 @@ export class IssueManager {
     };
   }
 
-  async assignAndRun(params: {
-    issueRef: string | number;
-    implementerBotId?: string;
-    ownerId?: string;
-    autoStartReview?: boolean;
-    landingMode?: LandingMode;
-    maxRounds?: number;
-    reviewers?: IssueReviewerInput[];
-    prompt?: string;
-  }): Promise<{ issue: SerializedIssue; session: Omit<SessionRow, "token"> }> {
-    let issue = this.resolveIssueRef(params.issueRef);
-    const implBotId =
-      params.implementerBotId?.trim() ||
-      issue.implementer_bot_id ||
-      this.db.listUsers("bot")[0]?.id;
-    if (!implBotId) throw new Error("Implementer bot is required");
-    const bot = this.db.getUser(implBotId);
-    if (!bot || bot.kind !== "bot") throw new Error(`Bot not found: ${implBotId}`);
+  private async onWorkerTurnCompleted(issue: IssueRow, session: SessionRow): Promise<void> {
+    if (this.closed) return;
+    if (issue.active_session_id !== session.id) return;
 
-    const settings = this.db.getHostSettings();
-    if (!settings.repo?.bare_path) {
-      throw new Error("Cannot run issue before a repository is configured");
+    const refreshed = await this.refreshGitMetrics(issue);
+    let current = refreshed.issue;
+    if (current.status !== "open") return;
+
+    if (
+      refreshed.clean &&
+      current.commits_ahead >= 1 &&
+      refreshed.headSha &&
+      refreshed.headSha !== current.checks_sha
+    ) {
+      await this.runImplicitChecks(current.id);
+      if (this.closed) return;
+      current = this.db.getIssue(current.id) ?? current;
+      const conv = this.db.getConversation(current.conversation_id);
+      const bot = this.db.getUser(session.bot_id);
+      if (conv && bot) {
+        const aheadLabel = `${current.commits_ahead} commit${current.commits_ahead === 1 ? "" : "s"} ahead`;
+        if (current.checks_status === "passed") {
+          this.postHostNote(
+            conv,
+            bot,
+            `Checkpoint: ${aheadLabel} · Checks passed (${current.checks_summary ?? "ok"}).`,
+            current.checks_artifact_id,
+          );
+        } else if (current.checks_status === "failed") {
+          this.postHostNote(
+            conv,
+            bot,
+            `Checkpoint: ${aheadLabel} · Checks failed (${current.checks_summary ?? "failed"}).`,
+            current.checks_artifact_id,
+          );
+        } else {
+          this.postHostNote(conv, bot, `Checkpoint: ${aheadLabel}.`);
+        }
+      }
+    }
+  }
+
+  async runImplicitChecks(issueId: string): Promise<void> {
+    const existing = this.runningChecks.get(issueId);
+    if (existing) {
+      return await existing;
     }
 
-    this.db.addMember(issue.conversation_id, bot.id);
-    if (params.reviewers) {
-      this.db.setIssueReviewers(
-        issue.id,
-        params.reviewers.map((r) => ({ botId: r.bot_id, focus: r.focus ?? null })),
-      );
-      for (const r of params.reviewers) {
-        if (this.db.getUser(r.bot_id)?.kind === "bot") {
-          this.db.addMember(issue.conversation_id, r.bot_id);
+    const promise = (async () => {
+      if (this.closed) return;
+      const issue = this.db.getIssue(issueId);
+      if (!issue || issue.status !== "open" || !issue.active_session_id) return;
+
+      const sess = this.db.getSession(issue.active_session_id);
+      const settings = this.db.getHostSettings();
+      if (!sess?.clone_path || !existsSync(sess.clone_path) || !settings.repo?.bare_path) return;
+      const bot = this.db.getUser(sess.bot_id);
+      if (!bot) return;
+
+      const clean = await isWorkingTreeClean(sess.clone_path);
+      if (!clean) return;
+      const [ahead, behind, headSha, touchesKawan] = await Promise.all([
+        commitsAhead(sess.clone_path, settings.repo.default_branch),
+        commitsBehindMain(settings.repo.bare_path, sess.clone_path, settings.repo.default_branch),
+        getHeadSha(sess.clone_path),
+        branchTouchesKawanDir(sess.clone_path, settings.repo.default_branch),
+      ]);
+      if (ahead < 1 || !headSha) return;
+
+      const runningRow = this.db.updateIssue(issue.id, {
+        commits_ahead: ahead,
+        behind_main: behind,
+        touches_kawan: touchesKawan,
+        checks_status: "running",
+      })!;
+      if (!this.closed) {
+        this.broadcastIssue(this.serializeIssue(runningRow));
+      }
+
+      const checkRes = await runRepoChecks({
+        workdir: sess.clone_path,
+        verifyCommand: settings.verify_command,
+        sandboxEnabled: Boolean(bot.sandbox_enabled),
+        sandboxNetwork: Boolean(bot.sandbox_network),
+        disableSandbox: this.disableSandbox,
+        allowUnconfigured: true,
+      });
+
+      if (this.closed) return;
+      const conv = this.db.getConversation(issue.conversation_id);
+
+      if (checkRes.source === "none") {
+        const updated = this.db.updateIssue(issue.id, {
+          checks_status: "none",
+          checks_sha: headSha,
+          checks_summary: null,
+          checks_json: null,
+          checks_artifact_id: null,
+        })!;
+        this.broadcastIssue(this.serializeIssue(updated));
+        return;
+      }
+
+      let artifactId: string | null = null;
+      if (checkRes.combined_output.trim()) {
+        const art = this.sessionManager.createTextArtifact({
+          content: checkRes.combined_output,
+          filename: `checks-${headSha.slice(0, 7)}.log`,
+          sessionId: sess.id,
+          conversationId: issue.conversation_id,
+        });
+        artifactId = art.id;
+        if (conv) {
+          this.wsServer.broadcastToConversation(conv, { type: "artifact.new", artifact: art });
+        }
+      }
+
+      const updated = this.db.updateIssue(issue.id, {
+        checks_status: checkRes.ok ? "passed" : "failed",
+        checks_sha: headSha,
+        checks_summary: checkRes.summary,
+        checks_json: JSON.stringify(checkRes.checks),
+        checks_artifact_id: artifactId,
+      })!;
+      this.broadcastIssue(this.serializeIssue(updated));
+    })().finally(() => {
+      if (this.runningChecks.get(issueId) === promise) {
+        this.runningChecks.delete(issueId);
+      }
+    });
+
+    this.runningChecks.set(issueId, promise);
+    await promise;
+  }
+
+  async startReadOnlyReview(input: {
+    issueRef: string | number;
+    bot: UserRow;
+    focus?: string | null;
+  }): Promise<{ session_id: string; issue_id: string; number: number; status: string }> {
+    const issue = this.resolveIssueRef(input.issueRef);
+    if (issue.status !== "open") {
+      throw new Error(`Issue #${issue.number} is ${issue.status}; only open issues can be reviewed`);
+    }
+    const sess = issue.active_session_id ? this.db.getSession(issue.active_session_id) : null;
+    if (!sess || !sess.clone_path || !existsSync(sess.clone_path)) {
+      throw new Error(`Issue #${issue.number} does not have an active branch clone to review yet`);
+    }
+    const settings = this.db.getHostSettings();
+    if (!settings.repo?.bare_path) {
+      throw new Error("Repository is not configured");
+    }
+
+    const conv = this.db.getConversation(issue.conversation_id);
+    if (!conv) throw new Error(`Conversation missing for issue #${issue.number}`);
+    this.db.addMember(conv.id, input.bot.id);
+
+    const implBot = issue.implementer_bot_id ? this.db.getUser(issue.implementer_bot_id) : null;
+    const focusLine = input.focus?.trim() ? `Review focus: ${input.focus.trim()}` : "Review focus: General code quality, correctness, edge cases, and spec alignment.";
+
+    const diff = await getSessionDiff({
+      barePath: settings.repo.bare_path,
+      defaultBranch: settings.repo.default_branch,
+      clonePath: sess.clone_path,
+    });
+    const diffExcerpt = diff.available
+      ? diff.files
+          .slice(0, 12)
+          .map(
+            (f) =>
+              `### ${f.path} (${f.status}, +${f.insertions}/-${f.deletions})\n\`\`\`diff\n${f.patch.slice(0, 2000)}\n\`\`\``,
+          )
+          .join("\n\n")
+      : `Diff unavailable (${diff.note ?? "no commits yet"}).`;
+
+    let checkExcerpt = "";
+    if (issue.checks_status === "failed" && issue.checks_artifact_id) {
+      const art = this.db.getArtifact(issue.checks_artifact_id);
+      if (art) {
+        const p = join(this.dataDir, "artifacts", art.sha256);
+        if (existsSync(p)) {
+          checkExcerpt = `\n\nLatest check log excerpt:\n\`\`\`\n${readFileSync(p, "utf8").slice(-1500)}\n\`\`\``;
         }
       }
     }
 
-    issue = this.db.updateIssue(issue.id, {
-      owner_id: params.ownerId,
-      implementer_bot_id: bot.id,
-      auto_start_review: params.autoStartReview,
-      landing_mode: params.landingMode,
-      max_rounds: params.maxRounds !== undefined ? Math.max(1, params.maxRounds) : undefined,
-      status: "implementing",
-      needs_input_question: null,
-    })!;
+    const systemPrompt = [
+      `You are ${input.bot.name}, acting as a read-only code reviewer for Issue #${issue.number}: "${issue.title}".`,
+      focusLine,
+      "Constraints:",
+      "- You are running inside a READ-ONLY view of the implementer branch clone (no bash/edit/write tools).",
+      "- You can inspect files cleanly via read/grep/find/ls and inspect kawan://issue.md and kawan://soul.md.",
+      "- Post your concrete findings (or concise sign-off if everything looks solid) directly to the issue room via report(text, artifact?) or a direct reply.",
+      implBot && implBot.id !== input.bot.id
+        ? `- Address @${implBot.name} when requesting concrete code changes so they see your feedback and can fix it on their branch.`
+        : "- Be concrete and reference file paths, behaviors, and edge cases.",
+    ].join("\n");
 
-    const conv = this.db.getConversation(issue.conversation_id)!;
-    const existingSess = issue.active_session_id ? this.db.getSession(issue.active_session_id) : null;
-    let workerSession: SessionRow;
-    if (
-      existingSess &&
-      existingSess.bot_id === bot.id &&
-      existingSess.clone_path &&
-      existsSync(existingSess.clone_path) &&
-      existingSess.status !== "landed" &&
-      existingSess.status !== "archived"
-    ) {
-      const promptText =
-        params.prompt?.trim() ||
-        `Resume work on Issue #${issue.number}: ${issue.title}\n\n${issue.body_md}`;
-      await this.sessionManager.resumeIssueWorker(existingSess.id, promptText);
-      workerSession = this.db.getSession(existingSess.id)!;
-    } else {
-      workerSession = await this.sessionManager.launchIssueImplementer({
-        issue,
-        bot,
-        extraPrompt: params.prompt,
-      });
-      issue = this.db.updateIssue(issue.id, {
-        active_session_id: workerSession.id,
-        behind_main: 0,
-      })!;
-    }
+    const recentMsgs = this.db.listRecentMessages(conv.id, 10).map((m) => {
+      const u = this.db.getUser(m.author_id);
+      return `${u?.name ?? "user"}: ${m.body}`;
+    });
 
-    this.postHostNote(
-      conv,
-      bot,
-      `Assigned Issue #${issue.number} to @${bot.name} — starting implementation.`,
-    );
-    const serialized = this.db.serializeIssue(issue);
-    this.broadcastIssue(serialized);
+    const promptText = [
+      `# Read-only review request for Issue #${issue.number}: ${issue.title}`,
+      focusLine,
+      `Branch: ${sess.branch ?? "(local)"} (${issue.commits_ahead} commit${issue.commits_ahead === 1 ? "" : "s"} ahead of ${settings.repo.default_branch})`,
+      `Latest checks: ${issue.checks_status}${issue.checks_summary ? ` (${issue.checks_summary})` : ""}${checkExcerpt}`,
+      "",
+      "Check kawan://issue.md for the full current Markdown specification.",
+      "",
+      "## Branch Diff",
+      diffExcerpt,
+      "",
+      ...(recentMsgs.length > 0 ? ["## Recent Discussion", ...recentMsgs, ""] : []),
+      "Inspect any files needed in the repo and post your review directly into this room.",
+    ].join("\n");
+
+    let resolveCreated!: (sid: string) => void;
+    let rejectCreated!: (err: Error) => void;
+    const createdPromise = new Promise<string>((resolve, reject) => {
+      resolveCreated = resolve;
+      rejectCreated = reject;
+    });
+
+    let createdSid: string | null = null;
+    const runPromise = (async () => {
+      try {
+        await this.sessionManager.runReviewerSession({
+          bot: input.bot,
+          issue,
+          round: 1,
+          focus: input.focus?.trim() || null,
+          clonePath: sess.clone_path!,
+          systemPrompt,
+          promptText,
+          onSessionCreated: (sid) => {
+            createdSid = sid;
+            let map = this.activeReviewers.get(issue.id);
+            if (!map) {
+              map = new Map();
+              this.activeReviewers.set(issue.id, map);
+            }
+            map.set(sid, {
+              session_id: sid,
+              bot_id: input.bot.id,
+              bot_name: input.bot.name,
+              focus: input.focus?.trim() || null,
+            });
+            const latest = this.db.getIssue(issue.id);
+            if (latest && !this.closed) {
+              this.broadcastIssue(this.serializeIssue(latest));
+            }
+            resolveCreated(sid);
+          },
+        });
+      } catch (err) {
+        if (!createdSid) {
+          rejectCreated(err instanceof Error ? err : new Error(String(err)));
+        }
+        if (!this.closed) {
+          this.wsServer.broadcastToConversation(conv, {
+            type: "error",
+            conversation_id: conv.id,
+            ...(createdSid ? { session_id: createdSid } : {}),
+            message: err instanceof Error ? err.message : String(err),
+          });
+        }
+      } finally {
+        if (createdSid) {
+          const map = this.activeReviewers.get(issue.id);
+          if (map?.delete(createdSid) && map.size === 0) {
+            this.activeReviewers.delete(issue.id);
+          }
+          const latest = this.db.getIssue(issue.id);
+          if (latest && !this.closed) {
+            this.broadcastIssue(this.serializeIssue(latest));
+          }
+        }
+      }
+    })();
+
+    const tracked = runPromise.finally(() => {
+      this.activeReviewerRuns.delete(tracked);
+    });
+    this.activeReviewerRuns.add(tracked);
+
+    const sessionId = await createdPromise;
     return {
-      issue: serialized,
-      session: this.sessionManager.serializePublicSession(workerSession),
+      session_id: sessionId,
+      issue_id: issue.id,
+      number: issue.number,
+      status: "running",
     };
   }
 
@@ -622,7 +750,7 @@ export class IssueManager {
     const existing = this.db.getIssueBySessionId(params.sessionId);
     if (existing) {
       const conv = this.db.getConversation(existing.conversation_id)!;
-      return { issue: this.db.serializeIssue(existing), conversation: conv };
+      return { issue: this.serializeIssue(existing), conversation: conv };
     }
 
     const session = this.db.getSession(params.sessionId);
@@ -637,39 +765,32 @@ export class IssueManager {
     const lands = this.db.listLands({ sessionId: session.id });
     const latestLand = lands.at(-1) ?? null;
 
-    let derivedStatus: IssueStatus = "implementing";
-    if (latestLand?.status === "landed" || session.status === "landed") {
-      derivedStatus = "landed";
-    } else if (
-      latestLand &&
-      (latestLand.status === "queued" ||
-        latestLand.status === "rebasing" ||
-        latestLand.status === "verifying" ||
-        latestLand.status === "paused")
-    ) {
-      derivedStatus = "queued";
-    } else if (latestLand?.status === "requested" || session.status === "review_requested") {
-      derivedStatus = "ready_to_land";
-    }
+    const derivedStatus: IssueStatus =
+      latestLand?.status === "landed" || session.status === "landed" ? "landed" : "open";
 
     const title = params.title?.trim() || deriveTaskTitle(session.task, session.title);
     const bodyMd = params.bodyMd !== undefined ? params.bodyMd : (session.task ?? "");
     const ownerId = this.defaultOwnerId(params.ownerId);
-    const humans = this.db.listUsers("human").map((u) => u.id);
+    const memberIds = new Set<string>(this.db.listUsers().map((u) => u.id));
+    memberIds.add(session.bot_id);
 
     const settings = this.db.getHostSettings();
     let behindMain = 0;
+    let aheadMain = 0;
+    let touchesKawan = false;
+    let clean = false;
     if (
       session.clone_path &&
       existsSync(session.clone_path) &&
       settings.repo?.bare_path &&
-      derivedStatus !== "landed"
+      derivedStatus === "open"
     ) {
-      behindMain = await commitsBehindMain(
-        settings.repo.bare_path,
-        session.clone_path,
-        settings.repo.default_branch,
-      );
+      [clean, aheadMain, behindMain, touchesKawan] = await Promise.all([
+        isWorkingTreeClean(session.clone_path),
+        commitsAhead(session.clone_path, settings.repo.default_branch),
+        commitsBehindMain(settings.repo.bare_path, session.clone_path, settings.repo.default_branch),
+        branchTouchesKawanDir(session.clone_path, settings.repo.default_branch),
+      ]);
     }
 
     const { issueRow, conv, updatedSession, updatedLands } = this.db.transaction(() => {
@@ -678,7 +799,7 @@ export class IssueManager {
         kind: "issue",
         name: `issue-${num}`,
         topic: title,
-        memberIds: [...humans, session.bot_id],
+        memberIds: [...memberIds],
       });
       const created = this.db.createIssue({
         number: num,
@@ -688,9 +809,10 @@ export class IssueManager {
         status: derivedStatus,
         ownerId,
         implementerBotId: session.bot_id,
-        landingMode: settings.merge_queue?.default_landing_mode ?? "manual",
         activeSessionId: session.id,
         behindMain,
+        commitsAhead: aheadMain,
+        touchesKawan,
       });
       const sessUpd = this.db.updateSession(session.id, {
         conversation_id: conversation.id,
@@ -743,8 +865,11 @@ export class IssueManager {
       }
     }
 
-    const serialized = this.db.serializeIssue(issueRow);
+    const serialized = this.serializeIssue(issueRow);
     this.broadcastIssue(serialized);
+    if (derivedStatus === "open" && clean && aheadMain >= 1) {
+      void this.runImplicitChecks(issueRow.id).catch(() => {});
+    }
     return { issue: serialized, conversation: conv };
   }
 
@@ -776,8 +901,16 @@ export class IssueManager {
       clonePath: sess.clone_path,
       defaultBranch: settings.repo.default_branch,
     });
-    issue = this.db.updateIssue(issue.id, { behind_main: res.behindAfter })!;
-    const serialized = this.db.serializeIssue(issue);
+    const [ahead, touchesKawan] = await Promise.all([
+      commitsAhead(sess.clone_path, settings.repo.default_branch),
+      branchTouchesKawanDir(sess.clone_path, settings.repo.default_branch),
+    ]);
+    issue = this.db.updateIssue(issue.id, {
+      behind_main: res.behindAfter,
+      commits_ahead: ahead,
+      touches_kawan: touchesKawan,
+    })!;
+    const serialized = this.serializeIssue(issue);
     this.broadcastIssue(serialized);
 
     const conv = this.db.getConversation(issue.conversation_id);
@@ -791,6 +924,10 @@ export class IssueManager {
       this.postHostNote(conv, bot, text);
     }
 
+    if (res.ok && res.behindBefore > 0 && ahead >= 1 && issue.status === "open") {
+      void this.runImplicitChecks(issue.id).catch(() => {});
+    }
+
     return {
       ok: res.ok,
       behind_before: res.behindBefore,
@@ -798,6 +935,100 @@ export class IssueManager {
       error: res.error,
       issue: serialized,
     };
+  }
+
+  async landIssue(
+    issueRef: string | number,
+    userId: string,
+  ): Promise<{ issue: SerializedIssue; land: SerializedLand }> {
+    const issue = this.resolveIssueRef(issueRef);
+    if (issue.status !== "open") {
+      throw new Error(`Issue #${issue.number} is ${issue.status}, not open`);
+    }
+    const settings = this.db.getHostSettings();
+    if (!settings.repo?.bare_path) {
+      throw new Error("Repository is not configured");
+    }
+    const sess = issue.active_session_id ? this.db.getSession(issue.active_session_id) : null;
+    if (!sess || !sess.clone_path || !existsSync(sess.clone_path) || !sess.branch) {
+      throw new Error(`Issue #${issue.number} has no active branch to land`);
+    }
+    if (sess.status === "running") {
+      throw new Error("Wait for the active worker turn to finish (or Stop it) before landing");
+    }
+    const clean = await isWorkingTreeClean(sess.clone_path);
+    if (!clean) {
+      throw new Error("Worker clone has uncommitted changes; commit before landing");
+    }
+    const ahead = await commitsAhead(sess.clone_path, settings.repo.default_branch);
+    if (ahead < 1) {
+      throw new Error(
+        `Branch has 0 commits ahead of ${settings.repo.default_branch}; commit changes before landing`,
+      );
+    }
+
+    const existingLands = this.db.listLands({ sessionId: sess.id });
+    const activeLand = existingLands.find(
+      (l) =>
+        l.status === "queued" ||
+        l.status === "rebasing" ||
+        l.status === "verifying" ||
+        l.status === "paused",
+    );
+    if (activeLand) {
+      throw new Error(`Issue #${issue.number} is already in the merge queue (${activeLand.status})`);
+    }
+
+    await this.cancelActiveReviewers(issue.id);
+
+    const touchesKawan = await branchTouchesKawanDir(sess.clone_path, settings.repo.default_branch);
+    const updatedIssue = this.db.updateIssue(issue.id, {
+      commits_ahead: ahead,
+      touches_kawan: touchesKawan,
+    })!;
+    this.broadcastIssue(this.serializeIssue(updatedIssue));
+
+    const reusable = [...existingLands]
+      .reverse()
+      .find((l) => l.status === "requested" || l.status === "failed" || l.status === "removed");
+
+    const landRow = reusable
+      ? this.db.updateLand(reusable.id, {
+          status: "requested",
+          issue_id: issue.id,
+          conversation_id: issue.conversation_id,
+          thread_id: null,
+          checks_json: updatedIssue.checks_json,
+          touches_kawan: touchesKawan ? 1 : 0,
+          error: null,
+        })!
+      : (() => {
+          const created = this.db.createLand({
+            sessionId: sess.id,
+            conversationId: issue.conversation_id,
+            issueId: issue.id,
+          });
+          return this.db.updateLand(created.id, {
+            checks_json: updatedIssue.checks_json,
+            touches_kawan: touchesKawan ? 1 : 0,
+          })!;
+        })();
+
+    const conv = this.db.getConversation(issue.conversation_id);
+    const bot = this.db.getUser(sess.bot_id);
+    if (conv && bot) {
+      const kawanWarn = touchesKawan ? " (Modifies `.kawan/` checks.)" : "";
+      this.postHostNote(conv, bot, `Enqueued Issue #${issue.number} onto #merge-queue.${kawanWarn}`);
+    }
+
+    const enqueued = await this.mergeQueue.enqueueLand({
+      landId: landRow.id,
+      approvedBy: userId,
+      trigger: "manual_approve",
+      waitForSettlement: false,
+    });
+    const latest = this.db.getIssue(issue.id) ?? updatedIssue;
+    return { issue: this.serializeIssue(latest), land: enqueued.land };
   }
 
   async handleAskOwner(
@@ -817,12 +1048,11 @@ export class IssueManager {
     if (!conv) throw new Error("Issue conversation not found");
 
     const updated = this.db.updateIssue(issue.id, {
-      status: "needs_input",
       needs_input_question: trimmed,
     })!;
     this.sessionManager.markTurnReported(session.id);
     this.postHostNote(conv, bot, `@${owner?.name ?? "owner"}: ${trimmed}`);
-    this.broadcastIssue(this.db.serializeIssue(updated));
+    this.broadcastIssue(this.serializeIssue(updated));
     return { issue_id: updated.id, number: updated.number, status: updated.status };
   }
 
@@ -833,7 +1063,7 @@ export class IssueManager {
   ): boolean {
     if (conversation.kind !== "issue" || author.kind !== "human") return false;
     const issue = this.db.getIssueByConversationId(conversation.id);
-    if (!issue || issue.status !== "needs_input" || !issue.active_session_id) {
+    if (!issue || issue.status !== "open" || !issue.needs_input_question || !issue.active_session_id) {
       return false;
     }
     if (author.id !== issue.owner_id && author.role !== "admin") {
@@ -845,10 +1075,9 @@ export class IssueManager {
     }
 
     const updated = this.db.updateIssue(issue.id, {
-      status: "implementing",
       needs_input_question: null,
     })!;
-    this.broadcastIssue(this.db.serializeIssue(updated));
+    this.broadcastIssue(this.serializeIssue(updated));
 
     const prompt = [
       `[Owner ${author.name} answered your question in Issue #${updated.number}]:`,
@@ -867,593 +1096,20 @@ export class IssueManager {
     return true;
   }
 
-  async startReviewCycle(
-    issueRef: string | number,
-    opts?: { round?: number; isAuto?: boolean },
-  ): Promise<{
-    issue: SerializedIssue;
-    ok: boolean;
-    checks: CheckRunItem[];
-    land?: ReturnType<typeof serializeLand>;
-  }> {
-    let issue = this.resolveIssueRef(issueRef);
-    const settings = this.db.getHostSettings();
-    if (!settings.repo?.bare_path) {
-      throw new Error("Repository is not configured");
-    }
-    const sess = issue.active_session_id ? this.db.getSession(issue.active_session_id) : null;
-    if (!sess || !sess.clone_path || !existsSync(sess.clone_path)) {
-      throw new Error("Issue does not have an active worker clone yet");
-    }
-    if (sess.status === "running") {
-      throw new Error("Wait for the current worker turn to finish or Stop it before starting review");
-    }
-    if (this.runningReviewCycles.has(issue.id)) {
-      throw new Error("A review cycle is already in progress for this issue");
-    }
-    const clean = await isWorkingTreeClean(sess.clone_path);
-    if (!clean) {
-      throw new Error("Worker clone has uncommitted changes; commit before starting review");
-    }
-    const ahead = await commitsAhead(sess.clone_path, settings.repo.default_branch);
-    if (ahead < 1) {
-      throw new Error(
-        `Issue branch has 0 commits ahead of ${settings.repo.default_branch}; commit changes first`,
-      );
-    }
-
-    const conv = this.db.getConversation(issue.conversation_id)!;
-    const bot = this.db.getUser(sess.bot_id)!;
-    const prevReviews = this.db.listIssueReviews(issue.id);
-    const maxRecordedRound = prevReviews.reduce((m, r) => Math.max(m, r.round), 0);
-    const round = opts?.round ?? Math.max(1, maxRecordedRound + 1);
-
-    const cycleToken = Symbol(`review-${issue.id}-${round}`);
-    this.runningReviewCycles.add(issue.id);
-    this.activeCycleTokens.set(issue.id, cycleToken);
-    let handedToBackgroundReviewers = false;
-
-    try {
-      issue = this.db.updateIssue(issue.id, {
-        status: "verifying",
-        current_round: round,
-        needs_input_question: null,
-      })!;
-      this.broadcastIssue(this.db.serializeIssue(issue));
-
-      const checkRes = await runRepoChecks({
-        workdir: sess.clone_path,
-        verifyCommand: settings.verify_command,
-        sandboxEnabled: Boolean(bot.sandbox_enabled),
-        sandboxNetwork: Boolean(bot.sandbox_network),
-        disableSandbox: this.disableSandbox,
-      });
-      const touchesKawan = await branchTouchesKawanDir(sess.clone_path, settings.repo.default_branch);
-
-      if (this.closed || this.activeCycleTokens.get(issue.id) !== cycleToken) {
-        return { issue: this.db.serializeIssue(this.db.getIssue(issue.id)!), ok: false, checks: checkRes.checks };
-      }
-
-      const reviewers = this.db.listIssueReviewers(issue.id);
-
-      if (!checkRes.ok) {
-        const failArt = this.sessionManager.createTextArtifact({
-          content: checkRes.combined_output,
-          filename: "checks-failure.log",
-          sessionId: sess.id,
-          conversationId: conv.id,
-        });
-        this.wsServer.broadcastToConversation(conv, { type: "artifact.new", artifact: failArt });
-
-        const autoLoopEnabled = reviewers.length > 0 || Boolean(issue.auto_start_review);
-        if (autoLoopEnabled) {
-          const fails = (this.consecutiveCheckFails.get(issue.id) ?? 0) + 1;
-          this.consecutiveCheckFails.set(issue.id, fails);
-          if (fails >= 2) {
-            const owner = this.db.getUser(issue.owner_id);
-            const q =
-              "Pre-review verification checks failed twice in a row. Inspect `checks-failure.log` and reply with guidance or fix manually.";
-            issue = this.db.updateIssue(issue.id, {
-              status: "needs_input",
-              needs_input_question: q,
-            })!;
-            this.pendingAutoReview.delete(issue.id);
-            this.postHostNote(conv, bot, `@${owner?.name ?? "owner"}: ${q}`, failArt.id);
-            const serialized = this.db.serializeIssue(issue);
-            this.broadcastIssue(serialized);
-            return { issue: serialized, ok: false, checks: checkRes.checks };
-          }
-          this.pendingAutoReview.set(issue.id, { nextRound: round });
-        }
-
-        issue = this.db.updateIssue(issue.id, { status: "implementing" })!;
-        this.postHostNote(
-          conv,
-          bot,
-          `Pre-review verification failed (${checkRes.summary}) — returning to implementer to fix.`,
-          failArt.id,
-        );
-        const serialized = this.db.serializeIssue(issue);
-        this.broadcastIssue(serialized);
-
-        void this.sessionManager.resumeIssueWorker(
-          sess.id,
-          [
-            `[Pre-review checks failed (${checkRes.summary})]`,
-            checkRes.combined_output,
-            "",
-            "Fix the failing checks cleanly, commit on your branch, and call report(summary).",
-          ].join("\n"),
-        );
-
-        return { issue: serialized, ok: false, checks: checkRes.checks };
-      }
-
-      this.consecutiveCheckFails.delete(issue.id);
-
-      if (reviewers.length === 0) {
-        const finalized = await this.finalizeApprovedReviewCycle({
-          issue,
-          sess,
-          conv,
-          implBot: bot,
-          settings,
-          checkRes,
-          touchesKawan,
-        });
-        return { issue: finalized.issue, ok: true, checks: checkRes.checks, land: finalized.land };
-      }
-
-      issue = this.db.updateIssue(issue.id, {
-        status: "reviewing",
-        current_round: round,
-        needs_input_question: null,
-      })!;
-      const serialized = this.db.serializeIssue(issue);
-      this.broadcastIssue(serialized);
-      this.postHostNote(
-        conv,
-        bot,
-        `Checks passed (${checkRes.summary}). Starting Review Round ${round}/${issue.max_rounds} with ${reviewers.length} reviewer${reviewers.length === 1 ? "" : "s"}.`,
-      );
-
-      handedToBackgroundReviewers = true;
-      void this.runParallelReviewers({
-        issueId: issue.id,
-        cycleToken,
-        round,
-        sess,
-        conv,
-        implBot: bot,
-        reviewers,
-        checkRes,
-        touchesKawan,
-      });
-
-      return { issue: serialized, ok: true, checks: checkRes.checks };
-    } finally {
-      if (!handedToBackgroundReviewers && this.activeCycleTokens.get(issue.id) === cycleToken) {
-        this.runningReviewCycles.delete(issue.id);
-        this.activeCycleTokens.delete(issue.id);
-      }
-    }
-  }
-
-  private async runParallelReviewers(params: {
-    issueId: string;
-    cycleToken: symbol;
-    round: number;
-    sess: SessionRow;
-    conv: ConversationRow;
-    implBot: UserRow;
-    reviewers: IssueReviewerRow[];
-    checkRes: { summary: string; combined_output: string };
-    touchesKawan: boolean;
-  }): Promise<void> {
-    try {
-      const settings = this.db.getHostSettings();
-      const issue = this.db.getIssue(params.issueId);
-      if (
-        !issue ||
-        this.closed ||
-        !params.sess.clone_path ||
-        !existsSync(params.sess.clone_path) ||
-        !settings.repo?.bare_path
-      ) {
-        return;
-      }
-
-      const diff = await getSessionDiff({
-        clonePath: params.sess.clone_path,
-        defaultBranch: settings.repo.default_branch,
-      });
-      let diffText = "(No diff available)";
-      if (diff.available) {
-        const chunks: string[] = [];
-        let total = 0;
-        for (const f of diff.files) {
-          const block = `### ${f.path} [${f.status}] (+${f.insertions}/-${f.deletions})\n\`\`\`diff\n${f.patch}\n\`\`\``;
-          if (total + block.length > 20_000) {
-            chunks.push("\n... (remaining files truncated)");
-            break;
-          }
-          chunks.push(block);
-          total += block.length;
-        }
-        diffText = chunks.join("\n\n") || "(Empty diff)";
-      }
-
-      const priorReviews = this.db
-        .listIssueReviews(issue.id)
-        .filter((r) => r.round < params.round);
-      const priorSection =
-        priorReviews.length > 0
-          ? priorReviews
-              .map(
-                (r) =>
-                  `- Round ${r.round} (${r.verdict}): ${r.summary}`,
-              )
-              .join("\n")
-          : "(None)";
-
-      const activeSet = new Set<string>();
-      this.activeReviewerSessions.set(issue.id, activeSet);
-
-      const results = await Promise.all(
-        params.reviewers.map(async (slot) => {
-          const reviewerBot = this.db.getUser(slot.bot_id) ?? params.implBot;
-          const focusLine = slot.focus?.trim()
-            ? `Your assigned review focus: ${slot.focus.trim()}`
-            : "Review holistically for correctness, edge cases, and maintainability.";
-          const roundGuidance =
-            params.round >= 2
-              ? `This is Review Round ${params.round} of ${issue.max_rounds}. Strictly verify whether prior blocking findings were resolved and check for regressions. Do NOT raise new style nits or scope creep.`
-              : "Focus on real bugs, missing requirements, edge cases, and test coverage rather than stylistic nitpicks.";
-
-          const systemPrompt = [
-            `You are read-only code reviewer @${reviewerBot.name} for Issue #${issue.number}: "${issue.title}".`,
-            focusLine,
-            roundGuidance,
-            "Rules:",
-            "- You are in a READ-ONLY workspace with no edit/write/bash commit rights.",
-            "- Inspect additional repository files read-only only if needed.",
-            "- Finish by calling submit_review(verdict, summary, notes_md?) with verdict 'approve', 'request_changes', or 'needs_owner'.",
-          ].join("\n");
-
-          const promptText = [
-            `# Review Request: Issue #${issue.number} — ${issue.title} (Round ${params.round}/${issue.max_rounds})`,
-            "",
-            "## Specification",
-            issue.body_md || "(No markdown specification provided.)",
-            "",
-            "## Implementer's Summary",
-            params.sess.last_report || "(No explicit report text.)",
-            "",
-            "## Pre-Review Checks",
-            params.checkRes.summary,
-            "",
-            "## Prior Review Rounds",
-            priorSection,
-            "",
-            "## Branch Diff vs Default Branch",
-            diffText,
-          ].join("\n");
-
-          let createdSessionId = "";
-          let notesMd: string | undefined;
-          let submitted: IssueReviewRow | undefined;
-
-          try {
-            const turn = await this.sessionManager.runReviewerSession({
-              bot: reviewerBot,
-              issue,
-              round: params.round,
-              focus: slot.focus,
-              clonePath: params.sess.clone_path!,
-              systemPrompt,
-              promptText,
-              onSessionCreated: (sid) => {
-                createdSessionId = sid;
-                activeSet.add(sid);
-                this.reviewerRunState.set(sid, {
-                  issueId: issue.id,
-                  round: params.round,
-                  slotId: slot.id,
-                  botId: reviewerBot.id,
-                  focus: slot.focus,
-                });
-              },
-            });
-
-            if (createdSessionId) {
-              const st = this.reviewerRunState.get(createdSessionId);
-              submitted = st?.submitted;
-              notesMd = st?.notesMd;
-            }
-
-            if (
-              !submitted &&
-              !this.closed &&
-              !turn.aborted &&
-              this.activeCycleTokens.get(issue.id) === params.cycleToken
-            ) {
-              const fallbackSummary = turn.errorMessage
-                ? `Reviewer failed: ${turn.errorMessage}`
-                : turn.assistantText.trim() || "Reviewer ended turn without submitting a structured verdict.";
-              submitted = this.db.createIssueReview({
-                issueId: issue.id,
-                round: params.round,
-                reviewerSlotId: slot.id,
-                sessionId: createdSessionId || null,
-                verdict: "needs_owner",
-                summary: fallbackSummary.slice(0, 600),
-              });
-            }
-          } finally {
-            if (createdSessionId) {
-              activeSet.delete(createdSessionId);
-              this.reviewerRunState.delete(createdSessionId);
-            }
-          }
-
-          return {
-            slot,
-            reviewerBot,
-            review: submitted,
-            notesMd,
-          };
-        }),
-      );
-
-      this.activeReviewerSessions.delete(issue.id);
-      if (this.closed || this.activeCycleTokens.get(issue.id) !== params.cycleToken) {
-        return;
-      }
-
-      const current = this.db.getIssue(issue.id);
-      if (!current || current.status !== "reviewing" || current.current_round !== params.round) {
-        return;
-      }
-
-      for (const item of results) {
-        if (!item.review) continue;
-        const focusTag = item.slot.focus?.trim() ? ` · ${item.slot.focus.trim()}` : "";
-        const verdictTag =
-          item.review.verdict === "approve"
-            ? "APPROVED"
-            : item.review.verdict === "request_changes"
-              ? "CHANGES REQUESTED"
-              : "NEEDS OWNER";
-        this.postHostNote(
-          params.conv,
-          item.reviewerBot,
-          `[Round ${params.round}/${current.max_rounds}${focusTag}] ${verdictTag}: ${item.review.summary}`,
-          item.review.notes_artifact_id,
-        );
-      }
-
-      const reviews = results.map((r) => r.review).filter((r): r is IssueReviewRow => Boolean(r));
-      const needsOwner = reviews.filter((r) => r.verdict === "needs_owner");
-      const changesRequested = results.filter((r) => r.review?.verdict === "request_changes");
-
-      if (needsOwner.length > 0) {
-        const owner = this.db.getUser(current.owner_id);
-        const question = needsOwner.map((r) => r.summary).join(" | ");
-        const updated = this.db.updateIssue(current.id, {
-          status: "needs_input",
-          needs_input_question: question,
-        })!;
-        this.postHostNote(
-          params.conv,
-          params.implBot,
-          `@${owner?.name ?? "owner"}: Reviewer escalated to owner in Round ${params.round}: ${question}`,
-        );
-        this.broadcastIssue(this.db.serializeIssue(updated));
-        return;
-      }
-
-      if (changesRequested.length === 0 && reviews.length === params.reviewers.length) {
-        await this.finalizeApprovedReviewCycle({
-          issue: current,
-          sess: params.sess,
-          conv: params.conv,
-          implBot: params.implBot,
-          settings,
-          checkRes: params.checkRes,
-          touchesKawan: params.touchesKawan,
-        });
-        return;
-      }
-
-      // Some reviewer requested changes
-      if (params.round >= current.max_rounds) {
-        const owner = this.db.getUser(current.owner_id);
-        const q = `Reached max review rounds (${params.round}/${current.max_rounds}) with changes still requested. Reply with guidance to revise, or click Return to Collaborate.`;
-        const updated = this.db.updateIssue(current.id, {
-          status: "needs_input",
-          needs_input_question: q,
-        })!;
-        this.postHostNote(params.conv, params.implBot, `@${owner?.name ?? "owner"}: ${q}`);
-        this.broadcastIssue(this.db.serializeIssue(updated));
-        return;
-      }
-
-      const feedbackBlocks = changesRequested.map((item, idx) => {
-        const focusLabel = item.slot.focus?.trim() ? ` (${item.slot.focus.trim()})` : "";
-        const notes = item.notesMd ? `\nNotes:\n${item.notesMd}` : "";
-        return `${idx + 1}. @${item.reviewerBot.name}${focusLabel}: ${item.review!.summary}${notes}`;
-      });
-      const revisionPrompt = [
-        `[Review Round ${params.round}/${current.max_rounds} — Changes Requested for Issue #${current.number}]`,
-        feedbackBlocks.join("\n\n"),
-        "",
-        "Address every requested change cleanly in your branch clone, run verification, commit, and call report(summary).",
-      ].join("\n");
-
-      const nextRound = params.round + 1;
-      this.pendingAutoReview.set(current.id, { nextRound });
-      const revisedIssue = this.db.updateIssue(current.id, {
-        status: "implementing",
-        needs_input_question: null,
-      })!;
-      this.postHostNote(
-        params.conv,
-        params.implBot,
-        `Review Round ${params.round}/${current.max_rounds} requested changes — resuming @${params.implBot.name} for revision (next: Round ${nextRound}).`,
-      );
-      this.broadcastIssue(this.db.serializeIssue(revisedIssue));
-
-      void this.sessionManager.resumeIssueWorker(params.sess.id, revisionPrompt).catch((err) => {
-        if (!this.closed) {
-          this.wsServer.broadcastToConversation(params.conv, {
-            type: "error",
-            conversation_id: params.conv.id,
-            session_id: params.sess.id,
-            message: err instanceof Error ? err.message : String(err),
-          });
-        }
-      });
-    } finally {
-      if (this.activeCycleTokens.get(params.issueId) === params.cycleToken) {
-        this.runningReviewCycles.delete(params.issueId);
-        this.activeCycleTokens.delete(params.issueId);
-      }
-    }
-  }
-
-  private async finalizeApprovedReviewCycle(params: {
-    issue: IssueRow;
-    sess: SessionRow;
-    conv: ConversationRow;
-    implBot: UserRow;
-    settings: HostSettings;
-    checkRes: { summary: string; combined_output: string; checks?: CheckRunItem[] };
-    touchesKawan: boolean;
-  }): Promise<{ issue: SerializedIssue; land: ReturnType<typeof serializeLand> }> {
-    const existingLand = this.db
-      .listLands({ sessionId: params.sess.id })
-      .find(
-        (l) =>
-          l.status === "requested" ||
-          l.status === "failed" ||
-          l.status === "removed",
-      );
-    const landRow = existingLand
-      ? this.db.updateLand(existingLand.id, {
-          status: "requested",
-          issue_id: params.issue.id,
-          conversation_id: params.conv.id,
-          thread_id: null,
-          checks_json: JSON.stringify(params.checkRes.checks ?? []),
-          touches_kawan: params.touchesKawan ? 1 : 0,
-          verify_output: params.checkRes.combined_output,
-          error: null,
-        })!
-      : (() => {
-          const created = this.db.createLand({
-            sessionId: params.sess.id,
-            conversationId: params.conv.id,
-            issueId: params.issue.id,
-          });
-          return this.db.updateLand(created.id, {
-            checks_json: JSON.stringify(params.checkRes.checks ?? []),
-            touches_kawan: params.touchesKawan ? 1 : 0,
-            verify_output: params.checkRes.combined_output,
-          })!;
-        })();
-
-    const updatedSess = this.db.updateSession(params.sess.id, { status: "review_requested" })!;
-    this.wsServer.broadcast({
-      type: "session.update",
-      session: this.sessionManager.serializePublicSession(updatedSess),
-    });
-
-    const wantsAutoLand = params.issue.landing_mode === "auto";
-    const canAutoLand = wantsAutoLand && !params.touchesKawan && !this.closed;
-
-    if (canAutoLand) {
-      this.wsServer.broadcast({ type: "land.update", land: serializeLand(landRow) });
-      this.postHostNote(
-        params.conv,
-        params.implBot,
-        `Checks (${params.checkRes.summary}) and reviews passed — auto-enqueueing Issue #${params.issue.number} onto the Merge Queue.`,
-      );
-      const enqueued = await this.mergeQueue.enqueueLand({
-        landId: landRow.id,
-        approvedBy: params.issue.owner_id,
-        trigger: "auto_land",
-        waitForSettlement: false,
-      });
-      const latestIssue = this.db.getIssue(params.issue.id)!;
-      return { issue: this.db.serializeIssue(latestIssue), land: enqueued.land };
-    }
-
-    const updatedIssue = this.db.updateIssue(params.issue.id, {
-      status: "ready_to_land",
-      needs_input_question: null,
-    })!;
-    const kawanWarn = params.touchesKawan
-      ? wantsAutoLand
-        ? " (Modifies `.kawan/` checks — auto-land downgraded to manual approval.)"
-        : " (Modifies `.kawan/` checks — manual approval required before landing.)"
-      : "";
-    const defaultBranch = params.settings.repo?.default_branch ?? "main";
-    this.postHostNote(
-      params.conv,
-      params.implBot,
-      `Checks passed (${params.checkRes.summary}). Ready to approve land into \`${defaultBranch}\`.${kawanWarn}`,
-    );
-
-    const serializedLand = serializeLand(landRow);
-    const serializedIssue = this.db.serializeIssue(updatedIssue);
-    this.wsServer.broadcast({ type: "land.update", land: serializedLand });
-    this.broadcastIssue(serializedIssue);
-
-    return { issue: serializedIssue, land: serializedLand };
-  }
-
-  returnToCollaborate(issueRef: string | number): SerializedIssue {
-    const existing = this.resolveIssueRef(issueRef);
-    if (existing.status === "landed" || existing.status === "closed" || existing.status === "queued") {
-      throw new Error(`Cannot return issue #${existing.number} in status ${existing.status} to collaborate`);
-    }
-    this.activeCycleTokens.delete(existing.id);
-    this.runningReviewCycles.delete(existing.id);
-    this.consecutiveCheckFails.delete(existing.id);
-    void this.cancelActiveReviewers(existing.id);
-    const updated = this.db.updateIssue(existing.id, {
-      status: "implementing",
-      needs_input_question: null,
-    })!;
-    const conv = this.db.getConversation(updated.conversation_id);
-    const botId = updated.implementer_bot_id ?? this.db.listUsers("bot")[0]?.id;
-    const bot = botId ? this.db.getUser(botId) : null;
-    if (conv && bot) {
-      this.postHostNote(conv, bot, `Returned Issue #${updated.number} to Collaborate.`);
-    }
-    const serialized = this.db.serializeIssue(updated);
-    this.broadcastIssue(serialized);
-    return serialized;
-  }
-
   async stopIssue(issueRef: string | number): Promise<SerializedIssue> {
     const issue = this.resolveIssueRef(issueRef);
-    this.activeCycleTokens.delete(issue.id);
-    this.runningReviewCycles.delete(issue.id);
     await this.cancelActiveReviewers(issue.id);
     if (issue.active_session_id) {
       await this.sessionManager.stopWorkerSession(issue.active_session_id);
     }
     const refreshed = this.db.getIssue(issue.id)!;
-    const serialized = this.db.serializeIssue(refreshed);
+    const serialized = this.serializeIssue(refreshed);
     this.broadcastIssue(serialized);
     return serialized;
   }
 
   async closeIssue(issueRef: string | number, abandon = false): Promise<SerializedIssue> {
     const issue = this.resolveIssueRef(issueRef);
-    this.activeCycleTokens.delete(issue.id);
-    this.runningReviewCycles.delete(issue.id);
     await this.cancelActiveReviewers(issue.id);
     if (issue.active_session_id) {
       const lands = this.db.listLands({ sessionId: issue.active_session_id });
@@ -1490,7 +1146,7 @@ export class IssueManager {
           : `Closed Issue #${updated.number}.`,
       );
     }
-    const serialized = this.db.serializeIssue(updated);
+    const serialized = this.serializeIssue(updated);
     this.broadcastIssue(serialized);
     return serialized;
   }
@@ -1500,31 +1156,26 @@ export class IssueManager {
     const issue = this.db.getIssue(land.issue_id);
     if (!issue || issue.status === "closed") return;
 
-    let nextStatus: IssueStatus | null = null;
-    if (
-      land.status === "queued" ||
-      land.status === "rebasing" ||
-      land.status === "verifying" ||
-      land.status === "paused"
-    ) {
-      nextStatus = "queued";
-    } else if (land.status === "landed") {
-      nextStatus = "landed";
-    } else if (land.status === "failed") {
-      nextStatus = "implementing";
-    } else if (land.status === "requested" || land.status === "removed") {
-      nextStatus = "ready_to_land";
+    if (land.status === "landed") {
+      if (issue.status !== "landed") {
+        const updated = this.db.updateIssue(issue.id, {
+          status: "landed",
+          behind_main: 0,
+          needs_input_question: null,
+        })!;
+        this.broadcastIssue(this.serializeIssue(updated));
+        if (!this.closed) {
+          this.sendPostLandingSoulDigest(updated, land);
+        }
+      }
+      return;
     }
-    if (!nextStatus || nextStatus === issue.status) return;
 
-    const updated = this.db.updateIssue(issue.id, {
-      status: nextStatus,
-      ...(nextStatus === "landed" ? { behind_main: 0, needs_input_question: null } : {}),
-    })!;
-    this.broadcastIssue(this.db.serializeIssue(updated));
-
-    if (nextStatus === "landed" && !this.closed) {
-      this.sendPostLandingSoulDigest(updated, land);
+    if (issue.status !== "open") {
+      const updated = this.db.updateIssue(issue.id, { status: "open" })!;
+      this.broadcastIssue(this.serializeIssue(updated));
+    } else {
+      this.broadcastIssue(this.serializeIssue(issue));
     }
   }
 
@@ -1538,11 +1189,20 @@ export class IssueManager {
     if (!settings.roles.default || Object.keys(settings.providers).length === 0) return;
 
     const sess = issue.active_session_id ? this.db.getSession(issue.active_session_id) : null;
-    const reviews = this.db.listIssueReviews(issue.id);
-    const reviewSummary =
-      reviews.length > 0
-        ? reviews.map((r) => `- Round ${r.round} (${r.verdict}): ${r.summary}`).join("\n")
-        : "(Direct land with no extra reviewer rounds)";
+    const recentBotNotes = this.db
+      .listRecentMessages(conv.id, 12)
+      .filter((m) => {
+        const u = this.db.getUser(m.author_id);
+        return u?.kind === "bot" && !m.body.startsWith("Checkpoint:") && !m.body.startsWith("Enqueued Issue #");
+      })
+      .map((m) => {
+        const u = this.db.getUser(m.author_id);
+        return `- @${u?.name ?? "bot"}: ${m.body.replace(/\s+/g, " ").slice(0, 200)}`;
+      });
+    const discussionSummary =
+      recentBotNotes.length > 0
+        ? recentBotNotes.join("\n")
+        : "(Direct land with no extra bot review discussion)";
     const specExcerpt = issue.body_md ? issue.body_md.slice(0, 600) : "(None)";
     const checkSummary = land.pause_reason
       ? `Had merge-queue pause (${land.pause_reason}: ${land.error ?? ""}).`
@@ -1553,7 +1213,7 @@ export class IssueManager {
       `Outcome: Landed cleanly via ${land.trigger}${land.landed_sha ? ` (${land.landed_sha.slice(0, 10)})` : ""}.`,
       `Specification:\n${specExcerpt}`,
       `Final implementation report:\n${sess?.last_report ?? "(None)"}`,
-      `Review findings:\n${reviewSummary}`,
+      `Issue collaboration & review notes:\n${discussionSummary}`,
       `Verification & landing: ${checkSummary}`,
       "",
       "Review kawan://soul.md. If this issue uncovered any durable repository facts, build/test conventions, or human/workflow preferences worth carrying into future issues, update your soul with `soul_replace` or `soul_write` (staying under 4 KB). When finished (or if nothing durable needs adding), output exactly: NO_REPLY",

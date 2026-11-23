@@ -3,11 +3,10 @@
 use std::collections::HashMap;
 
 use crate::protocol::{
-    Artifact, BotSummary, CheckRunItem, Conversation, Decision, DecisionRoleView, DefaultRoleView,
-    IssueReview, IssueReviewer, IssueSummary, Land, Member, MergeQueueSettingsView,
-    MergeQueueSnapshot, Message, ModelDefView, ProviderView, RepoSettingsView, RolesView,
-    SessionDiffFile, SessionDiffSummary, SessionSummary, SettingsView, SetupStatus, StatusRepoInfo,
-    UserSummary,
+    ActiveReviewer, Artifact, BotSummary, CheckRunItem, Conversation, Decision, DecisionRoleView,
+    DefaultRoleView, IssueSummary, Land, Member, MergeQueueSettingsView, MergeQueueSnapshot,
+    Message, ModelDefView, ProviderView, RepoSettingsView, RolesView, SessionDiffFile,
+    SessionDiffSummary, SessionSummary, SettingsView, SetupStatus, StatusRepoInfo, UserSummary,
 };
 use crate::state::{FocusTarget, KawanApp, LoadedArtifact, Screen, WorkspacePage};
 
@@ -672,27 +671,24 @@ pub fn populate_mock(app: &mut KawanApp) {
         ],
     );
 
-    // Slice C & D mock issues (#1 needs_input, #2 implementing, #3 backlog, #4 reviewing, #5 ready_to_land)
+    // Chat-first mock issues (#1 open + needs_input + Checks ✗ + reviewer, #2 open + Checks ✓ ready to Land, #3 open Draft, #4 Landed)
     let conv_i1 = "conv-issue-1".to_string();
     let conv_i2 = "conv-issue-2".to_string();
     let conv_i3 = "conv-issue-3".to_string();
     let conv_i4 = "conv-issue-4".to_string();
-    let conv_i5 = "conv-issue-5".to_string();
     let issue_1 = "mock-issue-1".to_string();
     let issue_2 = "mock-issue-2".to_string();
     let issue_3 = "mock-issue-3".to_string();
     let issue_4 = "mock-issue-4".to_string();
-    let issue_5 = "mock-issue-5".to_string();
     let sess_i1 = "7b88d100-0004-4000-8000-000000000004".to_string();
     let sess_i2 = "7b88d100-0005-4000-8000-000000000005".to_string();
     let sess_i4 = "7b88d100-0006-4000-8000-000000000006".to_string();
-    let sess_i5 = "7b88d100-0007-4000-8000-000000000007".to_string();
 
     for (cid, num, title, last_seq, last_read_seq, unread) in [
         (
             &conv_i1,
             1u64,
-            "Wire per-session token budgets & auto-pause",
+            "Enforce .kawan/checks exit-code isolation",
             2u64,
             1u64,
             1u64,
@@ -700,7 +696,7 @@ pub fn populate_mock(app: &mut KawanApp) {
         (
             &conv_i2,
             2u64,
-            "Enforce .kawan/checks exit-code isolation",
+            "Wire per-session token budgets & auto-pause",
             2u64,
             2u64,
             0u64,
@@ -716,14 +712,6 @@ pub fn populate_mock(app: &mut KawanApp) {
         (
             &conv_i4,
             4u64,
-            "Parallel reviewer focus slots & round circuit breaker",
-            2u64,
-            2u64,
-            0u64,
-        ),
-        (
-            &conv_i5,
-            5u64,
             "Add pre-commit formatting check in .kawan/checks",
             2u64,
             2u64,
@@ -745,6 +733,58 @@ pub fn populate_mock(app: &mut KawanApp) {
         app.members_by_conv.insert(cid.clone(), members.clone());
     }
 
+    let art_i1_fail = "art-issue-1-checks-fail".to_string();
+    app.artifacts_by_id.insert(
+        art_i1_fail.clone(),
+        Artifact {
+            id: art_i1_fail.clone(),
+            sha256: "f41c88e02a1901".to_string(),
+            mime_type: "text/plain".to_string(),
+            byte_size: 218,
+            filename: Some("checks-7a12f0c.log".to_string()),
+            session_id: Some(sess_i1.clone()),
+            conversation_id: Some(conv_i1.clone()),
+            message_id: None,
+            created_at: 261,
+        },
+    );
+    app.loaded_artifacts.insert(
+        art_i1_fail.clone(),
+        LoadedArtifact {
+            text_preview: Some(
+                "[PASS exit=0] 01-fmt (142ms)\n\n[FAIL exit=1] 02-exit-isolation (310ms)\nassertion failed: expected stderr_ring_len > 0 on timeout\n  at host/test/checks.test.ts:84:12"
+                    .to_string(),
+            ),
+            image: None,
+        },
+    );
+
+    let art_i2_pass = "art-issue-2-checks-pass".to_string();
+    app.artifacts_by_id.insert(
+        art_i2_pass.clone(),
+        Artifact {
+            id: art_i2_pass.clone(),
+            sha256: "91d44b02cc312".to_string(),
+            mime_type: "text/plain".to_string(),
+            byte_size: 124,
+            filename: Some("checks-9c31b11.log".to_string()),
+            session_id: Some(sess_i2.clone()),
+            conversation_id: Some(conv_i2.clone()),
+            message_id: None,
+            created_at: 246,
+        },
+    );
+    app.loaded_artifacts.insert(
+        art_i2_pass.clone(),
+        LoadedArtifact {
+            text_preview: Some(
+                "[PASS exit=0] 01-fmt (118ms)\n\n[PASS exit=0] 02-budget-test (845ms)\n24 passed, 0 failed"
+                    .to_string(),
+            ),
+            image: None,
+        },
+    );
+
     app.sessions_by_id.insert(
         sess_i1.clone(),
         SessionSummary {
@@ -754,16 +794,16 @@ pub fn populate_mock(app: &mut KawanApp) {
             kind: "worker".to_string(),
             conversation_id: Some(conv_i1.clone()),
             thread_id: None,
-            title: Some("Wire per-session token budgets & auto-pause".to_string()),
-            task: Some("Implement Issue #1 token budget ledger".to_string()),
+            title: Some("#1: Enforce .kawan/checks exit-code isolation".to_string()),
+            task: Some("Implement Issue #1 check runner isolation".to_string()),
             status: "idle".to_string(),
-            branch: Some("kawan/issue-1".to_string()),
+            branch: Some("kawan/issue-1-7b88d100".to_string()),
             clone_path: Some("/var/lib/kawan/workspaces/issue-1".to_string()),
             agent_dir: None,
             pi_session_file: None,
             last_entry_id: None,
             last_report: Some(
-                "Paused via ask_owner: soft-warning threshold vs hard stop?".to_string(),
+                "Split stdout/stderr buffers; one timeout test still failing.".to_string(),
             ),
             soul_snapshot: None,
             created_at: 250,
@@ -779,101 +819,22 @@ pub fn populate_mock(app: &mut KawanApp) {
             kind: "worker".to_string(),
             conversation_id: Some(conv_i2.clone()),
             thread_id: None,
-            title: Some("Enforce .kawan/checks exit-code isolation".to_string()),
-            task: Some("Implement Issue #2 check runner isolation".to_string()),
+            title: Some("#2: Wire per-session token budgets & auto-pause".to_string()),
+            task: Some("Implement Issue #2 token budget ledger".to_string()),
             status: "idle".to_string(),
-            branch: Some("kawan/issue-2".to_string()),
+            branch: Some("kawan/issue-2-7b88d100".to_string()),
             clone_path: Some("/var/lib/kawan/workspaces/issue-2".to_string()),
             agent_dir: None,
             pi_session_file: None,
             last_entry_id: None,
             last_report: Some(
-                "Split stdout/stderr capture into separate ring buffers.".to_string(),
+                "Implemented token budget ledger and warning notifications.".to_string(),
             ),
             soul_snapshot: None,
             created_at: 240,
-            updated_at: 245,
+            updated_at: 246,
         },
     );
-
-    app.issues_by_id.insert(
-        issue_1.clone(),
-        IssueSummary {
-            id: issue_1.clone(),
-            number: 1,
-            conversation_id: conv_i1.clone(),
-            title: "Wire per-session token budgets & auto-pause".to_string(),
-            body_md: "## Goal\nTrack prompt + completion tokens per worker clone and pause before runaway tool loops.\n\n## Acceptance\n- Emit `session.update` usage telemetry\n- Pause worker when budget hits 100%".to_string(),
-            status: "needs_input".to_string(),
-            owner_id: alice_id.clone(),
-            implementer_bot_id: Some(bot_id.clone()),
-            auto_start_review: false,
-            landing_mode: "manual".to_string(),
-            max_rounds: 3,
-            current_round: 0,
-            active_session_id: Some(sess_i1),
-            parent_issue_id: None,
-            needs_input_question: Some(
-                "Should reaching 80% budget only warn in the issue room or also auto-summarize older tool results?".to_string(),
-            ),
-            behind_main: 0,
-            reviewers: Vec::new(),
-            reviews: Vec::new(),
-            created_at: 1_795_401_100_000,
-            updated_at: 1_795_401_200_000,
-        },
-    );
-    app.issues_by_id.insert(
-        issue_2.clone(),
-        IssueSummary {
-            id: issue_2.clone(),
-            number: 2,
-            conversation_id: conv_i2.clone(),
-            title: "Enforce .kawan/checks exit-code isolation".to_string(),
-            body_md: "## Goal\nEnsure failing `.kawan/checks/*` scripts preserve exact exit code and tail output in artifacts.\n\n- Run scripts in sorted lexical order\n- Capture stderr independently of stdout".to_string(),
-            status: "implementing".to_string(),
-            owner_id: maya_id.clone(),
-            implementer_bot_id: Some(bot_id.clone()),
-            auto_start_review: false,
-            landing_mode: "manual".to_string(),
-            max_rounds: 3,
-            current_round: 1,
-            active_session_id: Some(sess_i2),
-            parent_issue_id: None,
-            needs_input_question: None,
-            behind_main: 2,
-            reviewers: vec![
-                IssueReviewer {
-                    id: "rev-slot-1".to_string(),
-                    issue_id: issue_2.clone(),
-                    bot_id: bot_id.clone(),
-                    focus: Some("sandbox isolation & error messages".to_string()),
-                    order_index: 0,
-                },
-                IssueReviewer {
-                    id: "rev-slot-2".to_string(),
-                    issue_id: issue_2.clone(),
-                    bot_id: bot_id.clone(),
-                    focus: Some("timeout cleanup".to_string()),
-                    order_index: 1,
-                },
-            ],
-            reviews: vec![IssueReview {
-                id: "rev-1".to_string(),
-                issue_id: issue_2.clone(),
-                round: 1,
-                reviewer_slot_id: "rev-slot-1".to_string(),
-                session_id: None,
-                verdict: "request_changes".to_string(),
-                summary: "Capture stderr separately from stdout on check timeout.".to_string(),
-                notes_artifact_id: None,
-                created_at: 1_795_401_050_000,
-            }],
-            created_at: 1_795_400_900_000,
-            updated_at: 1_795_401_150_000,
-        },
-    );
-
     app.sessions_by_id.insert(
         sess_i4.clone(),
         SessionSummary {
@@ -883,61 +844,36 @@ pub fn populate_mock(app: &mut KawanApp) {
             kind: "worker".to_string(),
             conversation_id: Some(conv_i4.clone()),
             thread_id: None,
-            title: Some("Parallel reviewer focus slots & round circuit breaker".to_string()),
-            task: Some("Implement parallel N-reviewer focus slots".to_string()),
-            status: "idle".to_string(),
-            branch: Some("kawan/issue-4".to_string()),
+            title: Some("#4: Add pre-commit formatting check in .kawan/checks".to_string()),
+            task: Some("Add 00-fmt.sh script inside .kawan/checks/".to_string()),
+            status: "landed".to_string(),
+            branch: Some("kawan/issue-4-7b88d100".to_string()),
             clone_path: Some("/var/lib/kawan/workspaces/issue-4".to_string()),
             agent_dir: None,
             pi_session_file: None,
             last_entry_id: None,
-            last_report: Some("All unit checks pass; awaiting Round 1 verdicts.".to_string()),
+            last_report: Some("Added .kawan/checks/00-fmt.sh and landed on main.".to_string()),
             soul_snapshot: None,
-            created_at: 265,
-            updated_at: 270,
-        },
-    );
-    app.sessions_by_id.insert(
-        sess_i5.clone(),
-        SessionSummary {
-            id: sess_i5.clone(),
-            bot_id: bot_id.clone(),
-            parent_session_id: None,
-            kind: "worker".to_string(),
-            conversation_id: Some(conv_i5.clone()),
-            thread_id: None,
-            title: Some("Add pre-commit formatting check in .kawan/checks".to_string()),
-            task: Some("Add 00-fmt.sh script inside .kawan/checks/".to_string()),
-            status: "review_requested".to_string(),
-            branch: Some("kawan/issue-5".to_string()),
-            clone_path: Some("/var/lib/kawan/workspaces/issue-5".to_string()),
-            agent_dir: None,
-            pi_session_file: None,
-            last_entry_id: None,
-            last_report: Some(
-                "Added .kawan/checks/00-fmt.sh; both reviewers approved in Round 2.".to_string(),
-            ),
-            soul_snapshot: None,
-            created_at: 255,
-            updated_at: 275,
+            created_at: 230,
+            updated_at: 235,
         },
     );
     app.lands_by_id.insert(
-        "land-issue-5".to_string(),
+        "land-issue-4".to_string(),
         Land {
-            id: "land-issue-5".to_string(),
-            session_id: sess_i5.clone(),
-            conversation_id: conv_i5.clone(),
+            id: "land-issue-4".to_string(),
+            session_id: sess_i4.clone(),
+            conversation_id: conv_i4.clone(),
             thread_id: None,
             message_id: None,
-            status: "requested".to_string(),
-            approved_by: None,
-            base_sha: None,
-            landed_sha: None,
-            verify_output: Some("00-fmt.sh (exit 0), 01-test.sh (exit 0)".to_string()),
+            status: "landed".to_string(),
+            approved_by: Some(alice_id.clone()),
+            base_sha: Some("7b22100a".to_string()),
+            landed_sha: Some("e94c20f88a12".to_string()),
+            verify_output: Some("00-fmt.sh (exit 0)".to_string()),
             error: None,
             queue_position: None,
-            issue_id: Some(issue_5.clone()),
+            issue_id: Some(issue_4.clone()),
             pause_reason: None,
             queue_session_id: None,
             queue_thread_id: None,
@@ -951,122 +887,104 @@ pub fn populate_mock(app: &mut KawanApp) {
                 artifact_id: None,
             }],
             touches_kawan: true,
-            created_at: 274,
-            updated_at: 275,
+            created_at: 232,
+            updated_at: 235,
         },
     );
 
     app.issues_by_id.insert(
-        issue_4.clone(),
+        issue_1.clone(),
         IssueSummary {
-            id: issue_4.clone(),
-            number: 4,
-            conversation_id: conv_i4.clone(),
-            title: "Parallel reviewer focus slots & round circuit breaker".to_string(),
-            body_md: "## Goal\nFan out parallel read-only reviewer sessions per round and enforce max_rounds circuit breaker.".to_string(),
-            status: "reviewing".to_string(),
+            id: issue_1.clone(),
+            number: 1,
+            conversation_id: conv_i1.clone(),
+            title: "Enforce .kawan/checks exit-code isolation".to_string(),
+            body_md: "## Goal\nEnsure failing `.kawan/checks/*` scripts preserve exact exit code and tail output in artifacts.\n\n- Run scripts in sorted lexical order\n- Capture stderr independently of stdout".to_string(),
+            status: "open".to_string(),
             owner_id: alice_id.clone(),
             implementer_bot_id: Some(bot_id.clone()),
-            auto_start_review: true,
-            landing_mode: "auto".to_string(),
-            max_rounds: 3,
-            current_round: 1,
-            active_session_id: Some(sess_i4),
+            active_session_id: Some(sess_i1),
             parent_issue_id: None,
-            needs_input_question: None,
-            behind_main: 0,
-            reviewers: vec![
-                IssueReviewer {
-                    id: "rev4-slot-1".to_string(),
-                    issue_id: issue_4.clone(),
-                    bot_id: bot_id.clone(),
-                    focus: Some("Concurrency & safety".to_string()),
-                    order_index: 0,
+            needs_input_question: Some(
+                "Should killed timeout checks still flush partial stderr before exit code 124?".to_string(),
+            ),
+            behind_main: 2,
+            commits_ahead: 2,
+            checks_status: "failed".to_string(),
+            checks_sha: Some("7a12f0c".to_string()),
+            checks_summary: Some("02-exit-isolation failed (1/2 passed)".to_string()),
+            checks: vec![
+                CheckRunItem {
+                    name: "01-fmt".to_string(),
+                    ok: true,
+                    exit_code: Some(0),
+                    duration_ms: 142,
+                    output: String::new(),
+                    artifact_id: None,
                 },
-                IssueReviewer {
-                    id: "rev4-slot-2".to_string(),
-                    issue_id: issue_4.clone(),
-                    bot_id: bot_id.clone(),
-                    focus: Some("Test coverage".to_string()),
-                    order_index: 1,
+                CheckRunItem {
+                    name: "02-exit-isolation".to_string(),
+                    ok: false,
+                    exit_code: Some(1),
+                    duration_ms: 310,
+                    output: "stderr ring empty".to_string(),
+                    artifact_id: Some(art_i1_fail.clone()),
                 },
             ],
-            reviews: vec![IssueReview {
-                id: "rev4-1".to_string(),
-                issue_id: issue_4,
-                round: 1,
-                reviewer_slot_id: "rev4-slot-1".to_string(),
-                session_id: None,
-                verdict: "approve".to_string(),
-                summary: "Cycle lock & cancellation tokens prevent stale state writes.".to_string(),
-                notes_artifact_id: None,
-                created_at: 1_795_401_260_000,
+            checks_artifact_id: Some(art_i1_fail),
+            touches_kawan: true,
+            active_reviewers: vec![ActiveReviewer {
+                session_id: "mock-rev-1".to_string(),
+                bot_id: "bot-reviewer".to_string(),
+                bot_name: "reviewer".to_string(),
+                focus: Some("Edge cases".to_string()),
             }],
-            created_at: 1_795_401_210_000,
-            updated_at: 1_795_401_260_000,
+            created_at: 1_795_401_100_000,
+            updated_at: 1_795_401_200_000,
         },
     );
     app.issues_by_id.insert(
-        issue_5.clone(),
+        issue_2.clone(),
         IssueSummary {
-            id: issue_5.clone(),
-            number: 5,
-            conversation_id: conv_i5.clone(),
-            title: "Add pre-commit formatting check in .kawan/checks".to_string(),
-            body_md: "## Goal\nAdd `.kawan/checks/00-fmt.sh` to enforce `cargo fmt --check` before review.".to_string(),
-            status: "ready_to_land".to_string(),
-            owner_id: alice_id.clone(),
+            id: issue_2.clone(),
+            number: 2,
+            conversation_id: conv_i2.clone(),
+            title: "Wire per-session token budgets & auto-pause".to_string(),
+            body_md: "## Goal\nTrack prompt + completion tokens per worker clone and warn cleanly before runaway tool loops.\n\n## Acceptance\n- Emit `session.update` usage telemetry\n- Pause worker when budget hits 100%".to_string(),
+            status: "open".to_string(),
+            owner_id: maya_id.clone(),
             implementer_bot_id: Some(bot_id.clone()),
-            auto_start_review: true,
-            landing_mode: "auto".to_string(),
-            max_rounds: 3,
-            current_round: 2,
-            active_session_id: Some(sess_i5),
+            active_session_id: Some(sess_i2),
             parent_issue_id: None,
             needs_input_question: None,
             behind_main: 0,
-            reviewers: vec![
-                IssueReviewer {
-                    id: "rev5-slot-1".to_string(),
-                    issue_id: issue_5.clone(),
-                    bot_id: bot_id.clone(),
-                    focus: Some("CI safety".to_string()),
-                    order_index: 0,
+            commits_ahead: 3,
+            checks_status: "passed".to_string(),
+            checks_sha: Some("9c31b11".to_string()),
+            checks_summary: Some("checks passed (2/2)".to_string()),
+            checks: vec![
+                CheckRunItem {
+                    name: "01-fmt".to_string(),
+                    ok: true,
+                    exit_code: Some(0),
+                    duration_ms: 118,
+                    output: String::new(),
+                    artifact_id: None,
                 },
-                IssueReviewer {
-                    id: "rev5-slot-2".to_string(),
-                    issue_id: issue_5.clone(),
-                    bot_id: bot_id.clone(),
-                    focus: Some("Performance".to_string()),
-                    order_index: 1,
-                },
-            ],
-            reviews: vec![
-                IssueReview {
-                    id: "rev5-1".to_string(),
-                    issue_id: issue_5.clone(),
-                    round: 2,
-                    reviewer_slot_id: "rev5-slot-1".to_string(),
-                    session_id: None,
-                    verdict: "approve".to_string(),
-                    summary: "Executable check script verified safe.".to_string(),
-                    notes_artifact_id: None,
-                    created_at: 1_795_401_280_000,
-                },
-                IssueReview {
-                    id: "rev5-2".to_string(),
-                    issue_id: issue_5,
-                    round: 2,
-                    reviewer_slot_id: "rev5-slot-2".to_string(),
-                    session_id: None,
-                    verdict: "approve".to_string(),
-                    summary: "Runs in <200ms in sandbox.".to_string(),
-                    notes_artifact_id: None,
-                    created_at: 1_795_401_285_000,
+                CheckRunItem {
+                    name: "02-budget-test".to_string(),
+                    ok: true,
+                    exit_code: Some(0),
+                    duration_ms: 845,
+                    output: String::new(),
+                    artifact_id: None,
                 },
             ],
-            created_at: 1_795_401_220_000,
-            updated_at: 1_795_401_285_000,
+            checks_artifact_id: Some(art_i2_pass),
+            touches_kawan: false,
+            active_reviewers: Vec::new(),
+            created_at: 1_795_400_900_000,
+            updated_at: 1_795_401_150_000,
         },
     );
     app.issues_by_id.insert(
@@ -1077,21 +995,51 @@ pub fn populate_mock(app: &mut KawanApp) {
             conversation_id: conv_i3.clone(),
             title: "Persist per-channel composer drafts across view switches".to_string(),
             body_md: "Store unsent draft text per conversation ID in `KawanApp` state so switching to Status or Issues does not discard half-written messages.".to_string(),
-            status: "backlog".to_string(),
+            status: "open".to_string(),
             owner_id: alice_id.clone(),
             implementer_bot_id: None,
-            auto_start_review: false,
-            landing_mode: "manual".to_string(),
-            max_rounds: 3,
-            current_round: 0,
             active_session_id: None,
             parent_issue_id: None,
             needs_input_question: None,
             behind_main: 0,
-            reviewers: Vec::new(),
-            reviews: Vec::new(),
+            commits_ahead: 0,
+            checks_status: "none".to_string(),
+            checks_sha: None,
+            checks_summary: None,
+            checks: Vec::new(),
+            checks_artifact_id: None,
+            touches_kawan: false,
+            active_reviewers: Vec::new(),
             created_at: 1_795_400_800_000,
             updated_at: 1_795_400_800_000,
+        },
+    );
+    app.issues_by_id.insert(
+        issue_4.clone(),
+        IssueSummary {
+            id: issue_4,
+            number: 4,
+            conversation_id: conv_i4.clone(),
+            title: "Add pre-commit formatting check in .kawan/checks".to_string(),
+            body_md: "## Goal\nAdd `.kawan/checks/00-fmt.sh` to enforce formatting checks cleanly."
+                .to_string(),
+            status: "landed".to_string(),
+            owner_id: alice_id.clone(),
+            implementer_bot_id: Some(bot_id.clone()),
+            active_session_id: Some(sess_i4),
+            parent_issue_id: None,
+            needs_input_question: None,
+            behind_main: 0,
+            commits_ahead: 1,
+            checks_status: "passed".to_string(),
+            checks_sha: Some("e94c20f".to_string()),
+            checks_summary: Some("checks passed (1/1)".to_string()),
+            checks: Vec::new(),
+            checks_artifact_id: None,
+            touches_kawan: true,
+            active_reviewers: Vec::new(),
+            created_at: 1_795_400_700_000,
+            updated_at: 1_795_400_750_000,
         },
     );
 
@@ -1104,7 +1052,7 @@ pub fn populate_mock(app: &mut KawanApp) {
                 seq: 1,
                 author_id: alice_id.clone(),
                 thread_id: None,
-                body: "Opened Issue #1 and assigned @kawan to wire per-session token tracking.".to_string(),
+                body: "@kawan please implement check runner exit-code isolation per the document above.".to_string(),
                 artifact_id: None,
                 created_at: 1_795_401_120_000,
             },
@@ -1114,7 +1062,7 @@ pub fn populate_mock(app: &mut KawanApp) {
                 seq: 2,
                 author_id: bot_id.clone(),
                 thread_id: None,
-                body: "@Alice: Should reaching 80% budget only warn in the issue room or also auto-summarize older tool results?".to_string(),
+                body: "@Alice: Should killed timeout checks still flush partial stderr before exit code 124?".to_string(),
                 artifact_id: None,
                 created_at: 1_795_401_200_000,
             },
@@ -1129,7 +1077,7 @@ pub fn populate_mock(app: &mut KawanApp) {
                 seq: 1,
                 author_id: maya_id,
                 thread_id: None,
-                body: "Round 1 requested separate stdout/stderr buffers so timeouts preserve failure context.".to_string(),
+                body: "@kawan wire up the token budget ledger; check the document above for telemetry fields.".to_string(),
                 artifact_id: None,
                 created_at: 1_795_401_060_000,
             },
@@ -1139,7 +1087,7 @@ pub fn populate_mock(app: &mut KawanApp) {
                 seq: 2,
                 author_id: bot_id.clone(),
                 thread_id: None,
-                body: "Updated `runRepoChecks` to keep separate stderr tail buffers; ready for another check pass after syncing main.".to_string(),
+                body: "Committed token budget tracking and telemetry events across 3 commits. Checks are green.".to_string(),
                 artifact_id: None,
                 created_at: 1_795_401_150_000,
             },
@@ -1153,44 +1101,32 @@ pub fn populate_mock(app: &mut KawanApp) {
             seq: 1,
             author_id: alice_id.clone(),
             thread_id: None,
-            body: "Spec drafted — assign an implementer when ready.".to_string(),
+            body: "Document drafted — @mention a bot whenever ready to implement.".to_string(),
             artifact_id: None,
             created_at: 1_795_400_800_000,
         }],
     );
     app.messages_by_conv.insert(
         conv_i4,
-        vec![Message {
-            id: "i4-msg-1".to_string(),
-            conversation_id: "conv-issue-4".to_string(),
-            seq: 1,
-            author_id: bot_id.clone(),
-            thread_id: None,
-            body: "[Round 1/3 · Concurrency & safety] APPROVED: Cycle lock & cancellation tokens prevent stale state writes.".to_string(),
-            artifact_id: None,
-            created_at: 1_795_401_260_000,
-        }],
-    );
-    app.messages_by_conv.insert(
-        conv_i5,
         vec![
             Message {
-                id: "i5-msg-1".to_string(),
-                conversation_id: "conv-issue-5".to_string(),
+                id: "i4-msg-1".to_string(),
+                conversation_id: "conv-issue-4".to_string(),
                 seq: 1,
                 author_id: bot_id,
                 thread_id: None,
-                body: "Checks passed (00-fmt.sh, 01-test.sh). Ready to approve land into `main`. (Modifies `.kawan/` checks — auto-land downgraded to manual approval.)".to_string(),
+                body: "Added .kawan/checks/00-fmt.sh cleanly; ready whenever you click Land."
+                    .to_string(),
                 artifact_id: None,
                 created_at: 1_795_401_285_000,
             },
             Message {
-                id: "i5-msg-2".to_string(),
-                conversation_id: "conv-issue-5".to_string(),
+                id: "i4-msg-2".to_string(),
+                conversation_id: "conv-issue-4".to_string(),
                 seq: 2,
                 author_id: alice_id,
                 thread_id: None,
-                body: "Looks good — will approve from header after inspecting check log.".to_string(),
+                body: "Looks good — landed onto main.".to_string(),
                 artifact_id: None,
                 created_at: 1_795_401_290_000,
             },

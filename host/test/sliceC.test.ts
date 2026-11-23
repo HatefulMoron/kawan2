@@ -43,27 +43,44 @@ async function seedRepoCommit(
   }
 }
 
-test("Slice C: orchestrator create_issue / update_issue / list_issues & issue.open / issue.update", async () => {
+test("Slice C: issue.md live injection, chat-first spawn, and unconfigured checks status 'none'", async () => {
   const decisionMode: DecisionMode = "live";
   const stub = await startStubProvider();
   const repo = await createFixtureBareRepo({ "README.md": "# Issue Authoring\n" });
   const dataDir = mkdtempSync(join(tmpdir(), "kawan-sliceC-author-"));
   const adminKey = await TestKeyPair.generate("admin@kawan");
 
+  const seenContexts: Array<{ role: string; text: string }> = [];
+
   stub.setHandler((reqBody) => {
     const sysText = JSON.stringify(reqBody.messages?.[0] ?? "");
     const msgs = reqBody.messages ?? [];
     const lastMsg = msgs[msgs.length - 1];
+    const allPromptText = JSON.stringify(msgs);
+
     if (sysText.includes("AI engineering orchestrator")) {
+      seenContexts.push({ role: "orchestrator", text: sysText });
+      const lastUser = JSON.stringify([...msgs].reverse().find((m: any) => m.role === "user")?.content ?? "");
+      if (lastUser.includes("start work on this")) {
+        if (lastMsg?.role !== "tool") {
+          return {
+            toolCalls: [
+              {
+                name: "spawn_session",
+                arguments: { title: "Create hello file", task: "Add hello.txt and commit on the issue branch." },
+              },
+            ],
+          };
+        }
+        return { text: "Started implementing on the issue branch." };
+      }
+
       if (lastMsg?.role !== "tool") {
         return {
           toolCalls: [
             {
               name: "create_issue",
-              arguments: {
-                title: "Add caching layer",
-                body_md: "## Goal\nInitial caching spec.",
-              },
+              arguments: { title: "Add caching layer", body_md: "## Goal\nInitial caching spec." },
             },
           ],
         };
@@ -74,10 +91,7 @@ test("Slice C: orchestrator create_issue / update_issue / list_issues & issue.op
           toolCalls: [
             {
               name: "update_issue",
-              arguments: {
-                issue_ref: "#1",
-                body_md: "## Goal\nUpdated caching spec with LRU eviction.",
-              },
+              arguments: { issue_ref: "#1", body_md: "## Goal\nUpdated caching spec with LRU eviction." },
             },
           ],
         };
@@ -87,7 +101,26 @@ test("Slice C: orchestrator create_issue / update_issue / list_issues & issue.op
       }
       return { text: "Created Issue #1 and updated its specification." };
     }
-    return { text: "ok" };
+
+    // Issue worker
+    seenContexts.push({ role: "worker", text: `${sysText}\n${allPromptText}` });
+    const toolCount = msgs.filter((m: any) => m.role === "tool").length;
+    if (toolCount === 0) {
+      return {
+        toolCalls: [
+          {
+            name: "bash",
+            arguments: { command: "printf 'hello\\n' > hello.txt && git add hello.txt && git commit -m 'Add hello.txt'" },
+          },
+        ],
+      };
+    }
+    if (toolCount === 1) {
+      return {
+        toolCalls: [{ name: "report", arguments: { text: "Committed hello.txt on issue branch." } }],
+      };
+    }
+    return { text: "NO_REPLY" };
   });
 
   const host = await startHost({ dataDir, quiet: true, decisionMode, disableSandbox: true });
@@ -142,18 +175,20 @@ test("Slice C: orchestrator create_issue / update_issue / list_issues & issue.op
     await issueCreatedWait;
     await replyWait;
 
-    const listed = await alice.request<{ issues: Array<{ id: string; number: number; title: string; body_md: string; conversation_id: string }> }>(
-      "issue.list",
-    );
+    const listed = await alice.request<{
+      issues: Array<{ id: string; number: number; title: string; body_md: string; status: string; conversation_id: string }>;
+    }>("issue.list");
     assert.equal(listed.issues.length, 1);
     const issue1 = listed.issues[0];
+    assert.equal(issue1.status, "open");
     assert.equal(issue1.title, "Add caching layer");
     assert.ok(issue1.body_md.includes("LRU eviction"));
 
     const opened = await alice.request<{
-      issue: { id: string; number: number };
+      issue: { id: string; number: number; status: string };
       conversation: { kind: string; name: string };
     }>("issue.open", { issue_id: issue1.id });
+    assert.equal(opened.issue.status, "open");
     assert.equal(opened.conversation.kind, "issue");
     assert.equal(opened.conversation.name, "issue-1");
 
@@ -162,6 +197,32 @@ test("Slice C: orchestrator create_issue / update_issue / list_issues & issue.op
       body_md: "## Goal\nHuman-edited markdown spec.",
     });
     assert.equal(updated.issue.body_md, "## Goal\nHuman-edited markdown spec.");
+
+    // Trigger implementation via @kawan in issue room -> verify dynamic kawan://issue.md + checks='none'
+    const workerCommitWait = alice.waitForNextFrame(
+      (f) =>
+        f.type === "issue.update" &&
+        f.issue?.id === issue1.id &&
+        f.issue?.commits_ahead === 1 &&
+        f.issue?.checks_sha !== null,
+      25_000,
+    );
+    await alice.request("message.send", {
+      conversation_id: issue1.conversation_id,
+      body: "@kawan start work on this",
+    });
+
+    const afterCommit = await workerCommitWait;
+    assert.equal(afterCommit.issue.status, "open");
+    assert.equal(afterCommit.issue.checks_status, "none", "Unconfigured repo must keep checks_status='none'");
+    assert.ok(
+      seenContexts.some((c) => c.role === "orchestrator" && c.text.includes("Human-edited markdown spec.")),
+      "Orchestrator must receive updated kawan://issue.md dynamically",
+    );
+    assert.ok(
+      seenContexts.some((c) => c.role === "worker" && c.text.includes("Human-edited markdown spec.")),
+      "Worker must receive updated kawan://issue.md dynamically",
+    );
   } finally {
     await alice?.close();
     await host.close();
@@ -172,7 +233,7 @@ test("Slice C: orchestrator create_issue / update_issue / list_issues & issue.op
   }
 });
 
-test("Slice C: collaborative issue, ask_owner resume, sync_main, start_review (fail -> fix -> pass), land", async () => {
+test("Slice C: chat-first spawn gate, ask_owner (open), implicit check fail (no auto-retry), sync_main, fix -> pass, issue.land", async () => {
   const decisionMode: DecisionMode = "live";
   const stub = await startStubProvider();
   const repo = await createFixtureBareRepo({ "README.md": "# Collaborative Issue Repo\n" });
@@ -186,19 +247,67 @@ test("Slice C: collaborative issue, ask_owner resume, sync_main, start_review (f
   const dataDir = mkdtempSync(join(tmpdir(), "kawan-sliceC-collab-"));
   const adminKey = await TestKeyPair.generate("admin@kawan");
 
+  let snapMode: "hold_proposal" | "to_worker" = "hold_proposal";
+  stub.setSystemOneHandler((reqBody) => {
+    const incoming = reqBody?.state?.incoming_message?.body ?? "";
+    const activeSessions = reqBody?.state?.active_worker_sessions ?? [];
+    if (snapMode === "hold_proposal" && activeSessions.length === 0) {
+      return {
+        status: 200,
+        body: {
+          model: "stub-snap",
+          answers: {
+            destination: { type: "choice", choice: "orchestrator", confidence: 0.99 },
+            readiness: { type: "choice", choice: "dispatch", confidence: 0.99 },
+            explicit_work_start: { type: "choice", choice: "no", confidence: 0.96 },
+            work_request: { type: "choice", choice: "yes", confidence: 0.95 },
+          },
+        },
+      };
+    }
+    const targetSession = activeSessions[0]?.destination_id ?? "orchestrator";
+    const dest = incoming.includes("@kawan") ? targetSession : "none";
+    return {
+      status: 200,
+      body: {
+        model: "stub-snap",
+        answers: {
+          destination: { type: "choice", choice: dest, confidence: 0.99 },
+          readiness: { type: "choice", choice: "dispatch", confidence: 0.99 },
+          explicit_work_start: { type: "choice", choice: "yes", confidence: 0.99 },
+          work_request: { type: "choice", choice: "yes", confidence: 0.99 },
+        },
+      },
+    };
+  });
+
   let stage: "ask" | "draft_ready" | "fix_pass" = "ask";
+  let workerTurns = 0;
 
   stub.setHandler((reqBody) => {
     const sysText = JSON.stringify(reqBody.messages?.[0] ?? "");
-    if (sysText.includes("AI engineering orchestrator")) {
-      return { text: "NO_REPLY" };
-    }
     const msgs = reqBody.messages ?? [];
     const lastMsg = msgs[msgs.length - 1];
-    const hasToolResult = lastMsg?.role === "tool";
+    if (sysText.includes("AI engineering orchestrator")) {
+      if (lastMsg?.role !== "tool") {
+        return {
+          toolCalls: [
+            {
+              name: "spawn_session",
+              arguments: { title: "Configure ready sentinel", task: "Implement ready.txt cleanly." },
+            },
+          ],
+        };
+      }
+      return { text: "Proposed branch work for Issue #1." };
+    }
+
+    const lastUserIdx = msgs.map((m: any) => m.role).lastIndexOf("user");
+    const toolCallsSinceUser = msgs.slice(lastUserIdx).filter((m: any) => m.role === "tool").length;
+    if (toolCallsSinceUser === 0) workerTurns += 1;
 
     if (stage === "ask") {
-      if (!hasToolResult) {
+      if (lastMsg?.role !== "tool") {
         return {
           toolCalls: [
             {
@@ -213,10 +322,7 @@ test("Slice C: collaborative issue, ask_owner resume, sync_main, start_review (f
     }
 
     if (stage === "draft_ready") {
-      const toolCallsSinceAnswer = msgs
-        .slice(msgs.map((m: any) => m.role).lastIndexOf("user"))
-        .filter((m: any) => m.role === "tool").length;
-      if (toolCallsSinceAnswer === 0) {
+      if (toolCallsSinceUser === 0) {
         return {
           toolCalls: [
             {
@@ -226,7 +332,7 @@ test("Slice C: collaborative issue, ask_owner resume, sync_main, start_review (f
           ],
         };
       }
-      if (toolCallsSinceAnswer === 1) {
+      if (toolCallsSinceUser === 1) {
         return {
           toolCalls: [
             {
@@ -244,10 +350,7 @@ test("Slice C: collaborative issue, ask_owner resume, sync_main, start_review (f
     }
 
     // stage === "fix_pass"
-    const toolCallsSinceFail = msgs
-      .slice(msgs.map((m: any) => m.role).lastIndexOf("user"))
-      .filter((m: any) => m.role === "tool").length;
-    if (toolCallsSinceFail === 0) {
+    if (toolCallsSinceUser === 0) {
       return {
         toolCalls: [
           {
@@ -257,14 +360,9 @@ test("Slice C: collaborative issue, ask_owner resume, sync_main, start_review (f
         ],
       };
     }
-    if (toolCallsSinceFail === 1) {
+    if (toolCallsSinceUser === 1) {
       return {
-        toolCalls: [
-          {
-            name: "report",
-            arguments: { text: "Fixed ready.txt to PASS and committed." },
-          },
-        ],
+        toolCalls: [{ name: "report", arguments: { text: "Fixed ready.txt to PASS and committed." } }],
       };
     }
     return { text: "NO_REPLY" };
@@ -291,55 +389,65 @@ test("Slice C: collaborative issue, ask_owner resume, sync_main, start_review (f
         decision: { provider: "stub", baseUrl: stub.systemOneBaseUrl, model: "stub-snap", apiKey: "stub-key" },
       },
     });
-    const botRes = await alice.request<{ bot: { id: string } }>("bot.create", {
+    await alice.request("bot.create", {
       name: "kawan",
       persona: "Orchestrator",
       sandbox_enabled: false,
     });
 
-    const created = await alice.request<{ issue: { id: string; number: number; conversation_id: string } }>(
+    const created = await alice.request<{ issue: { id: string; number: number; status: string; conversation_id: string } }>(
       "issue.create",
       { title: "Configure ready sentinel", body_md: "Write ready.txt cleanly." },
     );
+    assert.equal(created.issue.status, "open");
     const issueId = created.issue.id;
     const issueConvId = created.issue.conversation_id;
 
-    // Assign & run -> worker calls ask_owner -> enters needs_input
+    // Polite / tentative request holds behind [Start] [Dismiss] proposal card
+    const pendingWait = alice.waitForNextFrame(
+      (f) => f.type === "session.update" && f.session?.status === "pending_approval",
+      15_000,
+    );
+    await alice.request("message.send", {
+      conversation_id: issueConvId,
+      body: "@kawan could you maybe take a look at implementing ready.txt?",
+    });
+    const pendingEv = await pendingWait;
+    const workerId = pendingEv.session.id as string;
+
+    // Confirm -> binds branch to issue -> worker calls ask_owner -> stays 'open' with needs_input_question
+    snapMode = "to_worker";
     const needsInputWait = alice.waitForNextFrame(
-      (f) => f.type === "issue.update" && f.issue?.id === issueId && f.issue?.status === "needs_input",
+      (f) =>
+        f.type === "issue.update" &&
+        f.issue?.id === issueId &&
+        f.issue?.needs_input_question === "Should ready.txt say PASS or READY?",
       20_000,
     );
     const askIdleWait = alice.waitForNextFrame(
-      (f) => f.type === "session.update" && f.session?.kind === "worker" && f.session?.status === "idle",
+      (f) => f.type === "session.update" && f.session?.id === workerId && f.session?.status === "idle",
       20_000,
     );
-    const assigned = await alice.request<{ session: { id: string } }>("issue.assign", {
-      issue_id: issueId,
-      implementer_bot_id: botRes.bot.id,
-    });
-    const workerId = assigned.session.id;
-
+    await alice.request("session.confirm", { session_id: workerId });
     const niEv = await needsInputWait;
-    assert.equal(niEv.issue.needs_input_question, "Should ready.txt say PASS or READY?");
+    assert.equal(niEv.issue.status, "open");
     await askIdleWait;
 
-    const statusRes = await alice.request<{ issues: Array<{ id: string; status: string }> }>("status.read");
-    assert.ok(statusRes.issues.some((i) => i.id === issueId && i.status === "needs_input"));
+    const statusRes = await alice.request<{ issues: Array<{ id: string; status: string; needs_input_question: string | null }> }>(
+      "status.read",
+    );
+    assert.ok(
+      statusRes.issues.some((i) => i.id === issueId && i.status === "open" && i.needs_input_question !== null),
+    );
 
-    // Owner reply in issue room bypasses SubQ Snap and resumes persistent worker
+    // Owner reply in issue room bypasses SubQ Snap -> worker commits READY -> implicit check FAILS with NO auto-retry!
     const decisionsBefore = host.db.listDecisions(issueConvId).length;
-    const draftMsgWait = alice.waitForNextFrame(
-      (f) =>
-        f.type === "message.new" &&
-        f.message?.conversation_id === issueConvId &&
-        String(f.message?.body).includes("First draft ready for check"),
+    const checkFailedWait = alice.waitForNextFrame(
+      (f) => f.type === "issue.update" && f.issue?.id === issueId && f.issue?.checks_status === "failed",
       25_000,
     );
     const workerIdle1 = alice.waitForNextFrame(
-      (f) =>
-        f.type === "session.update" &&
-        f.session?.id === workerId &&
-        f.session?.status === "idle",
+      (f) => f.type === "session.update" && f.session?.id === workerId && f.session?.status === "idle",
       25_000,
     );
 
@@ -348,12 +456,18 @@ test("Slice C: collaborative issue, ask_owner resume, sync_main, start_review (f
       body: "Go ahead with PASS",
     });
 
-    const draftMsg = await draftMsgWait;
-    assert.ok(draftMsg.message.artifact_id, "worker report() artifact must appear directly in issue room");
     await workerIdle1;
+    const failedEv = await checkFailedWait;
+    assert.equal(failedEv.issue.status, "open");
+    assert.equal(failedEv.issue.commits_ahead, 1);
+    assert.ok(failedEv.issue.checks_artifact_id, "Failing implicit check must attach log artifact");
     assert.equal(host.db.listDecisions(issueConvId).length, decisionsBefore, "needs_input owner reply must bypass SubQ Snap");
 
-    // Push unrelated commit to host bare repo -> issue.open detects behind_main -> issue.sync_main rebases cleanly
+    const turnsAfterFail = workerTurns;
+    await new Promise((r) => setTimeout(r, 350));
+    assert.equal(workerTurns, turnsAfterFail, "Failing implicit check must NEVER auto-retry the implementer");
+
+    // Push upstream commit -> issue.open detects behind_main -> issue.sync_main rebases cleanly
     const hostBareRepo = join(dataDir, "repo.git");
     await seedRepoCommit(
       hostBareRepo,
@@ -378,47 +492,32 @@ test("Slice C: collaborative issue, ask_owner resume, sync_main, start_review (f
     assert.equal(synced.behind_after, 0);
     assert.equal(synced.issue.behind_main, 0);
 
-    // Start Review Cycle -> fails .kawan/checks -> auto-resumes worker -> worker fixes to PASS
-    const fixedMsgWait = alice.waitForNextFrame(
-      (f) =>
-        f.type === "message.new" &&
-        f.message?.conversation_id === issueConvId &&
-        String(f.message?.body).includes("Fixed ready.txt to PASS"),
+    // Human asks @kawan to fix ready.txt -> routes directly to worker -> commits PASS -> implicit check passes!
+    const checkPassedWait = alice.waitForNextFrame(
+      (f) => f.type === "issue.update" && f.issue?.id === issueId && f.issue?.checks_status === "passed",
       25_000,
     );
-    const workerIdle2 = alice.waitForNextFrame(
-      (f) =>
-        f.type === "session.update" &&
-        f.session?.id === workerId &&
-        f.session?.status === "idle",
-      25_000,
-    );
-    const reviewFail = await alice.request<{ ok: boolean; issue: { status: string } }>(
-      "issue.start_review",
-      { issue_id: issueId },
-    );
-    assert.equal(reviewFail.ok, false);
-    assert.equal(reviewFail.issue.status, "implementing");
+    await alice.request("message.send", {
+      conversation_id: issueConvId,
+      body: "@kawan please update ready.txt to PASS",
+    });
+    const passedEv = await checkPassedWait;
+    assert.equal(passedEv.issue.status, "open");
+    assert.equal(passedEv.issue.checks_status, "passed");
 
-    await fixedMsgWait;
-    await workerIdle2;
-
-    // Second Start Review Cycle passes -> ready_to_land -> land.approve -> landed
-    const reviewPass = await alice.request<{
-      ok: boolean;
-      issue: { status: string };
-      land: { id: string; issue_id: string };
-    }>("issue.start_review", { issue_id: issueId });
-    assert.equal(reviewPass.ok, true);
-    assert.equal(reviewPass.issue.status, "ready_to_land");
-    assert.equal(reviewPass.land.issue_id, issueId);
-
-    const landedIssueWait = alice.waitForFrame(
+    // Direct one-click issue.land -> enqueues onto Merge Queue -> lands cleanly
+    const landedIssueWait = alice.waitForNextFrame(
       (f) => f.type === "issue.update" && f.issue?.id === issueId && f.issue?.status === "landed",
       25_000,
     );
-    await alice.request("land.approve", { land_id: reviewPass.land.id, async: true });
+    const landedRes = await alice.request<{ land: { id: string; issue_id: string } }>("issue.land", {
+      issue_id: issueId,
+    });
+    assert.equal(landedRes.land.issue_id, issueId);
     await landedIssueWait;
+
+    const landedContent = await git(["show", `refs/heads/${repo.defaultBranch}:ready.txt`], hostBareRepo);
+    assert.equal(landedContent, "PASS");
   } finally {
     await alice?.close();
     await host.close();
@@ -429,7 +528,7 @@ test("Slice C: collaborative issue, ask_owner resume, sync_main, start_review (f
   }
 });
 
-test("Slice C: Promote to Issue, Return to Collaborate, Stop, and Abandon/Close", async () => {
+test("Slice C: Promote to Issue, Stop, and Abandon/Close", async () => {
   const decisionMode: DecisionMode = "live";
   const stub = await startStubProvider();
   const repo = await createFixtureBareRepo({ "README.md": "# Promote & Escape Repo\n" });
@@ -489,9 +588,7 @@ test("Slice C: Promote to Issue, Return to Collaborate, Stop, and Abandon/Close"
       };
     }
     if (toolCount === 2) {
-      return {
-        toolCalls: [{ name: "land_request", arguments: { summary: "adhoc ready" } }],
-      };
+      return { toolCalls: [{ name: "land_request", arguments: { summary: "adhoc ready" } }] };
     }
     return { text: "Done." };
   });
@@ -537,11 +634,12 @@ test("Slice C: Promote to Issue, Return to Collaborate, Stop, and Abandon/Close"
 
     // Promote to Issue
     const promoted = await alice.request<{
-      issue: { id: string; number: number; status: string; active_session_id: string };
+      issue: { id: string; number: number; status: string; active_session_id: string; commits_ahead: number };
       conversation: { id: string; kind: string };
     }>("issue.promote", { session_id: workerId, title: "Promoted adhoc feature" });
     assert.equal(promoted.issue.number, 1);
-    assert.equal(promoted.issue.status, "ready_to_land");
+    assert.equal(promoted.issue.status, "open");
+    assert.equal(promoted.issue.commits_ahead, 1);
     assert.equal(promoted.issue.active_session_id, workerId);
     assert.equal(promoted.conversation.kind, "issue");
 
@@ -550,12 +648,6 @@ test("Slice C: Promote to Issue, Return to Collaborate, Stop, and Abandon/Close"
       issue_id: promoted.issue.id,
     });
     assert.ok(opened.artifacts.some((a) => a.filename === "adhoc-report.txt"));
-
-    // Return to Collaborate drops ready_to_land -> implementing
-    const returned = await alice.request<{ issue: { status: string } }>("issue.return_to_collaborate", {
-      issue_id: promoted.issue.id,
-    });
-    assert.equal(returned.issue.status, "implementing");
 
     // Stop preserves clone
     await alice.request("issue.stop", { issue_id: promoted.issue.id });

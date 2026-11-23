@@ -2,23 +2,21 @@ import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import type {
   ArtifactRow,
+  CheckRunItem,
   ConversationKind,
   ConversationRow,
   DecisionReadiness,
   DecisionRow,
   HostSettings,
   InviteRow,
-  IssueReviewRow,
-  IssueReviewerRow,
+  IssueChecksStatus,
   IssueRow,
   IssueStatus,
   KeyRow,
   LandRow,
   LandStatus,
-  LandingMode,
   MessageRow,
   ReadCursorRow,
-  ReviewVerdict,
   SerializedIssue,
   SessionKind,
   SessionRow,
@@ -403,40 +401,80 @@ export class KawanDb {
         conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
         title TEXT NOT NULL,
         body_md TEXT NOT NULL DEFAULT '',
-        status TEXT NOT NULL CHECK(status IN ('backlog', 'implementing', 'verifying', 'reviewing', 'needs_input', 'ready_to_land', 'queued', 'landed', 'closed')),
+        status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open', 'landed', 'closed')),
         owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         implementer_bot_id TEXT REFERENCES users(id) ON DELETE SET NULL,
-        auto_start_review INTEGER NOT NULL DEFAULT 0,
-        landing_mode TEXT NOT NULL DEFAULT 'manual',
-        max_rounds INTEGER NOT NULL DEFAULT 3,
-        current_round INTEGER NOT NULL DEFAULT 0,
         active_session_id TEXT,
         parent_issue_id TEXT REFERENCES issues(id) ON DELETE SET NULL,
         needs_input_question TEXT,
         behind_main INTEGER NOT NULL DEFAULT 0,
+        commits_ahead INTEGER NOT NULL DEFAULT 0,
+        checks_status TEXT NOT NULL DEFAULT 'none' CHECK(checks_status IN ('none', 'running', 'passed', 'failed')),
+        checks_sha TEXT,
+        checks_summary TEXT,
+        checks_json TEXT,
+        checks_artifact_id TEXT,
+        touches_kawan INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
+    `);
 
-      CREATE TABLE IF NOT EXISTS issue_reviewers (
-        id TEXT PRIMARY KEY,
-        issue_id TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
-        bot_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        focus TEXT,
-        order_index INTEGER NOT NULL DEFAULT 0
-      );
-
-      CREATE TABLE IF NOT EXISTS issue_reviews (
-        id TEXT PRIMARY KEY,
-        issue_id TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
-        round INTEGER NOT NULL,
-        reviewer_slot_id TEXT NOT NULL,
-        session_id TEXT,
-        verdict TEXT NOT NULL CHECK(verdict IN ('approve', 'request_changes', 'needs_owner')),
-        summary TEXT NOT NULL,
-        notes_artifact_id TEXT,
-        created_at INTEGER NOT NULL
-      );
+    const issueTableSql = (
+      this.sqlite
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'issues'")
+        .get() as { sql?: string } | undefined
+    )?.sql;
+    if (issueTableSql && (!issueTableSql.includes("checks_status") || issueTableSql.includes("'backlog'"))) {
+      this.sqlite.exec("PRAGMA foreign_keys = OFF;");
+      try {
+        this.transaction(() => {
+          this.sqlite.exec(`
+            CREATE TABLE issues_v3 (
+              id TEXT PRIMARY KEY,
+              number INTEGER NOT NULL UNIQUE,
+              conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+              title TEXT NOT NULL,
+              body_md TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open', 'landed', 'closed')),
+              owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              implementer_bot_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+              active_session_id TEXT,
+              parent_issue_id TEXT REFERENCES issues(id) ON DELETE SET NULL,
+              needs_input_question TEXT,
+              behind_main INTEGER NOT NULL DEFAULT 0,
+              commits_ahead INTEGER NOT NULL DEFAULT 0,
+              checks_status TEXT NOT NULL DEFAULT 'none' CHECK(checks_status IN ('none', 'running', 'passed', 'failed')),
+              checks_sha TEXT,
+              checks_summary TEXT,
+              checks_json TEXT,
+              checks_artifact_id TEXT,
+              touches_kawan INTEGER NOT NULL DEFAULT 0,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+            INSERT INTO issues_v3 (
+              id, number, conversation_id, title, body_md, status, owner_id,
+              implementer_bot_id, active_session_id, parent_issue_id,
+              needs_input_question, behind_main, created_at, updated_at
+            )
+            SELECT
+              id, number, conversation_id, title, body_md,
+              CASE WHEN status IN ('landed', 'closed') THEN status ELSE 'open' END,
+              owner_id, implementer_bot_id, active_session_id, parent_issue_id,
+              needs_input_question, behind_main, created_at, updated_at
+            FROM issues;
+            DROP TABLE issues;
+            ALTER TABLE issues_v3 RENAME TO issues;
+          `);
+        });
+      } finally {
+        this.sqlite.exec("PRAGMA foreign_keys = ON;");
+      }
+    }
+    this.sqlite.exec(`
+      DROP TABLE IF EXISTS issue_reviewers;
+      DROP TABLE IF EXISTS issue_reviews;
     `);
   }
 
@@ -1426,14 +1464,17 @@ export class KawanDb {
     status?: IssueStatus;
     ownerId: string;
     implementerBotId?: string | null;
-    autoStartReview?: boolean;
-    landingMode?: LandingMode;
-    maxRounds?: number;
-    currentRound?: number;
     activeSessionId?: string | null;
     parentIssueId?: string | null;
     needsInputQuestion?: string | null;
     behindMain?: number;
+    commitsAhead?: number;
+    checksStatus?: IssueChecksStatus;
+    checksSha?: string | null;
+    checksSummary?: string | null;
+    checksJson?: string | null;
+    checksArtifactId?: string | null;
+    touchesKawan?: boolean | number;
   }): IssueRow {
     const id = input.id ?? randomUUID();
     const num = input.number ?? this.nextIssueNumber();
@@ -1442,10 +1483,11 @@ export class KawanDb {
       .prepare(
         `INSERT INTO issues (
           id, number, conversation_id, title, body_md, status, owner_id,
-          implementer_bot_id, auto_start_review, landing_mode, max_rounds, current_round,
-          active_session_id, parent_issue_id, needs_input_question, behind_main,
+          implementer_bot_id, active_session_id, parent_issue_id,
+          needs_input_question, behind_main, commits_ahead,
+          checks_status, checks_sha, checks_summary, checks_json, checks_artifact_id, touches_kawan,
           created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -1453,17 +1495,20 @@ export class KawanDb {
         input.conversationId,
         input.title,
         input.bodyMd ?? "",
-        input.status ?? "backlog",
+        input.status ?? "open",
         input.ownerId,
         input.implementerBotId ?? null,
-        input.autoStartReview ? 1 : 0,
-        input.landingMode ?? "manual",
-        input.maxRounds ?? 3,
-        input.currentRound ?? 0,
         input.activeSessionId ?? null,
         input.parentIssueId ?? null,
         input.needsInputQuestion ?? null,
         input.behindMain ?? 0,
+        input.commitsAhead ?? 0,
+        input.checksStatus ?? "none",
+        input.checksSha ?? null,
+        input.checksSummary ?? null,
+        input.checksJson ?? null,
+        input.checksArtifactId ?? null,
+        input.touchesKawan ? 1 : 0,
         now,
         now,
       );
@@ -1524,31 +1569,35 @@ export class KawanDb {
       status: IssueStatus;
       owner_id: string;
       implementer_bot_id: string | null;
-      auto_start_review: boolean | number;
-      landing_mode: LandingMode;
-      max_rounds: number;
-      current_round: number;
       active_session_id: string | null;
       parent_issue_id: string | null;
       needs_input_question: string | null;
       behind_main: number;
+      commits_ahead: number;
+      checks_status: IssueChecksStatus;
+      checks_sha: string | null;
+      checks_summary: string | null;
+      checks_json: string | null;
+      checks_artifact_id: string | null;
+      touches_kawan: boolean | number;
     }>,
   ): IssueRow | null {
     const existing = this.getIssue(id);
     if (!existing) return null;
-    const autoStart =
-      patch.auto_start_review !== undefined
-        ? patch.auto_start_review
+    const touchesKawan =
+      patch.touches_kawan !== undefined
+        ? patch.touches_kawan
           ? 1
           : 0
-        : existing.auto_start_review;
+        : existing.touches_kawan;
     this.sqlite
       .prepare(
         `UPDATE issues SET
           title = ?, body_md = ?, status = ?, owner_id = ?, implementer_bot_id = ?,
-          auto_start_review = ?, landing_mode = ?, max_rounds = ?, current_round = ?,
           active_session_id = ?, parent_issue_id = ?, needs_input_question = ?,
-          behind_main = ?, updated_at = ?
+          behind_main = ?, commits_ahead = ?,
+          checks_status = ?, checks_sha = ?, checks_summary = ?, checks_json = ?,
+          checks_artifact_id = ?, touches_kawan = ?, updated_at = ?
         WHERE id = ?`,
       )
       .run(
@@ -1557,90 +1606,40 @@ export class KawanDb {
         patch.status !== undefined ? patch.status : existing.status,
         patch.owner_id !== undefined ? patch.owner_id : existing.owner_id,
         patch.implementer_bot_id !== undefined ? patch.implementer_bot_id : existing.implementer_bot_id,
-        autoStart,
-        patch.landing_mode !== undefined ? patch.landing_mode : existing.landing_mode,
-        patch.max_rounds !== undefined ? patch.max_rounds : existing.max_rounds,
-        patch.current_round !== undefined ? patch.current_round : existing.current_round,
         patch.active_session_id !== undefined ? patch.active_session_id : existing.active_session_id,
         patch.parent_issue_id !== undefined ? patch.parent_issue_id : existing.parent_issue_id,
         patch.needs_input_question !== undefined
           ? patch.needs_input_question
           : existing.needs_input_question,
         patch.behind_main !== undefined ? patch.behind_main : existing.behind_main,
+        patch.commits_ahead !== undefined ? patch.commits_ahead : existing.commits_ahead,
+        patch.checks_status !== undefined ? patch.checks_status : existing.checks_status,
+        patch.checks_sha !== undefined ? patch.checks_sha : existing.checks_sha,
+        patch.checks_summary !== undefined ? patch.checks_summary : existing.checks_summary,
+        patch.checks_json !== undefined ? patch.checks_json : existing.checks_json,
+        patch.checks_artifact_id !== undefined ? patch.checks_artifact_id : existing.checks_artifact_id,
+        touchesKawan,
         Date.now(),
         id,
       );
     return this.getIssue(id);
   }
 
-  setIssueReviewers(
-    issueId: string,
-    reviewers: Array<{ botId: string; focus?: string | null }>,
-  ): IssueReviewerRow[] {
-    return this.transaction(() => {
-      this.sqlite.prepare("DELETE FROM issue_reviewers WHERE issue_id = ?").run(issueId);
-      const stmt = this.sqlite.prepare(
-        `INSERT INTO issue_reviewers (id, issue_id, bot_id, focus, order_index)
-         VALUES (?, ?, ?, ?, ?)`,
-      );
-      for (let i = 0; i < reviewers.length; i += 1) {
-        const r = reviewers[i];
-        stmt.run(randomUUID(), issueId, r.botId, r.focus ?? null, i);
-      }
-      return this.listIssueReviewers(issueId);
-    });
-  }
-
-  listIssueReviewers(issueId: string): IssueReviewerRow[] {
-    return this.sqlite
-      .prepare("SELECT * FROM issue_reviewers WHERE issue_id = ? ORDER BY order_index ASC")
-      .all(issueId) as unknown as IssueReviewerRow[];
-  }
-
-  createIssueReview(input: {
-    id?: string;
-    issueId: string;
-    round: number;
-    reviewerSlotId: string;
-    sessionId?: string | null;
-    verdict: ReviewVerdict;
-    summary: string;
-    notesArtifactId?: string | null;
-  }): IssueReviewRow {
-    const id = input.id ?? randomUUID();
-    const now = Date.now();
-    this.sqlite
-      .prepare(
-        `INSERT INTO issue_reviews (
-          id, issue_id, round, reviewer_slot_id, session_id, verdict, summary, notes_artifact_id, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        id,
-        input.issueId,
-        input.round,
-        input.reviewerSlotId,
-        input.sessionId ?? null,
-        input.verdict,
-        input.summary,
-        input.notesArtifactId ?? null,
-        now,
-      );
-    return this.sqlite.prepare("SELECT * FROM issue_reviews WHERE id = ?").get(id) as unknown as IssueReviewRow;
-  }
-
-  listIssueReviews(issueId: string): IssueReviewRow[] {
-    return this.sqlite
-      .prepare("SELECT * FROM issue_reviews WHERE issue_id = ? ORDER BY round ASC, created_at ASC")
-      .all(issueId) as unknown as IssueReviewRow[];
-  }
-
   serializeIssue(issue: IssueRow): SerializedIssue {
+    let checks: CheckRunItem[] = [];
+    if (issue.checks_json) {
+      try {
+        const parsed = JSON.parse(issue.checks_json);
+        if (Array.isArray(parsed)) checks = parsed as CheckRunItem[];
+      } catch {
+        checks = [];
+      }
+    }
     return {
       ...issue,
-      auto_start_review: Boolean(issue.auto_start_review),
-      reviewers: this.listIssueReviewers(issue.id),
-      reviews: this.listIssueReviews(issue.id),
+      checks,
+      touches_kawan: Boolean(issue.touches_kawan),
+      active_reviewers: [],
     };
   }
 }

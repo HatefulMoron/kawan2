@@ -179,6 +179,14 @@ export async function getBranchHead(repoDir: string, ref = "HEAD"): Promise<stri
   return stdout.trim();
 }
 
+export async function getHeadSha(clonePath: string): Promise<string | null> {
+  try {
+    return await getBranchHead(clonePath, "HEAD");
+  } catch {
+    return null;
+  }
+}
+
 export async function isWorkingTreeClean(clonePath: string): Promise<boolean> {
   const { stdout } = await runGit(["-C", clonePath, "status", "--porcelain"]);
   return stdout.trim().length === 0;
@@ -297,6 +305,7 @@ export async function runRepoChecks(params: {
   sandboxNetwork?: boolean;
   disableSandbox?: boolean;
   timeoutMs?: number;
+  allowUnconfigured?: boolean;
 }): Promise<RepoCheckResult> {
   const checksDir = join(params.workdir, ".kawan", "checks");
   const ciScript = join(params.workdir, ".kawan", "ci");
@@ -347,6 +356,15 @@ export async function runRepoChecks(params: {
   if (executableChecks.length === 0) {
     const cmd = params.verifyCommand?.trim() ?? "";
     if (!cmd) {
+      if (params.allowUnconfigured) {
+        return {
+          ok: true,
+          source: "none",
+          checks: [],
+          summary: "No checks configured",
+          combined_output: "",
+        };
+      }
       return {
         ok: false,
         source: "verify_command",

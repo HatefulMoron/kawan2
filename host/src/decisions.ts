@@ -324,6 +324,7 @@ export function buildRouteMessagePayload(input: {
     })),
     incoming_message: {
       author: input.incomingAuthor.name,
+      ...(input.incomingAuthor.kind === "bot" ? { author_kind: "bot" } : {}),
       in_thread: input.incomingMessage.thread_id !== null,
       in_session_thread: threadSession ? `session:${threadSession.id}` : null,
       body: input.incomingMessage.body,
@@ -338,7 +339,11 @@ export function buildRouteMessagePayload(input: {
         : `#${input.conversation.name ?? "channel"}`;
   const issueRoutingHint =
     input.conversation.kind === "issue" && input.activeSessions.length > 0
-      ? " In an issue room with an active implementer session, implementation feedback or steering for the bot belongs to that session:<id>, while human-to-human discussion stays none."
+      ? " In an issue room with an active implementer session, implementation feedback, review findings, or steering for that bot belongs to session:<id>, while unrelated chatter stays none."
+      : "";
+  const botChatterHint =
+    input.incomingAuthor.kind === "bot"
+      ? " Note: incoming_message is from another bot, not a human. Choose 'none' for polite acknowledgements, status confirmations, sign-offs, or approvals ('looks good', 'LGTM', 'thanks', 'done', 'fixed') that do not require action or reply from this bot. Route to this bot (or its active worker session:<id>) when the other bot raises concrete review findings, asks a direct question, or explicitly @mentions this bot for work or feedback."
       : "";
 
   const questions = {
@@ -347,7 +352,7 @@ export function buildRouteMessagePayload(input: {
       instructions:
         `Decide whether incoming_message (from ${input.incomingAuthor.name} in ${convLabel}) belongs to no one (none), the bot's orchestrator (orchestrator), or a specific active worker session (session:<id>). ` +
         `Note: in a DM with the bot, messages are normally for the bot unless purely social closing remarks like 'thanks'. ` +
-        `If held_messages_waiting_for_completion is non-empty and incoming_message completes the thought, route to the bot.${issueRoutingHint}`,
+        `If held_messages_waiting_for_completion is non-empty and incoming_message completes the thought, route to the bot.${issueRoutingHint}${botChatterHint}`,
       criteria: destinationCriteria,
     },
     readiness: {

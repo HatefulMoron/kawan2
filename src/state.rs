@@ -12,12 +12,12 @@ use crate::mock;
 use crate::protocol::{
     Artifact, ArtifactGetData, BotCreateData, BotListData, BotSummary, Conversation,
     ConversationCreateData, ConversationListData, ConversationMarkReadData, ConversationOpenData,
-    Decision, InviteCreateData, IssueActionData, IssueAssignData, IssueListData, IssueOpenData,
-    IssuePromoteData, IssueReviewer, IssueStartReviewData, IssueSummary, IssueSyncData, Land,
-    LandApproveData, Member, MergeQueueReadData, MergeQueueSnapshot, Message, ModelsTestData,
-    ServerFrame, SessionActionData, SessionDiffData, SessionDiffSummary, SessionListData,
-    SessionOpenData, SessionSummary, SettingsView, SetupStatus, StatusReadData, StatusRepoInfo,
-    UserListData, UserSummary, parse_invite_link,
+    Decision, InviteCreateData, IssueActionData, IssueLandData, IssueListData, IssueOpenData,
+    IssuePromoteData, IssueSummary, IssueSyncData, Land, LandApproveData, Member,
+    MergeQueueReadData, MergeQueueSnapshot, Message, ModelsTestData, ServerFrame,
+    SessionActionData, SessionDiffData, SessionDiffSummary, SessionListData, SessionOpenData,
+    SessionSummary, SettingsView, SetupStatus, StatusReadData, StatusRepoInfo, UserListData,
+    UserSummary, parse_invite_link,
 };
 use crate::ssh::default_ssh_key_path;
 use crate::ws_client::{AuthMode, ConnectConfig, WsEvent, WsHandle};
@@ -57,6 +57,7 @@ pub enum RightPanel {
     None,
     Thread(String),
     Session(String),
+    Artifact(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,7 +88,6 @@ pub enum FocusTarget {
     IssueBody,
     IssueEditTitle,
     IssueEditBody,
-    AssignReviewerFocus,
 }
 
 #[derive(Clone)]
@@ -161,22 +161,13 @@ pub struct KawanApp {
 
     // Issues view state
     pub issue_filter: String,
-    pub issue_view_mode: String,
     pub show_new_issue_form: bool,
     pub new_issue_title: String,
     pub new_issue_body: String,
     pub editing_issue_id: Option<String>,
     pub edit_issue_title: String,
     pub edit_issue_body: String,
-    pub show_assign_panel: bool,
-    pub assign_bot_id: Option<String>,
-    pub assign_landing_mode: String,
-    pub assign_auto_review: bool,
-    pub assign_max_rounds: u64,
-    pub assign_reviewers: Vec<(String, String)>,
-    pub assign_reviewer_bot_id: Option<String>,
-    pub assign_reviewer_focus: String,
-    pub expanded_issue_specs: HashSet<String>,
+    pub collapsed_issue_docs: HashSet<String>,
 
     // Settings form state
     pub repo_url_input: String,
@@ -288,22 +279,13 @@ impl KawanApp {
             new_channel_name: String::new(),
 
             issue_filter: "all".to_string(),
-            issue_view_mode: "list".to_string(),
             show_new_issue_form: false,
             new_issue_title: String::new(),
             new_issue_body: String::new(),
             editing_issue_id: None,
             edit_issue_title: String::new(),
             edit_issue_body: String::new(),
-            show_assign_panel: false,
-            assign_bot_id: None,
-            assign_landing_mode: "manual".to_string(),
-            assign_auto_review: false,
-            assign_max_rounds: 3,
-            assign_reviewers: Vec::new(),
-            assign_reviewer_bot_id: None,
-            assign_reviewer_focus: String::new(),
-            expanded_issue_specs: HashSet::new(),
+            collapsed_issue_docs: HashSet::new(),
 
             repo_url_input: String::new(),
             repo_branch_input: "main".to_string(),
@@ -925,20 +907,10 @@ impl KawanApp {
                     }
                 }
             }
-            "issue.assign" => {
-                if let Ok(res) = serde_json::from_value::<IssueAssignData>(val) {
-                    self.issues_by_id.insert(res.issue.id.clone(), res.issue);
-                    self.sessions_by_id
-                        .insert(res.session.id.clone(), res.session);
-                    self.show_assign_panel = false;
-                    self.error_banner = None;
-                }
-            }
-            "issue.update" | "issue.return_to_collaborate" | "issue.stop" | "issue.close" => {
+            "issue.update" | "issue.stop" | "issue.close" => {
                 if let Ok(res) = serde_json::from_value::<IssueActionData>(val) {
                     if command == "issue.update" {
                         self.editing_issue_id = None;
-                        self.show_assign_panel = false;
                     }
                     self.issues_by_id.insert(res.issue.id.clone(), res.issue);
                     self.error_banner = None;
@@ -954,12 +926,10 @@ impl KawanApp {
                     }
                 }
             }
-            "issue.start_review" => {
-                if let Ok(res) = serde_json::from_value::<IssueStartReviewData>(val) {
+            "issue.land" => {
+                if let Ok(res) = serde_json::from_value::<IssueLandData>(val) {
                     self.issues_by_id.insert(res.issue.id.clone(), res.issue);
-                    if let Some(land) = res.land {
-                        self.lands_by_id.insert(land.id.clone(), land);
-                    }
+                    self.lands_by_id.insert(res.land.id.clone(), res.land);
                     self.error_banner = None;
                 }
             }
@@ -1190,7 +1160,6 @@ impl KawanApp {
         self.redirect_menu_decision_id = None;
         self.show_add_member = false;
         self.editing_issue_id = None;
-        self.show_assign_panel = false;
         if !self.is_mock {
             self.send_cmd("issue.list", json!({}));
         }
@@ -1202,7 +1171,6 @@ impl KawanApp {
         self.redirect_menu_decision_id = None;
         self.show_add_member = false;
         self.editing_issue_id = None;
-        self.show_assign_panel = false;
         self.focus_target = FocusTarget::Composer;
         if let Some(issue) = self.issues_by_id.get(issue_id).cloned() {
             self.active_conversation_id = Some(issue.conversation_id.clone());
@@ -1258,19 +1226,21 @@ impl KawanApp {
                     conversation_id: cid,
                     title,
                     body_md: body,
-                    status: "backlog".to_string(),
+                    status: "open".to_string(),
                     owner_id: self.current_user_id.clone(),
                     implementer_bot_id: None,
-                    auto_start_review: false,
-                    landing_mode: "manual".to_string(),
-                    max_rounds: 3,
-                    current_round: 0,
                     active_session_id: None,
                     parent_issue_id: None,
                     needs_input_question: None,
                     behind_main: 0,
-                    reviewers: Vec::new(),
-                    reviews: Vec::new(),
+                    commits_ahead: 0,
+                    checks_status: "none".to_string(),
+                    checks_sha: None,
+                    checks_summary: None,
+                    checks: Vec::new(),
+                    checks_artifact_id: None,
+                    touches_kawan: false,
+                    active_reviewers: Vec::new(),
                     created_at: 300,
                     updated_at: 300,
                 },
@@ -1286,6 +1256,7 @@ impl KawanApp {
 
     pub fn begin_edit_issue(&mut self, issue_id: &str) {
         if let Some(issue) = self.issues_by_id.get(issue_id) {
+            self.collapsed_issue_docs.remove(issue_id);
             self.editing_issue_id = Some(issue.id.clone());
             self.edit_issue_title = issue.title.clone();
             self.edit_issue_body = issue.body_md.clone();
@@ -1315,168 +1286,20 @@ impl KawanApp {
         );
     }
 
-    pub fn open_assign_panel_for_issue(&mut self, issue_id: &str) {
-        if self.show_assign_panel {
-            self.show_assign_panel = false;
-            return;
-        }
-        let default_mode = self
-            .merge_queue
-            .as_ref()
-            .map(|q| q.settings.default_landing_mode.clone())
-            .or_else(|| {
-                self.settings
-                    .merge_queue
-                    .as_ref()
-                    .map(|q| q.default_landing_mode.clone())
-            })
-            .unwrap_or_else(|| "manual".to_string());
-        if let Some(issue) = self.issues_by_id.get(issue_id) {
-            self.assign_bot_id = issue
-                .implementer_bot_id
-                .clone()
-                .or_else(|| self.bots.first().map(|b| b.id.clone()));
-            self.assign_landing_mode = if issue.landing_mode.is_empty() {
-                default_mode
-            } else {
-                issue.landing_mode.clone()
-            };
-            self.assign_auto_review = issue.auto_start_review;
-            self.assign_max_rounds = issue.max_rounds.max(1);
-            self.assign_reviewers = issue
-                .reviewers
-                .iter()
-                .map(|r| (r.bot_id.clone(), r.focus.clone().unwrap_or_default()))
-                .collect();
-            self.assign_reviewer_bot_id = self.bots.first().map(|b| b.id.clone());
-            self.assign_reviewer_focus.clear();
-        }
-        self.show_assign_panel = true;
-    }
-
-    pub fn add_assign_reviewer(&mut self) {
-        let bot_id = self
-            .assign_reviewer_bot_id
-            .clone()
-            .or_else(|| self.bots.first().map(|b| b.id.clone()));
-        let Some(bot_id) = bot_id else {
-            return;
-        };
-        let focus = self.assign_reviewer_focus.trim().to_string();
-        self.assign_reviewers.push((bot_id, focus));
-        self.assign_reviewer_focus.clear();
-    }
-
-    pub fn remove_assign_reviewer(&mut self, idx: usize) {
-        if idx < self.assign_reviewers.len() {
-            self.assign_reviewers.remove(idx);
-        }
-    }
-
-    pub fn assign_and_run_issue(&mut self, issue_id: &str) {
-        let bot_id = self
-            .assign_bot_id
-            .clone()
-            .or_else(|| self.bots.first().map(|b| b.id.clone()));
-        let Some(bot_id) = bot_id else {
-            self.error_banner = Some("Create a bot before assigning an issue.".to_string());
-            return;
-        };
-        let reviewers_json: Vec<Value> = self
-            .assign_reviewers
-            .iter()
-            .map(|(bid, focus)| {
-                let trimmed = focus.trim();
-                json!({
-                    "bot_id": bid,
-                    "focus": if trimmed.is_empty() { Value::Null } else { Value::String(trimmed.to_string()) },
-                })
-            })
-            .collect();
-        if self.is_mock {
-            if let Some(issue) = self.issues_by_id.get_mut(issue_id) {
-                issue.implementer_bot_id = Some(bot_id);
-                issue.landing_mode = self.assign_landing_mode.clone();
-                issue.auto_start_review = self.assign_auto_review;
-                issue.max_rounds = self.assign_max_rounds.max(1);
-                issue.reviewers = self
-                    .assign_reviewers
-                    .iter()
-                    .enumerate()
-                    .map(|(oi, (bid, focus))| IssueReviewer {
-                        id: format!("mock-rev-slot-{oi}"),
-                        issue_id: issue_id.to_string(),
-                        bot_id: bid.clone(),
-                        focus: (!focus.trim().is_empty()).then(|| focus.trim().to_string()),
-                        order_index: oi as u64,
-                    })
-                    .collect();
-                issue.status = "implementing".to_string();
-                issue.needs_input_question = None;
+    pub fn toggle_issue_doc(&mut self, issue_id: &str) {
+        if !self.collapsed_issue_docs.remove(issue_id) {
+            self.collapsed_issue_docs.insert(issue_id.to_string());
+            if self.editing_issue_id.as_deref() == Some(issue_id) {
+                self.editing_issue_id = None;
             }
-            self.show_assign_panel = false;
-            return;
         }
-        self.send_cmd(
-            "issue.assign",
-            json!({
-                "issue_id": issue_id,
-                "implementer_bot_id": bot_id,
-                "landing_mode": self.assign_landing_mode,
-                "auto_start_review": self.assign_auto_review,
-                "max_rounds": self.assign_max_rounds.max(1),
-                "reviewers": reviewers_json,
-            }),
-        );
     }
 
-    pub fn save_issue_loop_config(&mut self, issue_id: &str) {
-        let reviewers_json: Vec<Value> = self
-            .assign_reviewers
-            .iter()
-            .map(|(bid, focus)| {
-                let trimmed = focus.trim();
-                json!({
-                    "bot_id": bid,
-                    "focus": if trimmed.is_empty() { Value::Null } else { Value::String(trimmed.to_string()) },
-                })
-            })
-            .collect();
-        if self.is_mock {
-            if let Some(issue) = self.issues_by_id.get_mut(issue_id) {
-                if let Some(bid) = &self.assign_bot_id {
-                    issue.implementer_bot_id = Some(bid.clone());
-                }
-                issue.landing_mode = self.assign_landing_mode.clone();
-                issue.auto_start_review = self.assign_auto_review;
-                issue.max_rounds = self.assign_max_rounds.max(1);
-                issue.reviewers = self
-                    .assign_reviewers
-                    .iter()
-                    .enumerate()
-                    .map(|(oi, (bid, focus))| IssueReviewer {
-                        id: format!("mock-rev-slot-{oi}"),
-                        issue_id: issue_id.to_string(),
-                        bot_id: bid.clone(),
-                        focus: (!focus.trim().is_empty()).then(|| focus.trim().to_string()),
-                        order_index: oi as u64,
-                    })
-                    .collect();
-            }
-            self.show_assign_panel = false;
-            return;
+    pub fn open_artifact_drawer(&mut self, artifact_id: &str) {
+        self.right_panel = RightPanel::Artifact(artifact_id.to_string());
+        if !self.is_mock && !self.loaded_artifacts.contains_key(artifact_id) {
+            self.send_cmd("artifact.get", json!({ "artifact_id": artifact_id }));
         }
-        self.send_cmd(
-            "issue.update",
-            json!({
-                "issue_id": issue_id,
-                "implementer_bot_id": self.assign_bot_id,
-                "landing_mode": self.assign_landing_mode,
-                "auto_start_review": self.assign_auto_review,
-                "max_rounds": self.assign_max_rounds.max(1),
-                "reviewers": reviewers_json,
-            }),
-        );
     }
 
     pub fn promote_session_to_issue(&mut self, session_id: &str) {
@@ -1520,19 +1343,21 @@ impl KawanApp {
                         conversation_id: cid,
                         title,
                         body_md: body,
-                        status: "implementing".to_string(),
+                        status: "open".to_string(),
                         owner_id: self.current_user_id.clone(),
                         implementer_bot_id: Some(sess.bot_id),
-                        auto_start_review: false,
-                        landing_mode: "manual".to_string(),
-                        max_rounds: 3,
-                        current_round: 0,
                         active_session_id: Some(session_id.to_string()),
                         parent_issue_id: None,
                         needs_input_question: None,
                         behind_main: 0,
-                        reviewers: Vec::new(),
-                        reviews: Vec::new(),
+                        commits_ahead: 1,
+                        checks_status: "none".to_string(),
+                        checks_sha: None,
+                        checks_summary: None,
+                        checks: Vec::new(),
+                        checks_artifact_id: None,
+                        touches_kawan: false,
+                        active_reviewers: Vec::new(),
                         created_at: 300,
                         updated_at: 300,
                     },
@@ -1554,39 +1379,33 @@ impl KawanApp {
         self.send_cmd("issue.sync_main", json!({ "issue_id": issue_id }));
     }
 
-    pub fn start_issue_review(&mut self, issue_id: &str) {
+    pub fn land_issue(&mut self, issue_id: &str) {
         if self.is_mock {
             if let Some(issue) = self.issues_by_id.get_mut(issue_id) {
-                issue.status = "ready_to_land".to_string();
-            }
-            return;
-        }
-        self.send_cmd("issue.start_review", json!({ "issue_id": issue_id }));
-    }
-
-    pub fn return_issue_to_collaborate(&mut self, issue_id: &str) {
-        if self.is_mock {
-            if let Some(issue) = self.issues_by_id.get_mut(issue_id) {
-                issue.status = "implementing".to_string();
+                issue.status = "landed".to_string();
+                issue.behind_main = 0;
                 issue.needs_input_question = None;
+                issue.active_reviewers.clear();
+                if let Some(sid) = &issue.active_session_id
+                    && let Some(sess) = self.sessions_by_id.get_mut(sid)
+                {
+                    sess.status = "landed".to_string();
+                }
             }
             return;
         }
-        self.send_cmd(
-            "issue.return_to_collaborate",
-            json!({ "issue_id": issue_id }),
-        );
+        self.send_cmd("issue.land", json!({ "issue_id": issue_id }));
     }
 
     pub fn stop_issue(&mut self, issue_id: &str) {
         if self.is_mock {
-            if let Some(sid) = self
-                .issues_by_id
-                .get(issue_id)
-                .and_then(|i| i.active_session_id.clone())
-                && let Some(sess) = self.sessions_by_id.get_mut(&sid)
-            {
-                sess.status = "stopped".to_string();
+            if let Some(issue) = self.issues_by_id.get_mut(issue_id) {
+                issue.active_reviewers.clear();
+                if let Some(sid) = issue.active_session_id.clone()
+                    && let Some(sess) = self.sessions_by_id.get_mut(&sid)
+                {
+                    sess.status = "stopped".to_string();
+                }
             }
             return;
         }
@@ -2337,7 +2156,8 @@ impl KawanApp {
             }
         }
         for issue in self.issues_by_id.values() {
-            if issue.status == "needs_input"
+            if issue.status == "open"
+                && issue.needs_input_question.is_some()
                 && !issue
                     .active_session_id
                     .as_deref()
@@ -2388,7 +2208,6 @@ impl KawanApp {
             self.show_new_channel = false;
             self.show_new_issue_form = false;
             self.editing_issue_id = None;
-            self.show_assign_panel = false;
             return;
         }
 
@@ -2445,7 +2264,6 @@ impl KawanApp {
                 FocusTarget::IssueBody | FocusTarget::IssueEditBody => {
                     self.focused_string_mut().push('\n');
                 }
-                FocusTarget::AssignReviewerFocus => self.add_assign_reviewer(),
                 _ => {}
             }
             return;
@@ -2510,7 +2328,6 @@ impl KawanApp {
             FocusTarget::IssueBody => &mut self.new_issue_body,
             FocusTarget::IssueEditTitle => &mut self.edit_issue_title,
             FocusTarget::IssueEditBody => &mut self.edit_issue_body,
-            FocusTarget::AssignReviewerFocus => &mut self.assign_reviewer_focus,
         }
     }
 

@@ -406,29 +406,12 @@ pub struct StatusRepoInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IssueReviewer {
-    pub id: String,
-    pub issue_id: String,
+pub struct ActiveReviewer {
+    pub session_id: String,
     pub bot_id: String,
+    pub bot_name: String,
     #[serde(default)]
     pub focus: Option<String>,
-    #[serde(default)]
-    pub order_index: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IssueReview {
-    pub id: String,
-    pub issue_id: String,
-    pub round: u64,
-    pub reviewer_slot_id: String,
-    #[serde(default)]
-    pub session_id: Option<String>,
-    pub verdict: String,
-    pub summary: String,
-    #[serde(default)]
-    pub notes_artifact_id: Option<String>,
-    pub created_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -444,14 +427,6 @@ pub struct IssueSummary {
     #[serde(default)]
     pub implementer_bot_id: Option<String>,
     #[serde(default)]
-    pub auto_start_review: bool,
-    #[serde(default)]
-    pub landing_mode: String,
-    #[serde(default)]
-    pub max_rounds: u64,
-    #[serde(default)]
-    pub current_round: u64,
-    #[serde(default)]
     pub active_session_id: Option<String>,
     #[serde(default)]
     pub parent_issue_id: Option<String>,
@@ -460,11 +435,27 @@ pub struct IssueSummary {
     #[serde(default)]
     pub behind_main: u64,
     #[serde(default)]
-    pub reviewers: Vec<IssueReviewer>,
+    pub commits_ahead: u64,
+    #[serde(default = "default_checks_status")]
+    pub checks_status: String,
     #[serde(default)]
-    pub reviews: Vec<IssueReview>,
+    pub checks_sha: Option<String>,
+    #[serde(default)]
+    pub checks_summary: Option<String>,
+    #[serde(default)]
+    pub checks: Vec<CheckRunItem>,
+    #[serde(default)]
+    pub checks_artifact_id: Option<String>,
+    #[serde(default)]
+    pub touches_kawan: bool,
+    #[serde(default)]
+    pub active_reviewers: Vec<ActiveReviewer>,
     pub created_at: u64,
     pub updated_at: u64,
+}
+
+fn default_checks_status() -> String {
+    "none".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -478,9 +469,9 @@ pub struct IssueActionData {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IssueAssignData {
+pub struct IssueLandData {
     pub issue: IssueSummary,
-    pub session: SessionSummary,
+    pub land: Land,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -497,16 +488,6 @@ pub struct IssueSyncData {
     #[serde(default)]
     pub error: Option<String>,
     pub issue: IssueSummary,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IssueStartReviewData {
-    pub issue: IssueSummary,
-    pub ok: bool,
-    #[serde(default)]
-    pub checks: Vec<CheckRunItem>,
-    #[serde(default)]
-    pub land: Option<Land>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
