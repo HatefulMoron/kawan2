@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+DIR="/tmp/kawan-dev"
+DIR_EXPLICIT=0
+FRESH=1
+FRESH_EXPLICIT=0
+REPO_ARG=""
+VERIFY_CMD="true"
+PORT=0
+NO_BUILD=0
+NO_CLIENT=0
+READY_FILE=""
+READY_IS_TEMP=0
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/dev-up [options]
+
+Starts a pre-configured Kawan host + empty git repo and opens the desktop client
+straight into #general with @kawan ready.
+
+Options:
+  --resume            Keep existing /tmp/kawan-dev state instead of wiping
+  --dir <path>        Use custom workspace dir (implies persistent unless --fresh)
+  --fresh             Wipe workspace dir before starting
+  --repo <path>       Attach an existing git repository instead of creating a new empty one
+  --verify <cmd>      Verification command for landing changes (default: "true")
+  --port <N>          Host WebSocket port (default: 0, auto-pick)
+  --no-build          Skip cargo build if target/debug/kawan already exists
+  --no-client         Start pre-seeded host only and wait until Ctrl+C
+  --ready-file <path> Write startup metadata JSON to <path> once ready
+  -h, --help          Show this help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --resume)
+      FRESH=0
+      FRESH_EXPLICIT=1
+      shift
+      ;;
+    --dir)
+      DIR="${2:?--dir requires a path}"
+      DIR_EXPLICIT=1
+      if [[ $FRESH_EXPLICIT -eq 0 ]]; then
+        FRESH=0
+      fi
+      shift 2
+      ;;
+    --fresh)
+      FRESH=1
+      FRESH_EXPLICIT=1
+      shift
+      ;;
+    --repo)
+      REPO_ARG="${2:?--repo requires a path}"
+      shift 2
+      ;;
+    --verify)
+      VERIFY_CMD="${2:?--verify requires a command}"
+      shift 2
+      ;;
+    --port)
+      PORT="${2:?--port requires a number}"
+      shift 2
+      ;;
+    --no-build)
+      NO_BUILD=1
+      shift
+      ;;
+    --no-client)
+      NO_CLIENT=1
+      shift
+      ;;
+    --ready-file)
+      READY_FILE="${2:?--ready-file requires a path}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [[ $NO_CLIENT -eq 0 ]]; then
+  if [[ -f "$HOME/.cargo/env" ]]; then
+    # shellcheck disable=SC1091
+    source "$HOME/.cargo/env"
+  fi
+  if [[ $NO_BUILD -eq 0 || ! -x "$ROOT_DIR/target/debug/kawan" ]]; then
+    (cd "$ROOT_DIR" && cargo build)
+  fi
+fi
+
+if [[ -z "$READY_FILE" ]]; then
+  READY_FILE="$(mktemp /tmp/kawan-dev-ready.XXXXXX.json)"
+  READY_IS_TEMP=1
+  rm -f "$READY_FILE"
+fi
+
+HOST_ARGS=(
+  --dir "$DIR"
+  --verify "$VERIFY_CMD"
+  --port "$PORT"
+  --ready-file "$READY_FILE"
+)
+if [[ $FRESH -eq 1 || ( $DIR_EXPLICIT -eq 0 && $FRESH_EXPLICIT -eq 0 ) ]]; then
+  HOST_ARGS+=(--fresh)
+fi
+if [[ -n "$REPO_ARG" ]]; then
+  HOST_ARGS+=(--repo "$REPO_ARG")
+fi
+
+HOST_PID=""
+cleanup() {
+  local rc=$?
+  if [[ -n "$HOST_PID" ]] && kill -0 "$HOST_PID" 2>/dev/null; then
+    kill "$HOST_PID" 2>/dev/null || true
+    for _ in {1..30}; do
+      if ! kill -0 "$HOST_PID" 2>/dev/null; then
+        break
+      fi
+      sleep 0.1
+    done
+    if kill -0 "$HOST_PID" 2>/dev/null; then
+      kill -9 "$HOST_PID" 2>/dev/null || true
+    fi
+    wait "$HOST_PID" 2>/dev/null || true
+  fi
+  if [[ $READY_IS_TEMP -eq 1 ]]; then
+    rm -f "$READY_FILE"
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT INT TERM
+
+(
+  cd "$ROOT_DIR/host"
+  exec npx tsx src/dev-host.ts "${HOST_ARGS[@]}"
+) &
+HOST_PID=$!
+
+for _ in {1..250}; do
+  if [[ -s "$READY_FILE" ]]; then
+    break
+  fi
+  if ! kill -0 "$HOST_PID" 2>/dev/null; then
+    wait "$HOST_PID" || true
+    echo "kawan dev-host exited before becoming ready" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+if [[ ! -s "$READY_FILE" ]]; then
+  echo "Timed out waiting for kawan dev-host to become ready" >&2
+  exit 1
+fi
+
+HOST_URL="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).url)' "$READY_FILE")"
+SSH_KEY_PATH="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).key_path)' "$READY_FILE")"
+USER_NAME="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).user_name)' "$READY_FILE")"
+
+if [[ $NO_CLIENT -eq 1 ]]; then
+  wait "$HOST_PID"
+  exit $?
+fi
+
+unset KAWAN_MOCK KAWAN_BOOTSTRAP_TOKEN || true
+export KAWAN_HOST_URL="$HOST_URL"
+export KAWAN_SSH_KEY="$SSH_KEY_PATH"
+export KAWAN_AUTH_MODE="login"
+export KAWAN_USER_NAME="$USER_NAME"
+export KAWAN_AUTOCONNECT=1
+
+"$ROOT_DIR/target/debug/kawan"

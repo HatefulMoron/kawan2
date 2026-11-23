@@ -174,6 +174,20 @@ impl KawanApp {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "ws://127.0.0.1:8787".to_string());
         let default_key = default_ssh_key_path();
+        let default_auth_mode = match std::env::var("KAWAN_AUTH_MODE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "login" => AuthMode::Login,
+            "register" | "invite" => AuthMode::Register,
+            _ => AuthMode::Bootstrap,
+        };
+        let default_name = std::env::var("KAWAN_USER_NAME")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "alice".to_string());
 
         let mut app = Self {
             focus_handle: cx.focus_handle(),
@@ -181,10 +195,10 @@ impl KawanApp {
             screen: Screen::Connect,
             is_mock,
 
-            auth_mode: AuthMode::Bootstrap,
+            auth_mode: default_auth_mode,
             connect_host: default_host,
             connect_token: std::env::var("KAWAN_BOOTSTRAP_TOKEN").unwrap_or_default(),
-            connect_name: "alice".to_string(),
+            connect_name: default_name,
             connect_key_path: default_key,
             connecting: false,
             connect_error: None,
@@ -252,6 +266,8 @@ impl KawanApp {
 
         if is_mock {
             mock::populate_mock(&mut app);
+        } else if std::env::var("KAWAN_AUTOCONNECT").as_deref() == Ok("1") {
+            app.start_connect(cx);
         }
 
         app
