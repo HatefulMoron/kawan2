@@ -14,17 +14,21 @@ import {
   type DecisionMode,
 } from "./decisions.js";
 import { attachRepository, ensureHostSshKey, generateBotKeypair, getBranchHead } from "./git.js";
+import { MergeQueueManager } from "./merge-queue.js";
 import { serializeSession, SessionManager, type SoulHandlers } from "./sessions.js";
 import { createSoulHandlers, INITIAL_SOUL_DOCUMENT } from "./soul.js";
 import type {
   ConversationRow,
   DecisionRow,
   HostSettings,
+  LandingMode,
+  MergeConflictPolicy,
   MessageRow,
   ModelDefinition,
   ProviderSettings,
   UserRow,
 } from "./types.js";
+import { serializeLand } from "./types.js";
 import { computeSetupStatus, KawanWsServer, type CommandHandler } from "./ws.js";
 
 export interface DispatchEvent {
@@ -34,6 +38,7 @@ export interface DispatchEvent {
   threadId: string | null;
   messages: MessageRow[];
   redirectedFrom?: string;
+  spawnIntent?: { explicitWorkStart: "yes" | "no"; workRequest: "yes" | "no" };
 }
 
 export interface StartHostOptions {
@@ -120,6 +125,7 @@ function maskSettings(settings: HostSettings, hostPubkey: string, db: KawanDb, i
         }
       : null,
     verify_command: settings.verify_command ?? null,
+    merge_queue: settings.merge_queue ?? null,
     providers,
     roles: {
       default: settings.roles.default ?? null,
@@ -266,6 +272,7 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
 
   let wsServer!: KawanWsServer;
   let sessionManager!: SessionManager;
+  let mergeQueue!: MergeQueueManager;
 
   const dispatchEvent = async (ev: DispatchEvent): Promise<void> => {
     if (opts.onDispatch) {
@@ -313,13 +320,18 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
       wsServer.broadcastToConversation(conv, { type: "decision.new", decision });
     }
     if (destination !== "none") {
-      const lastMsg = stillHeld[stillHeld.length - 1].message;
+      const lastDec = stillHeld[stillHeld.length - 1];
+      const lastMsg = lastDec.message;
       await dispatchEvent({
         bot,
         destination,
         conversation: conv,
         threadId: lastMsg.thread_id,
         messages: stillHeld.map((h) => h.message),
+        spawnIntent: {
+          explicitWorkStart: lastDec.explicit_work_start === "yes" ? "yes" : "no",
+          workRequest: lastDec.work_request === "yes" ? "yes" : "no",
+        },
       });
     }
   };
@@ -379,6 +391,22 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
         settings.verify_command = req.verify_command;
       }
 
+      if (req.merge_queue && typeof req.merge_queue === "object") {
+        const mq = req.merge_queue as {
+          bot_id?: string | null;
+          default_landing_mode?: LandingMode;
+          conflict_policy?: MergeConflictPolicy;
+        };
+        const prevMq = settings.merge_queue ?? {};
+        settings.merge_queue = {
+          bot_id: mq.bot_id !== undefined ? mq.bot_id : prevMq.bot_id ?? null,
+          default_landing_mode:
+            mq.default_landing_mode ?? prevMq.default_landing_mode ?? "manual",
+          conflict_policy: mq.conflict_policy ?? prevMq.conflict_policy ?? "pause_on_issue",
+          paused: Boolean(prevMq.paused),
+        };
+      }
+
       if (req.providers && typeof req.providers === "object") {
         const incomingProviders = req.providers as Record<string, ProviderSettings>;
         for (const [name, p] of Object.entries(incomingProviders)) {
@@ -427,6 +455,10 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
 
       db.saveHostSettings(settings);
       materializeHostModelsJson(opts.dataDir, settings);
+      if (req.merge_queue && mergeQueue) {
+        mergeQueue.ensureConversation();
+        mergeQueue.broadcastSnapshot();
+      }
       return maskSettings(settings, hostKey.pubkey, db, true);
     },
 
@@ -540,6 +572,18 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
       });
 
       const botPayload = serializeBot(db, bot);
+      if (!settings.merge_queue?.bot_id) {
+        const latestSettings = db.getHostSettings();
+        latestSettings.merge_queue = {
+          ...(latestSettings.merge_queue ?? {}),
+          bot_id: bot.id,
+        };
+        db.saveHostSettings(latestSettings);
+      }
+      if (mergeQueue) {
+        mergeQueue.ensureConversation();
+        mergeQueue.broadcastSnapshot();
+      }
       wsServer.broadcast({ type: "bot.update", bot: botPayload });
       return { bot: botPayload, session: serializeSession(session) };
     },
@@ -640,11 +684,79 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
       if (!landId && !sessionId) {
         throw new Error("land_id or session_id is required");
       }
-      return await sessionManager.approveLand({
+      return await mergeQueue.enqueueLand({
         landId,
         sessionId,
         approvedBy: client.user.id,
+        trigger: "manual_approve",
+        waitForSettlement: req.async !== true,
       });
+    },
+
+    "session.confirm": async (req) => {
+      const sessionId = String(req.session_id ?? "").trim();
+      if (!sessionId) throw new Error("session_id is required");
+      return await sessionManager.confirmPendingSession(sessionId);
+    },
+
+    "session.dismiss": async (req) => {
+      const sessionId = String(req.session_id ?? "").trim();
+      if (!sessionId) throw new Error("session_id is required");
+      return await sessionManager.dismissPendingSession(sessionId);
+    },
+
+    "session.stop": async (req) => {
+      const sessionId = String(req.session_id ?? "").trim();
+      if (!sessionId) throw new Error("session_id is required");
+      return await sessionManager.stopWorkerSession(sessionId);
+    },
+
+    "merge_queue.read": () => {
+      return { queue: mergeQueue.getSnapshot() };
+    },
+
+    "merge_queue.configure": (req, client) => {
+      if (client.user.role !== "admin") {
+        throw new Error("Only admins can configure the merge queue");
+      }
+      const queue = mergeQueue.configure({
+        bot_id: req.bot_id === undefined ? undefined : (req.bot_id as string | null),
+        default_landing_mode:
+          req.default_landing_mode === "auto" || req.default_landing_mode === "manual"
+            ? req.default_landing_mode
+            : undefined,
+        conflict_policy:
+          req.conflict_policy === "pause_on_issue" || req.conflict_policy === "auto_resolve_trivial"
+            ? req.conflict_policy
+            : undefined,
+      });
+      return { queue };
+    },
+
+    "merge_queue.pause": () => {
+      return { queue: mergeQueue.pauseQueue() };
+    },
+
+    "merge_queue.resume": () => {
+      return { queue: mergeQueue.resumeQueue() };
+    },
+
+    "merge_queue.retry": async (req) => {
+      const landId = typeof req.land_id === "string" ? req.land_id : undefined;
+      return { queue: await mergeQueue.retryLand(landId) };
+    },
+
+    "merge_queue.eject": async (req) => {
+      const landId = String(req.land_id ?? "").trim();
+      if (!landId) throw new Error("land_id is required");
+      const reason = typeof req.reason === "string" && req.reason.trim() ? req.reason.trim() : "Sent back to implementer";
+      return { queue: await mergeQueue.ejectLand(landId, reason) };
+    },
+
+    "merge_queue.remove": async (req) => {
+      const landId = String(req.land_id ?? "").trim();
+      if (!landId) throw new Error("land_id is required");
+      return { queue: await mergeQueue.removeFromQueue(landId) };
     },
 
     "decision.redirect": async (req, client) => {
@@ -714,7 +826,7 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
             }
           : null,
         sessions: db.listSessions({ kind: "worker" }).map(serializeSession),
-        lands: db.listLands(),
+        lands: db.listLands().map(serializeLand),
         artifacts: db.listArtifacts(),
       };
     },
@@ -735,6 +847,9 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
     extraHandlers,
     onMessageCreated: async ({ conversation, message, author }) => {
       if (author.kind !== "human") return;
+      if (conversation.kind === "merge_queue" && mergeQueue.tryRouteIncidentMessage(conversation, message, author)) {
+        return;
+      }
       const members = db.listMembers(conversation.id);
       const bots = members.filter((m) => m.kind === "bot");
       if (bots.length === 0) return;
@@ -831,6 +946,8 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
             heldBatchId,
             dispatched: !isHeld,
             holdExpiresAt,
+            explicitWorkStart: result.explicitWorkStart,
+            workRequest: result.workRequest,
           });
         });
 
@@ -858,6 +975,10 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
             conversation,
             threadId: message.thread_id,
             messages: batchMessages,
+            spawnIntent: {
+              explicitWorkStart: result.explicitWorkStart,
+              workRequest: result.workRequest,
+            },
           });
         }
       }
@@ -872,6 +993,15 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
     soulHandlers: opts.soulHandlers ?? createSoulHandlers(db),
   });
   await sessionManager.start();
+  mergeQueue = new MergeQueueManager({
+    dataDir: opts.dataDir,
+    db,
+    wsServer,
+    sessionManager,
+    disableSandbox: opts.disableSandbox,
+  });
+  mergeQueue.ensureConversation();
+  void mergeQueue.kickLoop();
 
   if (holdTimeoutMs > 0) {
     const grouped = new Map<string, { conversationId: string; botId: string; expiresAt: number }>();
@@ -912,6 +1042,7 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
         clearTimeout(timer);
       }
       holdTimers.clear();
+      await mergeQueue.close();
       await sessionManager.stopAll();
       await new Promise<void>((resolve) => {
         for (const client of wss.clients) {

@@ -18,7 +18,7 @@ use crate::views::{short_id, status_color_hex};
 
 const EDITORIAL_MEASURE: f32 = 780.0;
 
-fn truncate_chars(text: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
     let count = text.chars().count();
     if count <= max_chars {
         return text.to_string();
@@ -48,7 +48,11 @@ pub(crate) fn session_display_title(sess: &SessionSummary) -> String {
 pub(crate) fn short_status_label(status: &str) -> &'static str {
     match status {
         "running" => "running",
+        "pending_approval" => "proposed",
+        "queued" => "queued",
+        "rebasing" => "rebasing",
         "verifying" => "verifying",
+        "paused" => "paused",
         "review_requested" | "requested" => "review",
         "landed" => "landed",
         "failed" => "failed",
@@ -88,6 +92,7 @@ pub fn left_rail(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
         .filter(|c| c.kind == "dm")
         .collect();
     let status_active = matches!(app.screen, Screen::Workspace(WorkspacePage::Status));
+    let mq_active = matches!(app.screen, Screen::Workspace(WorkspacePage::MergeQueue));
     let conv_page_active = matches!(app.screen, Screen::Workspace(WorkspacePage::Conversation));
     let settings_active = matches!(app.screen, Screen::Workspace(WorkspacePage::Settings(_)));
 
@@ -153,6 +158,90 @@ pub fn left_rail(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
             cx.notify();
         }));
 
+    let mq_unread = if mq_active {
+        0
+    } else {
+        app.merge_queue_conversation().map_or(0, |c| c.unread_count)
+    };
+    let (mq_paused, mq_queued_count) = match &app.merge_queue {
+        Some(q) => (q.settings.paused || q.paused_land.is_some(), q.queued.len()),
+        None => {
+            let queued_lands: Vec<&Land> = app
+                .lands_by_id
+                .values()
+                .filter(|l| {
+                    matches!(
+                        l.status.as_str(),
+                        "queued" | "rebasing" | "verifying" | "paused"
+                    )
+                })
+                .collect();
+            (
+                queued_lands.iter().any(|l| l.status == "paused"),
+                queued_lands.len(),
+            )
+        }
+    };
+    let (mq_badge_label, mq_badge_color) = if mq_paused {
+        ("paused".to_string(), theme::hex(theme::CATEGORY_VALS))
+    } else if mq_queued_count > 0 {
+        (
+            format!("{mq_queued_count} queued"),
+            theme::hex(theme::CATEGORY_ACADEMIC),
+        )
+    } else {
+        (String::new(), theme.fg_tertiary)
+    };
+
+    let mut merge_queue_row = div()
+        .id("rail-merge-queue")
+        .h(px(30.0))
+        .px(px(8.0))
+        .rounded(px(2.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(8.0))
+        .cursor_pointer();
+    merge_queue_row = if mq_active {
+        merge_queue_row
+            .relative()
+            .overflow_hidden()
+            .bg(theme::with_alpha(theme.palette.vivid, 0.09))
+            .child(kit::left_edge(theme.dark))
+    } else {
+        merge_queue_row.hover(|s| s.bg(theme.hover))
+    };
+    let merge_queue_row = merge_queue_row
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(kit::icon("kawan/merge.svg", 13.0, theme.dark))
+                .child(theme::label("Merge Queue", 13.0, theme.ink)),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .children((mq_unread > 0).then(|| kit::swatch(theme.vivid, px(5.0))))
+                .children((!mq_badge_label.is_empty()).then(|| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .child(kit::swatch(mq_badge_color, px(5.0)))
+                        .child(theme::micro(mq_badge_label, 8.0, theme.fg_tertiary))
+                })),
+        )
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.open_merge_queue();
+            window.focus(&this.focus_handle, cx);
+            cx.notify();
+        }));
+
     let nav_section = div()
         .flex()
         .flex_col()
@@ -162,7 +251,8 @@ pub fn left_rail(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
             9.0,
             theme.fg_tertiary,
         )))
-        .child(status_row);
+        .child(status_row)
+        .child(merge_queue_row);
 
     let mut ch_section = div().flex().flex_col().gap(px(3.0)).child(
         div()
@@ -314,6 +404,10 @@ pub fn left_rail(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
             };
             let workers = app.worker_sessions_for_bot(&bot.id);
             let workers_running = workers.iter().filter(|s| s.status == "running").count();
+            let workers_pending = workers
+                .iter()
+                .filter(|s| s.status == "pending_approval")
+                .count();
             let workers_review = workers
                 .iter()
                 .filter(|s| s.status == "review_requested")
@@ -335,6 +429,11 @@ pub fn left_rail(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> D
                 )
             } else if orch_running {
                 ("thinking".to_string(), theme::hex(theme::CATEGORY_INDUSTRY))
+            } else if workers_pending > 0 {
+                (
+                    format!("{workers_pending} proposed"),
+                    theme::hex(theme::CATEGORY_ACADEMIC),
+                )
             } else if workers_review > 0 {
                 (
                     format!("{workers_review} review"),
@@ -706,12 +805,80 @@ fn main_stream_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -
                 })),
         );
 
+    let (stream, composer) = conversation_stream_and_composer(
+        app,
+        &active_cid,
+        &title,
+        is_channel,
+        "No messages yet. Mention a bot with @name to start work.",
+        theme,
+        cx,
+    );
+
+    let tasks_panel = dm_bot.map(|bot| bot_tasks_panel(app, bot, theme, cx));
+
+    div()
+        .flex_1()
+        .min_h(px(0.0))
+        .w_full()
+        .flex()
+        .flex_col()
+        .child(header)
+        .children(tasks_panel)
+        .child(stream)
+        .child(composer)
+}
+
+pub(crate) fn conversation_stream_and_composer(
+    app: &KawanApp,
+    active_cid: &str,
+    title: &str,
+    is_channel: bool,
+    empty_hint: &str,
+    theme: &Theme,
+    cx: &mut Context<KawanApp>,
+) -> (gpui::Stateful<Div>, Div) {
+    let messages = app
+        .messages_by_conv
+        .get(active_cid)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let all_ids: HashSet<&str> = messages.iter().map(|m| m.id.as_str()).collect();
+    let mut replies_by_parent: HashMap<&str, Vec<&Message>> = HashMap::new();
+    let mut top_level_messages: Vec<&Message> = Vec::new();
+    for m in messages {
+        if let Some(tid) = m.thread_id.as_deref()
+            && all_ids.contains(tid)
+        {
+            replies_by_parent.entry(tid).or_default().push(m);
+        } else {
+            top_level_messages.push(m);
+        }
+    }
+
+    let rendered_parent_ids: HashSet<&str> =
+        top_level_messages.iter().map(|m| m.id.as_str()).collect();
+    let mut standalone_pending: Vec<&SessionSummary> = app
+        .sessions_by_id
+        .values()
+        .filter(|s| {
+            s.kind == "worker"
+                && s.status == "pending_approval"
+                && s.conversation_id.as_deref() == Some(active_cid)
+                && s.thread_id
+                    .as_deref()
+                    .is_none_or(|tid| !rendered_parent_ids.contains(tid))
+        })
+        .collect();
+    standalone_pending.sort_by_key(|s| s.created_at);
+
     let conv_errors = app
         .conv_errors
-        .get(&active_cid)
+        .get(active_cid)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
 
+    let empty_text = empty_hint.to_string();
     let stream = div()
         .id("conv-message-scroll")
         .flex_1()
@@ -745,31 +912,32 @@ fn main_stream_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -
                                 theme::hex(theme::CATEGORY_VALS),
                             ))
                     }))
-                    .children(if top_level_messages.is_empty() {
-                        vec![
-                            div()
-                                .py(px(24.0))
-                                .child(theme::body(
-                                    "No messages yet. Mention a bot with @name to start work.",
-                                    13.0,
-                                    theme.fg_tertiary,
-                                ))
-                                .into_any_element(),
-                        ]
-                    } else {
-                        top_level_messages
-                            .iter()
-                            .enumerate()
-                            .map(|(mi, msg)| {
-                                let replies = replies_by_parent
-                                    .get(msg.id.as_str())
-                                    .map(Vec::as_slice)
-                                    .unwrap_or(&[]);
-                                message_row(app, msg, replies, is_channel, mi, theme, cx)
-                                    .into_any_element()
-                            })
-                            .collect()
-                    }),
+                    .children(
+                        if top_level_messages.is_empty() && standalone_pending.is_empty() {
+                            vec![
+                                div()
+                                    .py(px(24.0))
+                                    .child(theme::body(empty_text, 13.0, theme.fg_tertiary))
+                                    .into_any_element(),
+                            ]
+                        } else {
+                            top_level_messages
+                                .iter()
+                                .enumerate()
+                                .map(|(mi, msg)| {
+                                    let replies = replies_by_parent
+                                        .get(msg.id.as_str())
+                                        .map(Vec::as_slice)
+                                        .unwrap_or(&[]);
+                                    message_row(app, msg, replies, is_channel, mi, theme, cx)
+                                        .into_any_element()
+                                })
+                                .collect()
+                        },
+                    )
+                    .children(standalone_pending.into_iter().enumerate().map(|(pi, ps)| {
+                        pending_session_card(app, ps, "stream-pend", pi, theme, cx)
+                    })),
             ),
         );
 
@@ -859,18 +1027,106 @@ fn main_stream_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -
                 ),
         );
 
-    let tasks_panel = dm_bot.map(|bot| bot_tasks_panel(app, bot, theme, cx));
+    (stream, composer)
+}
+
+pub(crate) fn pending_session_card(
+    app: &KawanApp,
+    sess: &SessionSummary,
+    id_prefix: &'static str,
+    idx: usize,
+    theme: &Theme,
+    cx: &mut Context<KawanApp>,
+) -> Div {
+    let title = session_display_title(sess);
+    let task_body = sess
+        .task
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| truncate_chars(s, 200))
+        .unwrap_or_else(|| "Confirm to clone repository and start worker session.".to_string());
+    let bot_name = format!("@{}", app.actor_name(&sess.bot_id));
+    let sid_start = sess.id.clone();
+    let sid_dismiss = sess.id.clone();
 
     div()
-        .flex_1()
-        .min_h(px(0.0))
+        .mt(px(4.0))
         .w_full()
-        .flex()
-        .flex_col()
-        .child(header)
-        .children(tasks_panel)
-        .child(stream)
-        .child(composer)
+        .relative()
+        .overflow_hidden()
+        .rounded(px(2.0))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.surface)
+        .child(kit::left_edge(theme::hex(theme::CATEGORY_ACADEMIC)))
+        .child(
+            div()
+                .min_h(px(32.0))
+                .px(px(14.0))
+                .py(px(5.0))
+                .bg(theme.strip)
+                .border_b_1()
+                .border_color(theme.border_subtle)
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(theme::micro("TASK PROPOSAL", 8.5, theme.fg_tertiary))
+                        .child(theme::label(title, 12.5, theme.ink)),
+                )
+                .child(kit::status_tag(
+                    "AWAITING CONFIRMATION",
+                    theme::CATEGORY_ACADEMIC,
+                    theme,
+                )),
+        )
+        .child(div().px(px(14.0)).py(px(9.0)).child(theme::body(
+            task_body,
+            12.5,
+            theme.fg_secondary,
+        )))
+        .child(
+            div()
+                .min_h(px(34.0))
+                .px(px(14.0))
+                .py(px(5.0))
+                .bg(theme.strip)
+                .border_t_1()
+                .border_color(theme.border_subtle)
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .child(theme::micro(bot_name, 8.5, theme.fg_tertiary))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            kit::ghost_button((id_prefix, idx * 2 + 1), "Dismiss", theme).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.dismiss_session(&sid_dismiss);
+                                    cx.notify();
+                                }),
+                            ),
+                        )
+                        .child(
+                            kit::small_primary_button((id_prefix, idx * 2), "Start", theme)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.confirm_session(&sid_start);
+                                    cx.notify();
+                                })),
+                        ),
+                ),
+        )
 }
 
 fn bot_tasks_panel(
@@ -882,7 +1138,12 @@ fn bot_tasks_panel(
     let workers = app.worker_sessions_for_bot(&bot.id);
     let active_count = workers
         .iter()
-        .filter(|s| matches!(s.status.as_str(), "running" | "review_requested" | "failed"))
+        .filter(|s| {
+            matches!(
+                s.status.as_str(),
+                "running" | "pending_approval" | "review_requested" | "failed"
+            )
+        })
         .count();
 
     let rows: Vec<AnyElement> = if workers.is_empty() {
@@ -904,6 +1165,9 @@ fn bot_tasks_panel(
             .enumerate()
             .map(|(ti, sess)| {
                 let sid = sess.id.clone();
+                let sid_confirm = sess.id.clone();
+                let sid_dismiss = sess.id.clone();
+                let sid_stop = sess.id.clone();
                 let title = session_display_title(sess);
                 let origin = sess
                     .conversation_id
@@ -914,6 +1178,8 @@ fn bot_tasks_panel(
                     .land_for_session(&sess.id)
                     .filter(|l| l.status == "requested" || l.status == "failed");
                 let status_color = status_color_hex(&sess.status);
+                let is_pending = sess.status == "pending_approval";
+                let is_running = sess.status == "running";
 
                 div()
                     .px(px(14.0))
@@ -962,6 +1228,28 @@ fn bot_tasks_panel(
                                         cx.notify();
                                     })),
                             )
+                            .children(is_running.then(|| {
+                                kit::ghost_button(("dm-task-stop", ti), "Stop", theme).on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.stop_session(&sid_stop);
+                                        cx.notify();
+                                    }),
+                                )
+                            }))
+                            .children(is_pending.then(|| {
+                                kit::ghost_button(("dm-task-dismiss", ti), "Dismiss", theme)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.dismiss_session(&sid_dismiss);
+                                        cx.notify();
+                                    }))
+                            }))
+                            .children(is_pending.then(|| {
+                                kit::small_primary_button(("dm-task-start", ti), "Start", theme)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.confirm_session(&sid_confirm);
+                                        cx.notify();
+                                    }))
+                            }))
                             .children(land.map(|l| {
                                 let lid = l.id.clone();
                                 kit::small_primary_button(
@@ -1100,6 +1388,17 @@ fn message_row(
         content_col = content_col.child(decision_chip_row(app, dec, mi * 10 + di, theme, cx));
     }
 
+    let mut pending_for_msg: Vec<&SessionSummary> = app
+        .sessions_by_id
+        .values()
+        .filter(|s| {
+            s.kind == "worker"
+                && s.status == "pending_approval"
+                && s.thread_id.as_deref() == Some(msg.id.as_str())
+        })
+        .collect();
+    pending_for_msg.sort_by_key(|s| s.created_at);
+
     if !replies.is_empty() {
         content_col = content_col.child(thread_tray(app, &msg.id, replies, mi, theme, cx));
     } else if is_channel && msg.thread_id.is_none() {
@@ -1126,6 +1425,17 @@ fn message_row(
                     })),
             ),
         );
+    }
+
+    for (pi, ps) in pending_for_msg.into_iter().enumerate() {
+        content_col = content_col.child(pending_session_card(
+            app,
+            ps,
+            "msg-pend",
+            mi * 10 + pi,
+            theme,
+            cx,
+        ));
     }
 
     div()
@@ -1171,8 +1481,14 @@ fn thread_tray(
     };
 
     let has_report = replies.iter().any(|r| r.artifact_id.is_some());
-    let thread_running = app.sessions_by_id.values().any(|s| {
+    let thread_running_sess = app.sessions_by_id.values().find(|s| {
         s.kind == "worker" && s.thread_id.as_deref() == Some(parent_msg_id) && s.status == "running"
+    });
+    let thread_running = thread_running_sess.is_some();
+    let thread_pending = app.sessions_by_id.values().any(|s| {
+        s.kind == "worker"
+            && s.thread_id.as_deref() == Some(parent_msg_id)
+            && s.status == "pending_approval"
     });
     let mut matching_lands: Vec<&Land> = app
         .lands_by_id
@@ -1189,10 +1505,15 @@ fn thread_tray(
 
     let status_badge: Option<(&'static str, u32)> = if thread_running {
         Some(("WORKING", theme::CATEGORY_INDUSTRY))
+    } else if thread_pending {
+        Some(("PROPOSED", theme::CATEGORY_ACADEMIC))
     } else if let Some(land) = thread_land {
         match land.status.as_str() {
             "requested" => Some(("REVIEW", theme::UMBER_VIVID)),
+            "queued" => Some(("QUEUED", theme::CATEGORY_ACADEMIC)),
+            "rebasing" => Some(("REBASING", theme::CATEGORY_INDUSTRY)),
             "verifying" => Some(("VERIFYING", theme::CATEGORY_INDUSTRY)),
+            "paused" => Some(("PAUSED", theme::CATEGORY_VALS)),
             "failed" => Some(("BLOCKED", theme::CATEGORY_VALS)),
             "landed" => Some(("LANDED", status_color_hex("landed"))),
             _ => None,
@@ -1298,18 +1619,39 @@ fn thread_tray(
         .child(kit::left_edge(accent_color))
         .child(left_btn);
 
-    if let Some(land) = thread_land
-        && (land.status == "requested" || land.status == "failed")
-    {
-        let lid = land.id.clone();
+    if let Some(run_sess) = thread_running_sess {
+        let stop_sid = run_sess.id.clone();
         tray = tray.child(
-            kit::small_primary_button(("tray-land-approve", mi), "Approve Land", theme).on_click(
-                cx.listener(move |this, _, _, cx| {
-                    this.approve_land(&lid);
+            kit::ghost_button(("tray-sess-stop", mi), "Stop", theme).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.stop_session(&stop_sid);
                     cx.notify();
-                }),
-            ),
+                },
+            )),
         );
+    }
+
+    if let Some(land) = thread_land {
+        if land.status == "requested" || land.status == "failed" {
+            let lid = land.id.clone();
+            tray = tray.child(
+                kit::small_primary_button(("tray-land-approve", mi), "Approve Land", theme)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.approve_land(&lid);
+                        cx.notify();
+                    })),
+            );
+        } else if land.status == "paused" {
+            tray = tray.child(
+                kit::ghost_button(("tray-mq-open", mi), "Merge Queue", theme).on_click(
+                    cx.listener(|this, _, window, cx| {
+                        this.open_merge_queue();
+                        window.focus(&this.focus_handle, cx);
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
     }
 
     tray
@@ -1622,7 +1964,10 @@ fn artifact_card(
                             short_status_label(status).to_uppercase(),
                             status_color,
                             theme,
-                        )),
+                        ))
+                        .children(land.filter(|l| l.touches_kawan).map(|_| {
+                            kit::status_tag("MODIFIES .kawan/", theme::UMBER_VIVID, theme)
+                        })),
                 )
                 .child(theme::numeric(
                     format!(
@@ -1735,6 +2080,14 @@ fn artifact_card(
                             cx.notify();
                         }))
                         .into_any_element()
+                } else if l.status == "paused" {
+                    kit::ghost_button(("art-mq-open", mi), "Merge Queue", theme)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_merge_queue();
+                            window.focus(&this.focus_handle, cx);
+                            cx.notify();
+                        }))
+                        .into_any_element()
                 } else {
                     kit::status_tag(l.status.to_uppercase(), status_color_hex(&l.status), theme)
                         .into_any_element()
@@ -1788,7 +2141,10 @@ fn land_card(
                             land.status.to_uppercase(),
                             status_color,
                             theme,
-                        )),
+                        ))
+                        .children(land.touches_kawan.then(|| {
+                            kit::status_tag("MODIFIES .kawan/", theme::UMBER_VIVID, theme)
+                        })),
                 )
                 .children(land.landed_sha.as_ref().map(|sha| {
                     theme::numeric(
@@ -1833,6 +2189,14 @@ fn land_card(
                         cx.notify();
                     }))
                     .into_any_element()
+            } else if land.status == "paused" {
+                kit::ghost_button(("land-mq-open", mi), "Merge Queue", theme)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_merge_queue();
+                        window.focus(&this.focus_handle, cx);
+                        cx.notify();
+                    }))
+                    .into_any_element()
             } else {
                 kit::status_tag(land.status.to_uppercase(), status_color, theme).into_any_element()
             }),
@@ -1841,6 +2205,31 @@ fn land_card(
 
 pub(crate) fn session_strip(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> Div {
     let workers = app.all_worker_sessions();
+    let (mq_pill_color, mq_pill_label) = match &app.merge_queue {
+        Some(q) if q.settings.paused || q.paused_land.is_some() => {
+            (theme::CATEGORY_VALS, "MQ · paused".to_string())
+        }
+        Some(q) if !q.queued.is_empty() => {
+            let head_st = q
+                .head
+                .as_ref()
+                .map(|h| h.status.as_str())
+                .unwrap_or("queued");
+            let col = if matches!(head_st, "verifying" | "rebasing") {
+                theme::CATEGORY_INDUSTRY
+            } else {
+                theme::CATEGORY_ACADEMIC
+            };
+            let lbl = if q.queued.len() == 1 && matches!(head_st, "verifying" | "rebasing") {
+                format!("MQ · {head_st}")
+            } else {
+                format!("MQ · {} queued", q.queued.len())
+            };
+            (col, lbl)
+        }
+        _ => (0x284D32, "MQ · idle".to_string()),
+    };
+    let mq_pill_active = matches!(app.screen, Screen::Workspace(WorkspacePage::MergeQueue));
     div()
         .h(px(36.0))
         .w_full()
@@ -1918,6 +2307,36 @@ pub(crate) fn session_strip(app: &KawanApp, theme: &Theme, cx: &mut Context<Kawa
                 .flex()
                 .items_center()
                 .gap(px(8.0))
+                .child(
+                    div()
+                        .id("strip-merge-queue")
+                        .h(px(24.0))
+                        .px(px(8.0))
+                        .rounded(px(2.0))
+                        .border_1()
+                        .border_color(if mq_pill_active {
+                            theme.ink
+                        } else {
+                            theme.border_subtle
+                        })
+                        .bg(if mq_pill_active {
+                            theme::with_alpha(theme.palette.vivid, 0.09)
+                        } else {
+                            theme.surface
+                        })
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.hover))
+                        .child(kit::swatch(theme::hex(mq_pill_color), px(5.0)))
+                        .child(theme::micro(mq_pill_label, 8.5, theme.dark))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_merge_queue();
+                            window.focus(&this.focus_handle, cx);
+                            cx.notify();
+                        })),
+                )
                 .children((!app.setup.ready).then(|| {
                     kit::ghost_button("strip-checklist", "Checklist", theme).on_click(cx.listener(
                         |this, _, _, cx| {
@@ -2003,6 +2422,19 @@ fn thread_drawer_body(
         .iter()
         .filter(|m| m.id == thread_id || m.thread_id.as_deref() == Some(thread_id))
         .collect();
+    let mut thread_pending: Vec<&SessionSummary> = app
+        .sessions_by_id
+        .values()
+        .filter(|s| {
+            s.kind == "worker"
+                && s.status == "pending_approval"
+                && s.thread_id.as_deref() == Some(thread_id)
+        })
+        .collect();
+    thread_pending.sort_by_key(|s| s.created_at);
+    let thread_running = app.sessions_by_id.values().find(|s| {
+        s.kind == "worker" && s.status == "running" && s.thread_id.as_deref() == Some(thread_id)
+    });
     let focused = app.focus_target == FocusTarget::ThreadComposer;
 
     div()
@@ -2099,6 +2531,40 @@ fn thread_drawer_body(
                     }
 
                     msg_col
+                }))
+                .children(
+                    thread_pending.into_iter().enumerate().map(|(pi, ps)| {
+                        pending_session_card(app, ps, "drawer-pend", pi, theme, cx)
+                    }),
+                )
+                .children(thread_running.map(|rs| {
+                    let stop_sid = rs.id.clone();
+                    div()
+                        .p(px(10.0))
+                        .rounded(px(2.0))
+                        .border_1()
+                        .border_color(theme.border_subtle)
+                        .bg(theme.strip)
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(kit::swatch(theme::hex(theme::CATEGORY_INDUSTRY), px(6.0)))
+                                .child(theme::label(session_display_title(rs), 12.0, theme.ink)),
+                        )
+                        .child(
+                            kit::ghost_button("drawer-thread-stop", "Stop", theme).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.stop_session(&stop_sid);
+                                    cx.notify();
+                                }),
+                            ),
+                        )
                 })),
         )
         .child(
@@ -2205,6 +2671,9 @@ fn session_drawer_body(
             })),
         );
 
+    let sid_confirm = session_id.to_string();
+    let sid_dismiss = session_id.to_string();
+    let sid_stop = session_id.to_string();
     let mut container = div()
         .id("drawer-session-scroll")
         .flex_1()
@@ -2215,11 +2684,47 @@ fn session_drawer_body(
         .flex_col()
         .gap(px(12.0))
         .child(theme::title(session_display_title(sess), 17.0, theme.ink))
-        .child(kit::status_tag(
-            sess.status.to_uppercase(),
-            status_color_hex(&sess.status),
-            theme,
-        ))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .child(kit::status_tag(
+                    sess.status.to_uppercase(),
+                    status_color_hex(&sess.status),
+                    theme,
+                ))
+                .children((sess.status == "running").then(|| {
+                    kit::ghost_button("drawer-sess-stop", "Stop", theme).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.stop_session(&sid_stop);
+                            cx.notify();
+                        },
+                    ))
+                }))
+                .children((sess.status == "pending_approval").then(|| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            kit::ghost_button("drawer-sess-dismiss", "Dismiss", theme).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.dismiss_session(&sid_dismiss);
+                                    cx.notify();
+                                }),
+                            ),
+                        )
+                        .child(
+                            kit::small_primary_button("drawer-sess-start", "Start", theme)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.confirm_session(&sid_confirm);
+                                    cx.notify();
+                                })),
+                        )
+                })),
+        )
         .child(tab_bar);
 
     if app.session_drawer_tab == SessionDrawerTab::Changes {
@@ -2300,18 +2805,57 @@ fn session_drawer_body(
                 .border_color(theme.border_subtle)
                 .bg(theme.strip)
                 .flex()
-                .items_center()
-                .justify_between()
-                .child(kit::status_tag(
-                    format!("LAND · {}", l.status.to_uppercase()),
-                    status_color_hex(&l.status),
-                    theme,
-                ))
-                .children((l.status == "requested" || l.status == "failed").then(|| {
-                    kit::small_primary_button("drawer-approve-land", "Approve Land", theme)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.approve_land(&lid);
-                            cx.notify();
+                .flex_col()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(kit::status_tag(
+                                    format!("LAND · {}", l.status.to_uppercase()),
+                                    status_color_hex(&l.status),
+                                    theme,
+                                ))
+                                .children(l.touches_kawan.then(|| {
+                                    kit::status_tag("MODIFIES .kawan/", theme::UMBER_VIVID, theme)
+                                })),
+                        )
+                        .children((l.status == "requested" || l.status == "failed").then(|| {
+                            kit::small_primary_button("drawer-approve-land", "Approve Land", theme)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.approve_land(&lid);
+                                    cx.notify();
+                                }))
+                        }))
+                        .children((l.status == "paused").then(|| {
+                            kit::ghost_button("drawer-land-mq", "Open in Merge Queue", theme)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_merge_queue();
+                                    window.focus(&this.focus_handle, cx);
+                                    cx.notify();
+                                }))
+                        })),
+                )
+                .children((!l.checks.is_empty()).then(|| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap(px(5.0))
+                        .children(l.checks.iter().map(|chk| {
+                            let (fg, mark) = if chk.ok {
+                                (theme::hex(0x1C592C), "✓")
+                            } else {
+                                (theme::hex(theme::CATEGORY_VALS), "✕")
+                            };
+                            theme::numeric(format!("{mark} {}", chk.name), 10.0, fg)
                         }))
                 }))
         }))

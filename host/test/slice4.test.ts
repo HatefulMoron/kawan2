@@ -45,6 +45,10 @@ test("Slice 4: passing verify lands signed commit onto bare repo; failing verify
       [...msgs].reverse().find((m: any) => m.role === "user")?.content ?? "",
     );
 
+    if (sysText.includes("Merge Queue Bot")) {
+      return { text: "Verification failed in merge queue; paused for human guidance." };
+    }
+
     if (sysText.includes("AI engineering orchestrator")) {
       if (lastUserText.includes("[worker-report")) {
         return { text: "Prepared the change — ready for your approval." };
@@ -280,8 +284,8 @@ test("Slice 4: passing verify lands signed commit onto bare repo; failing verify
     const approveRes2 = await admin.request<{ land: any; session: any }>("land.approve", {
       land_id: land2Id,
     });
-    assert.equal(approveRes2.land.status, "failed");
-    assert.equal(approveRes2.session.status, "failed");
+    assert.equal(approveRes2.land.status, "paused");
+    assert.equal(approveRes2.land.pause_reason, "checks_failed");
     await failMsgWait;
 
     // Bare repo head MUST remain unchanged at approveRes1.land.landed_sha
@@ -292,6 +296,14 @@ test("Slice 4: passing verify lands signed commit onto bare repo; failing verify
     );
     assert.equal(headAfterFail.trim(), approveRes1.land.landed_sha);
     assert.equal(existsSync(worker2ClonePath), true, "Failed worker clone should remain for inspection");
+
+    // Ejecting paused land marks it failed and unpauses queue
+    const ejectRes = await admin.request<{ queue: any }>("merge_queue.eject", {
+      land_id: land2Id,
+      reason: "Fix lint check",
+    });
+    assert.equal(ejectRes.queue.settings.paused, false);
+    assert.equal(host.db.getLand(land2Id)!.status, "failed");
 
     admin.close();
   } finally {

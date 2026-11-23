@@ -199,3 +199,68 @@ export function composeSpawnSpec(params: ComposeSpawnParams): ComposedSpawnSpec 
     env: childEnv,
   };
 }
+
+export function composeCheckCommand(params: {
+  cwd: string;
+  command: string;
+  args?: string[];
+  sandboxEnabled: boolean;
+  sandboxNetwork: boolean;
+  disableSandbox?: boolean;
+}): {
+  command: string;
+  args: string[];
+  cwd: string;
+  env: Record<string, string>;
+} {
+  const childEnv: Record<string, string> = {
+    PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
+    HOME: "/home/kawan",
+    GIT_TERMINAL_PROMPT: "0",
+  };
+  const extraArgs = params.args ?? [];
+  const useSandbox = params.sandboxEnabled && !params.disableSandbox;
+  if (!useSandbox) {
+    return {
+      command: params.command,
+      args: extraArgs,
+      cwd: params.cwd,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    };
+  }
+
+  const bwrapArgs: string[] = ["--die-with-parent"];
+  for (const sysDir of ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"]) {
+    if (existsSync(sysDir)) {
+      bwrapArgs.push("--ro-bind", sysDir, sysDir);
+    }
+  }
+  bwrapArgs.push("--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--dir", "/home/kawan");
+  bwrapArgs.push("--bind", params.cwd, params.cwd);
+
+  if (params.sandboxNetwork) {
+    try {
+      const resolvedResolv = realpathSync("/etc/resolv.conf");
+      if (!resolvedResolv.startsWith("/etc/") && existsSync(resolvedResolv)) {
+        const resolvDir = dirname(resolvedResolv);
+        if (resolvDir.startsWith("/run/")) {
+          bwrapArgs.push("--ro-bind", resolvDir, resolvDir);
+        } else {
+          bwrapArgs.push("--ro-bind", resolvedResolv, resolvedResolv);
+        }
+      }
+    } catch {
+      // ignore missing /etc/resolv.conf
+    }
+  } else {
+    bwrapArgs.push("--unshare-net");
+  }
+
+  bwrapArgs.push("--chdir", params.cwd, "--", params.command, ...extraArgs);
+  return {
+    command: "bwrap",
+    args: bwrapArgs,
+    cwd: params.cwd,
+    env: childEnv,
+  };
+}

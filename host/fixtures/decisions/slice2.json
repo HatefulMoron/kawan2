@@ -106,5 +106,185 @@
       "input_tokens": 664,
       "output_tokens": 0
     }
+  },
+  "822a83f8da2c0843a7a2b0b3": {
+    "model": "subq-snap-1.2",
+    "answers": {
+      "destination": {
+        "type": "choice",
+        "choice": "orchestrator",
+        "probabilities": {
+          "none": 0.00007711176294833422,
+          "orchestrator": 0.9999228715896606
+        },
+        "confidence": 0.9998457431793213
+      },
+      "readiness": {
+        "type": "choice",
+        "choice": "dispatch",
+        "probabilities": {
+          "dispatch": 0.9985995888710022,
+          "hold": 0.0014004188124090433
+        },
+        "confidence": 0.9971991777420044
+      },
+      "explicit_work_start": {
+        "type": "choice",
+        "choice": "yes",
+        "probabilities": {
+          "yes": 0.9998558759689331,
+          "no": 0.00014410285803023726
+        },
+        "confidence": 0.9997117519378662
+      },
+      "work_request": {
+        "type": "choice",
+        "choice": "yes",
+        "probabilities": {
+          "yes": 0.9998238682746887,
+          "no": 0.0001761791208991781
+        },
+        "confidence": 0.9996477365493774
+      }
+    },
+    "usage": {
+      "input_tokens": 936,
+      "output_tokens": 0
+    }
+  },
+  "8f1edf6a310a0d048a7bbb77": {
+    "model": "subq-snap-1.2",
+    "answers": {
+      "destination": {
+        "type": "choice",
+        "choice": "orchestrator",
+        "probabilities": {
+          "none": 0.002301651518791914,
+          "orchestrator": 0.9976983666419983
+        },
+        "confidence": 0.9953967332839966
+      },
+      "readiness": {
+        "type": "choice",
+        "choice": "hold",
+        "probabilities": {
+          "dispatch": 0.01036094781011343,
+          "hold": 0.9896390438079834
+        },
+        "confidence": 0.9792780876159668
+      },
+      "explicit_work_start": {
+        "type": "choice",
+        "choice": "no",
+        "probabilities": {
+          "yes": 0.009172582067549229,
+          "no": 0.9908273816108704
+        },
+        "confidence": 0.9816547632217407
+      },
+      "work_request": {
+        "type": "choice",
+        "choice": "no",
+        "probabilities": {
+          "yes": 0.012099621817469597,
+          "no": 0.9879003763198853
+        },
+        "confidence": 0.9758007526397705
+      }
+    },
+    "usage": {
+      "input_tokens": 962,
+      "output_tokens": 0
+    }
+  },
+  "38b0533689fa6e8e407ef334": {
+    "model": "subq-snap-1.2",
+    "answers": {
+      "destination": {
+        "type": "choice",
+        "choice": "orchestrator",
+        "probabilities": {
+          "none": 0.0024045512545853853,
+          "orchestrator": 0.997595489025116
+        },
+        "confidence": 0.9951909780502319
+      },
+      "readiness": {
+        "type": "choice",
+        "choice": "dispatch",
+        "probabilities": {
+          "dispatch": 0.9882935285568237,
+          "hold": 0.011706463061273098
+        },
+        "confidence": 0.9765870571136475
+      },
+      "explicit_work_start": {
+        "type": "choice",
+        "choice": "no",
+        "probabilities": {
+          "yes": 0.46469685435295105,
+          "no": 0.5353031754493713
+        },
+        "confidence": 0.07060635089874268
+      },
+      "work_request": {
+        "type": "choice",
+        "choice": "yes",
+        "probabilities": {
+          "yes": 0.9762800335884094,
+          "no": 0.023719996213912964
+        },
+        "confidence": 0.9525600671768188
+      }
+    },
+    "usage": {
+      "input_tokens": 1007,
+      "output_tokens": 0
+    }
+  },
+  "cc2ed86082b0376e2f9b83f4": {
+    "model": "subq-snap-1.2",
+    "answers": {
+      "destination": {
+        "type": "choice",
+        "choice": "none",
+        "probabilities": {
+          "none": 0.9923967719078064,
+          "orchestrator": 0.007603260688483715
+        },
+        "confidence": 0.9847935438156128
+      },
+      "readiness": {
+        "type": "choice",
+        "choice": "dispatch",
+        "probabilities": {
+          "dispatch": 0.995444655418396,
+          "hold": 0.004555343650281429
+        },
+        "confidence": 0.990889310836792
+      },
+      "explicit_work_start": {
+        "type": "choice",
+        "choice": "no",
+        "probabilities": {
+          "yes": 0.00025166140403598547,
+          "no": 0.9997482895851135
+        },
+        "confidence": 0.999496579170227
+      },
+      "work_request": {
+        "type": "choice",
+        "choice": "no",
+        "probabilities": {
+          "yes": 0.0004201928968541324,
+          "no": 0.9995798468589783
+        },
+        "confidence": 0.9991596937179565
+      }
+    },
+    "usage": {
+      "input_tokens": 1026,
+      "output_tokens": 0
+    }
   }
 }

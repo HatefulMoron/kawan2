@@ -12,10 +12,10 @@ use crate::mock;
 use crate::protocol::{
     Artifact, ArtifactGetData, BotCreateData, BotListData, BotSummary, Conversation,
     ConversationCreateData, ConversationListData, ConversationMarkReadData, ConversationOpenData,
-    Decision, InviteCreateData, Land, LandApproveData, Member, Message, ModelsTestData,
-    ServerFrame, SessionDiffData, SessionDiffSummary, SessionListData, SessionOpenData,
-    SessionSummary, SettingsView, SetupStatus, StatusReadData, StatusRepoInfo, UserListData,
-    UserSummary, parse_invite_link,
+    Decision, InviteCreateData, Land, LandApproveData, Member, MergeQueueReadData,
+    MergeQueueSnapshot, Message, ModelsTestData, ServerFrame, SessionActionData, SessionDiffData,
+    SessionDiffSummary, SessionListData, SessionOpenData, SessionSummary, SettingsView,
+    SetupStatus, StatusReadData, StatusRepoInfo, UserListData, UserSummary, parse_invite_link,
 };
 use crate::ssh::default_ssh_key_path;
 use crate::ws_client::{AuthMode, ConnectConfig, WsEvent, WsHandle};
@@ -30,6 +30,7 @@ pub enum Screen {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspacePage {
     Status,
+    MergeQueue,
     Conversation,
     Settings(SettingsTab),
 }
@@ -128,6 +129,7 @@ pub struct KawanApp {
     pub sessions_by_id: HashMap<String, SessionSummary>,
     pub artifacts_by_id: HashMap<String, Artifact>,
     pub lands_by_id: HashMap<String, Land>,
+    pub merge_queue: Option<MergeQueueSnapshot>,
     pub conv_errors: HashMap<String, Vec<ConversationError>>,
     pub loaded_artifacts: HashMap<String, LoadedArtifact>,
     pub expanded_artifacts: HashSet<String>,
@@ -236,6 +238,7 @@ impl KawanApp {
             sessions_by_id: HashMap::new(),
             artifacts_by_id: HashMap::new(),
             lands_by_id: HashMap::new(),
+            merge_queue: None,
             conv_errors: HashMap::new(),
             loaded_artifacts: HashMap::new(),
             expanded_artifacts: HashSet::new(),
@@ -489,8 +492,11 @@ impl KawanApp {
                     list.push(message);
                     list.sort_by_key(|m| m.seq);
                 }
-                let viewing_active = self.screen == Screen::Workspace(WorkspacePage::Conversation)
-                    && self.active_conversation_id.as_deref() == Some(conv_id.as_str());
+                let viewing_active = matches!(
+                    self.screen,
+                    Screen::Workspace(WorkspacePage::Conversation | WorkspacePage::MergeQueue)
+                ) && self.active_conversation_id.as_deref()
+                    == Some(conv_id.as_str());
                 if let Some(conv) = self.conversations.iter_mut().find(|c| c.id == conv_id) {
                     conv.last_seq = conv.last_seq.max(msg_seq);
                     conv.next_seq = conv.next_seq.max(conv.last_seq + 1);
@@ -554,6 +560,9 @@ impl KawanApp {
                         self.fetch_session_diff(&sess_id);
                     }
                 }
+            }
+            ServerFrame::MergeQueueUpdate { queue } => {
+                self.apply_merge_queue_snapshot(*queue);
             }
             ServerFrame::ReadCursorUpdate {
                 conversation_id,
@@ -643,7 +652,11 @@ impl KawanApp {
                         }
                     }
                     if prev_active.is_none()
-                        && let Some(first) = self.conversations.first()
+                        && let Some(first) = self
+                            .conversations
+                            .iter()
+                            .find(|c| c.kind == "channel")
+                            .or_else(|| self.conversations.first())
                     {
                         let cid = first.id.clone();
                         self.active_conversation_id = Some(cid.clone());
@@ -758,6 +771,25 @@ impl KawanApp {
                     self.error_banner = None;
                 }
             }
+            "merge_queue.read"
+            | "merge_queue.configure"
+            | "merge_queue.pause"
+            | "merge_queue.resume"
+            | "merge_queue.retry"
+            | "merge_queue.eject"
+            | "merge_queue.remove" => {
+                if let Ok(res) = serde_json::from_value::<MergeQueueReadData>(val) {
+                    self.apply_merge_queue_snapshot(res.queue);
+                    self.error_banner = None;
+                }
+            }
+            "session.confirm" | "session.dismiss" | "session.stop" => {
+                if let Ok(res) = serde_json::from_value::<SessionActionData>(val) {
+                    self.sessions_by_id
+                        .insert(res.session.id.clone(), res.session);
+                    self.error_banner = None;
+                }
+            }
             "invite.create" => {
                 if let Ok(res) = serde_json::from_value::<InviteCreateData>(val) {
                     self.last_invite_link = Some(res.link);
@@ -856,8 +888,25 @@ impl KawanApp {
             && self.setup.has_bot;
     }
 
+    fn apply_merge_queue_snapshot(&mut self, queue: MergeQueueSnapshot) {
+        if let Some(head) = &queue.head {
+            self.lands_by_id.insert(head.id.clone(), head.clone());
+        }
+        for l in &queue.queued {
+            self.lands_by_id.insert(l.id.clone(), l.clone());
+        }
+        if let Some(p) = &queue.paused_land {
+            self.lands_by_id.insert(p.id.clone(), p.clone());
+        }
+        for l in &queue.recent_landed {
+            self.lands_by_id.insert(l.id.clone(), l.clone());
+        }
+        self.merge_queue = Some(queue);
+    }
+
     fn upsert_conversation(&mut self, conv: Conversation) {
         let cid = conv.id.clone();
+        let kind = conv.kind.clone();
         if !conv.members.is_empty() {
             self.members_by_conv
                 .insert(cid.clone(), conv.members.clone());
@@ -867,7 +916,7 @@ impl KawanApp {
         } else {
             self.conversations.push(conv);
         }
-        if self.active_conversation_id.is_none() {
+        if self.active_conversation_id.is_none() && kind != "merge_queue" {
             self.active_conversation_id = Some(cid.clone());
             self.send_cmd("conversation.open", json!({ "conversation_id": cid }));
         }
@@ -880,6 +929,7 @@ impl KawanApp {
         self.send_cmd("conversation.list", json!({}));
         self.send_cmd("session.list", json!({}));
         self.send_cmd("status.read", json!({}));
+        self.send_cmd("merge_queue.read", json!({}));
     }
 
     pub fn open_conversation(&mut self, conv_id: &str) {
@@ -913,7 +963,44 @@ impl KawanApp {
         self.show_add_member = false;
         if !self.is_mock {
             self.send_cmd("status.read", json!({}));
+            self.send_cmd("merge_queue.read", json!({}));
         }
+    }
+
+    pub fn merge_queue_conversation(&self) -> Option<&Conversation> {
+        self.conversations.iter().find(|c| c.kind == "merge_queue")
+    }
+
+    pub fn open_merge_queue(&mut self) {
+        self.screen = Screen::Workspace(WorkspacePage::MergeQueue);
+        self.right_panel = RightPanel::None;
+        self.redirect_menu_decision_id = None;
+        self.show_add_member = false;
+        self.focus_target = FocusTarget::Composer;
+        let mq_cid = self
+            .merge_queue
+            .as_ref()
+            .map(|q| q.conversation_id.clone())
+            .or_else(|| self.merge_queue_conversation().map(|c| c.id.clone()));
+        if let Some(cid) = mq_cid {
+            self.active_conversation_id = Some(cid.clone());
+            if let Some(conv) = self.conversations.iter_mut().find(|c| c.id == cid) {
+                conv.last_read_seq = conv.last_read_seq.max(conv.last_seq);
+                conv.unread_count = 0;
+            }
+            if !self.is_mock {
+                self.send_cmd("conversation.open", json!({ "conversation_id": cid }));
+            }
+        }
+        if !self.is_mock {
+            self.send_cmd("merge_queue.read", json!({}));
+        }
+    }
+
+    pub fn open_merge_queue_thread(&mut self, thread_id: &str) {
+        self.open_merge_queue();
+        self.right_panel = RightPanel::Thread(thread_id.to_string());
+        self.focus_target = FocusTarget::ThreadComposer;
     }
 
     pub fn open_dm_with(&mut self, user_id: &str) {
@@ -1024,6 +1111,8 @@ impl KawanApp {
                     redirected_from: None,
                     redirected_by: None,
                     hold_expires_at: None,
+                    explicit_work_start: Some("yes".to_string()),
+                    work_request: Some("yes".to_string()),
                     created_at: 1_795_409_400_050,
                 });
             return;
@@ -1149,13 +1238,186 @@ impl KawanApp {
             if let Some(land) = self.lands_by_id.get_mut(land_id) {
                 land.status = "landed".to_string();
                 land.landed_sha = Some("d92b7f1e88c3".to_string());
+                land.pause_reason = None;
+                land.error = None;
                 if let Some(sess) = self.sessions_by_id.get_mut(&land.session_id) {
                     sess.status = "landed".to_string();
+                }
+                let updated_land = land.clone();
+                if let Some(mq) = &mut self.merge_queue {
+                    mq.queued.retain(|l| l.id != land_id);
+                    mq.head = mq.queued.first().cloned();
+                    if mq.paused_land.as_ref().is_some_and(|l| l.id == land_id) {
+                        mq.paused_land = None;
+                        mq.settings.paused = false;
+                    }
+                    mq.recent_landed.insert(0, updated_land);
                 }
             }
             return;
         }
-        self.send_cmd("land.approve", json!({ "land_id": land_id }));
+        self.send_cmd("land.approve", json!({ "land_id": land_id, "async": true }));
+    }
+
+    pub fn confirm_session(&mut self, session_id: &str) {
+        if self.is_mock {
+            if let Some(sess) = self.sessions_by_id.get_mut(session_id) {
+                sess.status = "running".to_string();
+            }
+            return;
+        }
+        self.send_cmd("session.confirm", json!({ "session_id": session_id }));
+    }
+
+    pub fn dismiss_session(&mut self, session_id: &str) {
+        if self.is_mock {
+            if let Some(sess) = self.sessions_by_id.get_mut(session_id) {
+                sess.status = "stopped".to_string();
+                sess.last_report = Some("Dismissed by user".to_string());
+            }
+            return;
+        }
+        self.send_cmd("session.dismiss", json!({ "session_id": session_id }));
+    }
+
+    pub fn stop_session(&mut self, session_id: &str) {
+        if self.is_mock {
+            if let Some(sess) = self.sessions_by_id.get_mut(session_id) {
+                sess.status = "stopped".to_string();
+                sess.last_report = Some("Stopped by user".to_string());
+            }
+            return;
+        }
+        self.send_cmd("session.stop", json!({ "session_id": session_id }));
+    }
+
+    fn sync_mock_merge_queue_head(&mut self) {
+        if let Some(mq) = &mut self.merge_queue {
+            mq.head = mq.queued.first().cloned();
+            mq.paused_land = mq.queued.iter().find(|l| l.status == "paused").cloned();
+            if mq.paused_land.is_none() && mq.queued.is_empty() {
+                mq.settings.paused = false;
+            }
+        }
+    }
+
+    pub fn merge_queue_pause(&mut self) {
+        if self.is_mock {
+            if let Some(mq) = &mut self.merge_queue {
+                mq.settings.paused = true;
+            }
+            return;
+        }
+        self.send_cmd("merge_queue.pause", json!({}));
+    }
+
+    pub fn merge_queue_resume(&mut self) {
+        if self.is_mock {
+            if let Some(mq) = &mut self.merge_queue {
+                mq.settings.paused = false;
+                if let Some(head) = mq.queued.first_mut()
+                    && head.status == "paused"
+                {
+                    head.status = "queued".to_string();
+                    head.pause_reason = None;
+                    head.error = None;
+                    self.lands_by_id.insert(head.id.clone(), head.clone());
+                }
+            }
+            self.sync_mock_merge_queue_head();
+            return;
+        }
+        self.send_cmd("merge_queue.resume", json!({}));
+    }
+
+    pub fn merge_queue_retry(&mut self, land_id: Option<&str>) {
+        if self.is_mock {
+            self.merge_queue_resume();
+            return;
+        }
+        self.send_cmd("merge_queue.retry", json!({ "land_id": land_id }));
+    }
+
+    pub fn merge_queue_eject(&mut self, land_id: &str) {
+        if self.is_mock {
+            if let Some(land) = self.lands_by_id.get_mut(land_id) {
+                land.status = "failed".to_string();
+                land.pause_reason = None;
+                land.queue_position = None;
+                if let Some(sess) = self.sessions_by_id.get_mut(&land.session_id) {
+                    sess.status = "idle".to_string();
+                }
+            }
+            if let Some(mq) = &mut self.merge_queue {
+                mq.queued.retain(|l| l.id != land_id);
+                mq.settings.paused = false;
+            }
+            self.sync_mock_merge_queue_head();
+            return;
+        }
+        self.send_cmd("merge_queue.eject", json!({ "land_id": land_id }));
+    }
+
+    pub fn merge_queue_remove(&mut self, land_id: &str) {
+        if self.is_mock {
+            if let Some(land) = self.lands_by_id.get_mut(land_id) {
+                land.status = "requested".to_string();
+                land.pause_reason = None;
+                land.queue_position = None;
+                if let Some(sess) = self.sessions_by_id.get_mut(&land.session_id) {
+                    sess.status = "review_requested".to_string();
+                }
+            }
+            if let Some(mq) = &mut self.merge_queue {
+                mq.queued.retain(|l| l.id != land_id);
+                mq.settings.paused = false;
+            }
+            self.sync_mock_merge_queue_head();
+            return;
+        }
+        self.send_cmd("merge_queue.remove", json!({ "land_id": land_id }));
+    }
+
+    pub fn merge_queue_cycle_bot(&mut self) {
+        if self.bots.is_empty() {
+            return;
+        }
+        let current = self
+            .merge_queue
+            .as_ref()
+            .and_then(|q| q.settings.bot_id.as_deref());
+        let next_idx = current
+            .and_then(|cid| self.bots.iter().position(|b| b.id == cid))
+            .map(|i| (i + 1) % self.bots.len())
+            .unwrap_or(0);
+        let next_bot_id = self.bots[next_idx].id.clone();
+        if self.is_mock {
+            if let Some(mq) = &mut self.merge_queue {
+                mq.settings.bot_id = Some(next_bot_id);
+            }
+            return;
+        }
+        self.send_cmd("merge_queue.configure", json!({ "bot_id": next_bot_id }));
+    }
+
+    pub fn merge_queue_toggle_conflict_policy(&mut self) {
+        let current = self
+            .merge_queue
+            .as_ref()
+            .map(|q| q.settings.conflict_policy.as_str())
+            .unwrap_or("pause_on_issue");
+        let next = if current == "auto_resolve_trivial" {
+            "pause_on_issue"
+        } else {
+            "auto_resolve_trivial"
+        };
+        if self.is_mock {
+            if let Some(mq) = &mut self.merge_queue {
+                mq.settings.conflict_policy = next.to_string();
+            }
+            return;
+        }
+        self.send_cmd("merge_queue.configure", json!({ "conflict_policy": next }));
     }
 
     pub fn toggle_artifact_view(&mut self, artifact_id: &str) {
@@ -1385,9 +1647,10 @@ impl KawanApp {
         out.sort_by_key(|s| {
             let prio = match s.status.as_str() {
                 "running" => 0_u8,
-                "review_requested" => 1,
-                "failed" => 2,
-                _ => 3,
+                "pending_approval" => 1,
+                "review_requested" => 2,
+                "failed" => 3,
+                _ => 4,
             };
             (prio, std::cmp::Reverse(s.updated_at))
         });
@@ -1408,6 +1671,9 @@ impl KawanApp {
 
     pub fn conversation_label(&self, conv_id: &str) -> String {
         if let Some(conv) = self.conversations.iter().find(|c| c.id == conv_id) {
+            if conv.kind == "merge_queue" {
+                return "#merge-queue".to_string();
+            }
             if conv.kind == "channel" {
                 return format!("#{}", conv.name.as_deref().unwrap_or("channel"));
             }
@@ -1441,12 +1707,15 @@ impl KawanApp {
         let mut in_flight = 0usize;
         for sess in self.all_worker_sessions() {
             let land_status = self.land_for_session(&sess.id).map(|l| l.status.as_str());
-            if land_status == Some("failed")
+            if matches!(land_status, Some("failed" | "paused"))
                 || (sess.status == "failed" && land_status != Some("landed"))
+                || sess.status == "pending_approval"
             {
                 needs_you += 1;
-            } else if matches!(land_status, Some("requested" | "verifying"))
-                || (sess.status == "review_requested" && land_status != Some("landed"))
+            } else if matches!(
+                land_status,
+                Some("requested" | "queued" | "rebasing" | "verifying")
+            ) || (sess.status == "review_requested" && land_status != Some("landed"))
             {
                 waiting += 1;
             } else if matches!(sess.status.as_str(), "running" | "idle")

@@ -88,6 +88,10 @@ pub struct Decision {
     pub redirected_by: Option<String>,
     #[serde(default)]
     pub hold_expires_at: Option<u64>,
+    #[serde(default)]
+    pub explicit_work_start: Option<String>,
+    #[serde(default)]
+    pub work_request: Option<String>,
     pub created_at: u64,
 }
 
@@ -145,6 +149,18 @@ pub struct Artifact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckRunItem {
+    pub name: String,
+    pub ok: bool,
+    pub exit_code: Option<i64>,
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub output: String,
+    #[serde(default)]
+    pub artifact_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Land {
     pub id: String,
     pub session_id: String,
@@ -158,8 +174,69 @@ pub struct Land {
     pub landed_sha: Option<String>,
     pub verify_output: Option<String>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub queue_position: Option<u64>,
+    #[serde(default)]
+    pub issue_id: Option<String>,
+    #[serde(default)]
+    pub pause_reason: Option<String>,
+    #[serde(default)]
+    pub queue_session_id: Option<String>,
+    #[serde(default)]
+    pub queue_thread_id: Option<String>,
+    #[serde(default)]
+    pub trigger: Option<String>,
+    #[serde(default)]
+    pub checks: Vec<CheckRunItem>,
+    #[serde(default)]
+    pub touches_kawan: bool,
     pub created_at: u64,
     pub updated_at: u64,
+}
+
+fn default_landing_mode_str() -> String {
+    "manual".to_string()
+}
+
+fn default_conflict_policy_str() -> String {
+    "pause_on_issue".to_string()
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeQueueSettingsView {
+    #[serde(default)]
+    pub bot_id: Option<String>,
+    #[serde(default = "default_landing_mode_str")]
+    pub default_landing_mode: String,
+    #[serde(default = "default_conflict_policy_str")]
+    pub conflict_policy: String,
+    #[serde(default)]
+    pub paused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeQueueSnapshot {
+    pub conversation_id: String,
+    #[serde(default)]
+    pub settings: MergeQueueSettingsView,
+    #[serde(default)]
+    pub head: Option<Land>,
+    #[serde(default)]
+    pub queued: Vec<Land>,
+    #[serde(default)]
+    pub paused_land: Option<Land>,
+    #[serde(default)]
+    pub recent_landed: Vec<Land>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeQueueReadData {
+    pub queue: MergeQueueSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionActionData {
+    pub session: SessionSummary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,6 +305,8 @@ pub struct SettingsView {
     pub providers: HashMap<String, ProviderView>,
     #[serde(default)]
     pub roles: RolesView,
+    #[serde(default)]
+    pub merge_queue: Option<MergeQueueSettingsView>,
     #[serde(default)]
     pub setup: SetupStatus,
 }
@@ -423,6 +502,8 @@ pub enum ServerFrame {
     ArtifactNew { artifact: Artifact },
     #[serde(rename = "land.update")]
     LandUpdate { land: Land },
+    #[serde(rename = "merge_queue.update")]
+    MergeQueueUpdate { queue: Box<MergeQueueSnapshot> },
     #[serde(rename = "read_cursor.update")]
     ReadCursorUpdate {
         conversation_id: String,

@@ -25,5 +25,50 @@
       "input_tokens": 606,
       "output_tokens": 0
     }
+  },
+  "a3b45310e03098bc39bb83c5": {
+    "model": "subq-snap-1.2",
+    "answers": {
+      "destination": {
+        "type": "choice",
+        "choice": "orchestrator",
+        "probabilities": {
+          "none": 0.00007078539056237787,
+          "orchestrator": 0.9999291896820068
+        },
+        "confidence": 0.9998583793640137
+      },
+      "readiness": {
+        "type": "choice",
+        "choice": "dispatch",
+        "probabilities": {
+          "dispatch": 0.9989677667617798,
+          "hold": 0.0010322798043489456
+        },
+        "confidence": 0.9979355335235596
+      },
+      "explicit_work_start": {
+        "type": "choice",
+        "choice": "yes",
+        "probabilities": {
+          "yes": 0.9997640252113342,
+          "no": 0.0002359429345233366
+        },
+        "confidence": 0.9995280504226685
+      },
+      "work_request": {
+        "type": "choice",
+        "choice": "yes",
+        "probabilities": {
+          "yes": 0.9998127818107605,
+          "no": 0.0001872401189757511
+        },
+        "confidence": 0.999625563621521
+      }
+    },
+    "usage": {
+      "input_tokens": 968,
+      "output_tokens": 0
+    }
   }
 }

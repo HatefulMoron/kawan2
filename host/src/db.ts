@@ -62,7 +62,7 @@ const SCHEMA_MIGRATIONS: Array<{ version: number; sql: string }> = [
 
       CREATE TABLE IF NOT EXISTS conversations (
         id TEXT PRIMARY KEY,
-        kind TEXT NOT NULL CHECK(kind IN ('channel', 'dm')),
+        kind TEXT NOT NULL CHECK(kind IN ('channel', 'dm', 'issue', 'merge_queue')),
         name TEXT,
         topic TEXT,
         next_seq INTEGER NOT NULL DEFAULT 1,
@@ -110,6 +110,8 @@ const SCHEMA_MIGRATIONS: Array<{ version: number; sql: string }> = [
         redirected_from TEXT,
         redirected_by TEXT,
         hold_expires_at INTEGER,
+        explicit_work_start TEXT,
+        work_request TEXT,
         created_at INTEGER NOT NULL
       );
 
@@ -120,7 +122,7 @@ const SCHEMA_MIGRATIONS: Array<{ version: number; sql: string }> = [
         id TEXT PRIMARY KEY,
         bot_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         parent_session_id TEXT,
-        kind TEXT NOT NULL CHECK(kind IN ('orchestrator', 'worker')),
+        kind TEXT NOT NULL CHECK(kind IN ('orchestrator', 'worker', 'queue', 'reviewer')),
         conversation_id TEXT,
         thread_id TEXT,
         title TEXT,
@@ -173,12 +175,20 @@ const SCHEMA_MIGRATIONS: Array<{ version: number; sql: string }> = [
         conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
         thread_id TEXT,
         message_id TEXT,
-        status TEXT NOT NULL CHECK(status IN ('requested', 'verifying', 'landed', 'failed')),
+        status TEXT NOT NULL CHECK(status IN ('requested', 'queued', 'rebasing', 'verifying', 'paused', 'landed', 'failed', 'removed')),
         approved_by TEXT,
         base_sha TEXT,
         landed_sha TEXT,
         verify_output TEXT,
         error TEXT,
+        queue_position INTEGER,
+        issue_id TEXT,
+        pause_reason TEXT,
+        queue_session_id TEXT,
+        queue_thread_id TEXT,
+        trigger TEXT NOT NULL DEFAULT 'manual_approve',
+        checks_json TEXT,
+        touches_kawan INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
@@ -225,20 +235,124 @@ export class KawanDb {
         (r) => r.version,
       ),
     );
-    for (const m of SCHEMA_MIGRATIONS) {
-      if (applied.has(m.version)) continue;
+    if (!applied.has(1)) {
       this.transaction(() => {
-        this.sqlite.exec(m.sql);
+        this.sqlite.exec(SCHEMA_MIGRATIONS[0].sql);
+        const now = Date.now();
         this.sqlite
           .prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
-          .run(m.version, Date.now());
+          .run(1, now);
+        this.sqlite
+          .prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+          .run(2, now);
       });
+    } else if (!applied.has(2)) {
+      this.sqlite.exec("PRAGMA foreign_keys = OFF;");
+      try {
+        this.transaction(() => {
+          this.sqlite.exec(`
+            CREATE TABLE conversations_v2 (
+              id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL CHECK(kind IN ('channel', 'dm', 'issue', 'merge_queue')),
+              name TEXT,
+              topic TEXT,
+              next_seq INTEGER NOT NULL DEFAULT 1,
+              created_at INTEGER NOT NULL
+            );
+            INSERT INTO conversations_v2 (id, kind, name, topic, next_seq, created_at)
+              SELECT id, kind, name, topic, next_seq, created_at FROM conversations;
+            DROP TABLE conversations;
+            ALTER TABLE conversations_v2 RENAME TO conversations;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_channel_name
+              ON conversations(name) WHERE kind = 'channel';
+
+            CREATE TABLE sessions_v2 (
+              id TEXT PRIMARY KEY,
+              bot_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              parent_session_id TEXT,
+              kind TEXT NOT NULL CHECK(kind IN ('orchestrator', 'worker', 'queue', 'reviewer')),
+              conversation_id TEXT,
+              thread_id TEXT,
+              title TEXT,
+              task TEXT,
+              status TEXT NOT NULL,
+              branch TEXT,
+              clone_path TEXT,
+              agent_dir TEXT,
+              pi_session_file TEXT,
+              last_entry_id TEXT,
+              last_report TEXT,
+              soul_snapshot TEXT,
+              token TEXT NOT NULL UNIQUE,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+            INSERT INTO sessions_v2 (
+              id, bot_id, parent_session_id, kind, conversation_id, thread_id, title, task, status,
+              branch, clone_path, agent_dir, pi_session_file, last_entry_id, last_report,
+              soul_snapshot, token, created_at, updated_at
+            )
+            SELECT
+              id, bot_id, parent_session_id, kind, conversation_id, thread_id, title, task, status,
+              branch, clone_path, agent_dir, pi_session_file, last_entry_id, last_report,
+              soul_snapshot, token, created_at, updated_at
+            FROM sessions;
+            DROP TABLE sessions;
+            ALTER TABLE sessions_v2 RENAME TO sessions;
+
+            CREATE TABLE lands_v2 (
+              id TEXT PRIMARY KEY,
+              session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+              conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+              thread_id TEXT,
+              message_id TEXT,
+              status TEXT NOT NULL CHECK(status IN ('requested', 'queued', 'rebasing', 'verifying', 'paused', 'landed', 'failed', 'removed')),
+              approved_by TEXT,
+              base_sha TEXT,
+              landed_sha TEXT,
+              verify_output TEXT,
+              error TEXT,
+              queue_position INTEGER,
+              issue_id TEXT,
+              pause_reason TEXT,
+              queue_session_id TEXT,
+              queue_thread_id TEXT,
+              trigger TEXT NOT NULL DEFAULT 'manual_approve',
+              checks_json TEXT,
+              touches_kawan INTEGER NOT NULL DEFAULT 0,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+            INSERT INTO lands_v2 (
+              id, session_id, conversation_id, thread_id, message_id, status, approved_by,
+              base_sha, landed_sha, verify_output, error, created_at, updated_at
+            )
+            SELECT
+              id, session_id, conversation_id, thread_id, message_id, status, approved_by,
+              base_sha, landed_sha, verify_output, error, created_at, updated_at
+            FROM lands;
+            DROP TABLE lands;
+            ALTER TABLE lands_v2 RENAME TO lands;
+          `);
+          this.sqlite
+            .prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+            .run(2, Date.now());
+        });
+      } finally {
+        this.sqlite.exec("PRAGMA foreign_keys = ON;");
+      }
     }
     const decCols = this.sqlite
       .prepare("PRAGMA table_info(decisions)")
       .all() as Array<{ name: string }>;
     if (!decCols.some((c) => c.name === "hold_expires_at")) {
       this.sqlite.exec("ALTER TABLE decisions ADD COLUMN hold_expires_at INTEGER");
+    }
+    if (!decCols.some((c) => c.name === "explicit_work_start")) {
+      this.sqlite.exec("ALTER TABLE decisions ADD COLUMN explicit_work_start TEXT");
+    }
+    if (!decCols.some((c) => c.name === "work_request")) {
+      this.sqlite.exec("ALTER TABLE decisions ADD COLUMN work_request TEXT");
     }
     const sessCols = this.sqlite
       .prepare("PRAGMA table_info(sessions)")
@@ -251,6 +365,21 @@ export class KawanDb {
       .all() as Array<{ name: string }>;
     if (!landCols.some((c) => c.name === "message_id")) {
       this.sqlite.exec("ALTER TABLE lands ADD COLUMN message_id TEXT");
+    }
+    const extraLandCols: Array<[string, string]> = [
+      ["queue_position", "INTEGER"],
+      ["issue_id", "TEXT"],
+      ["pause_reason", "TEXT"],
+      ["queue_session_id", "TEXT"],
+      ["queue_thread_id", "TEXT"],
+      ["trigger", "TEXT NOT NULL DEFAULT 'manual_approve'"],
+      ["checks_json", "TEXT"],
+      ["touches_kawan", "INTEGER NOT NULL DEFAULT 0"],
+    ];
+    for (const [col, def] of extraLandCols) {
+      if (!landCols.some((c) => c.name === col)) {
+        this.sqlite.exec(`ALTER TABLE lands ADD COLUMN ${col} ${def}`);
+      }
     }
     this.sqlite.exec(`
       CREATE TABLE IF NOT EXISTS read_cursors (
@@ -293,6 +422,7 @@ export class KawanDb {
     return {
       repo: parsed.repo,
       verify_command: parsed.verify_command,
+      merge_queue: parsed.merge_queue,
       providers: parsed.providers ?? {},
       roles: parsed.roles ?? {},
     };
@@ -519,10 +649,48 @@ export class KawanDb {
       .prepare(
         `SELECT DISTINCT c.* FROM conversations c
          LEFT JOIN members m ON m.conversation_id = c.id AND m.user_id = ?
-         WHERE c.kind = 'channel' OR m.user_id IS NOT NULL
+         WHERE c.kind IN ('channel', 'issue', 'merge_queue') OR m.user_id IS NOT NULL
          ORDER BY c.created_at ASC`,
       )
       .all(userId) as unknown as ConversationRow[];
+  }
+
+  getMergeQueueConversation(): ConversationRow | null {
+    return (
+      (this.sqlite
+        .prepare("SELECT * FROM conversations WHERE kind = 'merge_queue' ORDER BY created_at ASC LIMIT 1")
+        .get() as ConversationRow | undefined) ?? null
+    );
+  }
+
+  ensureMergeQueueConversation(memberIds: string[] = []): ConversationRow {
+    let conv = this.getMergeQueueConversation();
+    if (!conv) {
+      conv = this.createConversation({
+        kind: "merge_queue",
+        name: "merge-queue",
+        topic: "Serialized merge queue and conflict reconciliation",
+        memberIds,
+      });
+    } else {
+      for (const uid of memberIds) {
+        this.addMember(conv.id, uid);
+      }
+    }
+    return conv;
+  }
+
+  syncMergeQueueBotMember(convId: string, botId: string | null): void {
+    this.sqlite
+      .prepare(
+        `DELETE FROM members
+         WHERE conversation_id = ?
+           AND user_id IN (SELECT id FROM users WHERE kind = 'bot')`,
+      )
+      .run(convId);
+    if (botId) {
+      this.addMember(convId, botId);
+    }
   }
 
   addMember(conversationId: string, userId: string): boolean {
@@ -633,6 +801,8 @@ export class KawanDb {
     heldBatchId?: string | null;
     dispatched?: boolean;
     holdExpiresAt?: number | null;
+    explicitWorkStart?: string | null;
+    workRequest?: string | null;
   }): DecisionRow {
     const id = input.id ?? randomUUID();
     const now = Date.now();
@@ -640,8 +810,9 @@ export class KawanDb {
       .prepare(
         `INSERT INTO decisions (
           id, conversation_id, message_id, bot_id, decision_type, destination,
-          readiness, confidence, reason, raw_json, held_batch_id, dispatched, hold_expires_at, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          readiness, confidence, reason, raw_json, held_batch_id, dispatched,
+          hold_expires_at, explicit_work_start, work_request, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -657,6 +828,8 @@ export class KawanDb {
         input.heldBatchId ?? null,
         input.dispatched ? 1 : 0,
         input.holdExpiresAt ?? null,
+        input.explicitWorkStart ?? null,
+        input.workRequest ?? null,
         now,
       );
     return this.getDecision(id)!;
@@ -868,7 +1041,7 @@ export class KawanDb {
         .prepare(
           `SELECT * FROM sessions
            WHERE bot_id = ? AND kind = 'worker' AND conversation_id = ?
-             AND status NOT IN ('landed', 'archived', 'stopped')
+             AND status NOT IN ('pending_approval', 'landed', 'archived', 'stopped')
            ORDER BY created_at ASC`,
         )
         .all(botId, conversationId) as unknown as SessionRow[];
@@ -877,7 +1050,7 @@ export class KawanDb {
       .prepare(
         `SELECT * FROM sessions
          WHERE bot_id = ? AND kind = 'worker'
-           AND status NOT IN ('landed', 'archived', 'stopped')
+           AND status NOT IN ('pending_approval', 'landed', 'archived', 'stopped')
          ORDER BY created_at ASC`,
       )
       .all(botId) as unknown as SessionRow[];
@@ -887,6 +1060,8 @@ export class KawanDb {
     id: string,
     patch: Partial<{
       status: SessionStatus;
+      title: string | null;
+      task: string | null;
       branch: string | null;
       clone_path: string | null;
       agent_dir: string | null;
@@ -902,12 +1077,14 @@ export class KawanDb {
     this.sqlite
       .prepare(
         `UPDATE sessions SET
-          status = ?, branch = ?, clone_path = ?, agent_dir = ?, pi_session_file = ?,
+          status = ?, title = ?, task = ?, branch = ?, clone_path = ?, agent_dir = ?, pi_session_file = ?,
           last_entry_id = ?, last_report = ?, conversation_id = ?, thread_id = ?, updated_at = ?
         WHERE id = ?`,
       )
       .run(
         patch.status ?? existing.status,
+        patch.title !== undefined ? patch.title : existing.title,
+        patch.task !== undefined ? patch.task : existing.task,
         patch.branch !== undefined ? patch.branch : existing.branch,
         patch.clone_path !== undefined ? patch.clone_path : existing.clone_path,
         patch.agent_dir !== undefined ? patch.agent_dir : existing.agent_dir,
@@ -1020,16 +1197,28 @@ export class KawanDb {
     conversationId: string;
     threadId?: string | null;
     messageId?: string | null;
+    issueId?: string | null;
+    trigger?: string;
   }): LandRow {
     const id = input.id ?? randomUUID();
     const now = Date.now();
     this.sqlite
       .prepare(
         `INSERT INTO lands (
-          id, session_id, conversation_id, thread_id, message_id, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, 'requested', ?, ?)`,
+          id, session_id, conversation_id, thread_id, message_id, issue_id, trigger, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?)`,
       )
-      .run(id, input.sessionId, input.conversationId, input.threadId ?? null, input.messageId ?? null, now, now);
+      .run(
+        id,
+        input.sessionId,
+        input.conversationId,
+        input.threadId ?? null,
+        input.messageId ?? null,
+        input.issueId ?? null,
+        input.trigger ?? "manual_approve",
+        now,
+        now,
+      );
     return this.getLand(id)!;
   }
 
@@ -1039,7 +1228,7 @@ export class KawanDb {
     );
   }
 
-  listLands(filter?: { sessionId?: string; conversationId?: string }): LandRow[] {
+  listLands(filter?: { sessionId?: string; conversationId?: string; issueId?: string }): LandRow[] {
     if (filter?.sessionId) {
       return this.sqlite
         .prepare("SELECT * FROM lands WHERE session_id = ? ORDER BY created_at ASC")
@@ -1050,19 +1239,50 @@ export class KawanDb {
         .prepare("SELECT * FROM lands WHERE conversation_id = ? ORDER BY created_at ASC")
         .all(filter.conversationId) as unknown as LandRow[];
     }
+    if (filter?.issueId) {
+      return this.sqlite
+        .prepare("SELECT * FROM lands WHERE issue_id = ? ORDER BY created_at ASC")
+        .all(filter.issueId) as unknown as LandRow[];
+    }
     return this.sqlite.prepare("SELECT * FROM lands ORDER BY created_at ASC").all() as unknown as LandRow[];
+  }
+
+  nextQueuePosition(): number {
+    const row = this.sqlite
+      .prepare("SELECT COALESCE(MAX(queue_position), 0) + 1 AS next_pos FROM lands")
+      .get() as { next_pos: number };
+    return row.next_pos;
+  }
+
+  listQueuedLands(): LandRow[] {
+    return this.sqlite
+      .prepare(
+        `SELECT * FROM lands
+         WHERE status IN ('queued', 'rebasing', 'verifying', 'paused')
+         ORDER BY COALESCE(queue_position, 999999) ASC, created_at ASC`,
+      )
+      .all() as unknown as LandRow[];
   }
 
   updateLand(
     id: string,
     patch: Partial<{
       status: LandStatus;
+      thread_id: string | null;
       message_id: string | null;
       approved_by: string | null;
       base_sha: string | null;
       landed_sha: string | null;
       verify_output: string | null;
       error: string | null;
+      queue_position: number | null;
+      issue_id: string | null;
+      pause_reason: string | null;
+      queue_session_id: string | null;
+      queue_thread_id: string | null;
+      trigger: string;
+      checks_json: string | null;
+      touches_kawan: number;
     }>,
   ): LandRow | null {
     const existing = this.getLand(id);
@@ -1070,17 +1290,29 @@ export class KawanDb {
     this.sqlite
       .prepare(
         `UPDATE lands SET
-          status = ?, message_id = ?, approved_by = ?, base_sha = ?, landed_sha = ?, verify_output = ?, error = ?, updated_at = ?
+          status = ?, thread_id = ?, message_id = ?, approved_by = ?, base_sha = ?, landed_sha = ?,
+          verify_output = ?, error = ?, queue_position = ?, issue_id = ?, pause_reason = ?,
+          queue_session_id = ?, queue_thread_id = ?, trigger = ?, checks_json = ?, touches_kawan = ?,
+          updated_at = ?
         WHERE id = ?`,
       )
       .run(
         patch.status ?? existing.status,
+        patch.thread_id !== undefined ? patch.thread_id : existing.thread_id,
         patch.message_id !== undefined ? patch.message_id : existing.message_id,
         patch.approved_by !== undefined ? patch.approved_by : existing.approved_by,
         patch.base_sha !== undefined ? patch.base_sha : existing.base_sha,
         patch.landed_sha !== undefined ? patch.landed_sha : existing.landed_sha,
         patch.verify_output !== undefined ? patch.verify_output : existing.verify_output,
         patch.error !== undefined ? patch.error : existing.error,
+        patch.queue_position !== undefined ? patch.queue_position : existing.queue_position,
+        patch.issue_id !== undefined ? patch.issue_id : existing.issue_id,
+        patch.pause_reason !== undefined ? patch.pause_reason : existing.pause_reason,
+        patch.queue_session_id !== undefined ? patch.queue_session_id : existing.queue_session_id,
+        patch.queue_thread_id !== undefined ? patch.queue_thread_id : existing.queue_thread_id,
+        patch.trigger ?? existing.trigger ?? "manual_approve",
+        patch.checks_json !== undefined ? patch.checks_json : existing.checks_json,
+        patch.touches_kawan !== undefined ? patch.touches_kawan : existing.touches_kawan ?? 0,
         Date.now(),
         id,
       );

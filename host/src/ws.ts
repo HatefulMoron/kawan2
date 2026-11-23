@@ -10,6 +10,7 @@ import {
 } from "./auth.js";
 import type { KawanDb } from "./db.js";
 import type { ClientRequest, ConversationRow, UserRow, WsEventFrame, WsResponseFrame } from "./types.js";
+import { serializeLand } from "./types.js";
 
 type PendingAuth =
   | {
@@ -184,7 +185,7 @@ export class KawanWsServer {
   }
 
   broadcastToConversation(conversation: ConversationRow, frame: WsEventFrame): void {
-    if (conversation.kind === "channel") {
+    if (conversation.kind !== "dm") {
       this.broadcast(frame);
       return;
     }
@@ -396,6 +397,7 @@ export class KawanWsServer {
                 topic: "General project conversation",
                 memberIds: [created.id],
               });
+              this.opts.db.ensureMergeQueueConversation([created.id]);
               return created;
             });
           } else if (pending.kind === "register") {
@@ -625,7 +627,7 @@ export class KawanWsServer {
           return pub;
         });
         const artifacts = db.listArtifacts({ conversationId: convId });
-        const lands = db.listLands({ conversationId: convId });
+        const lands = db.listLands({ conversationId: convId }).map(serializeLand);
         return {
           conversation: {
             ...conv,
@@ -680,7 +682,9 @@ export class KawanWsServer {
         if (!body.trim()) throw new Error("Message body cannot be empty");
         const conv = db.getConversation(convId);
         if (!conv) throw new Error(`Conversation not found: ${convId}`);
-        if (!db.isMember(convId, user.id)) {
+        if (conv.kind === "merge_queue" || conv.kind === "issue") {
+          db.addMember(convId, user.id);
+        } else if (!db.isMember(convId, user.id)) {
           throw new Error("You must be a member of this conversation to send messages");
         }
         if (threadId) {

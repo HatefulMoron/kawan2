@@ -40,6 +40,8 @@ export interface RouteMessageInput {
 export interface RouteMessageResult {
   destination: string;
   readiness: DecisionReadiness;
+  explicitWorkStart: "yes" | "no";
+  workRequest: "yes" | "no";
   confidence: number;
   reason: string;
   rawJson: string;
@@ -354,6 +356,24 @@ export function buildRouteMessagePayload(input: {
           "An incomplete bare ping or dangling lead-in addressed to the bot (like '@bot hey' or '@bot quick question') where the user clearly hasn't sent their actual message yet.",
       },
     },
+    explicit_work_start: {
+      type: "choice",
+      instructions:
+        "Decide whether incoming_message is a direct, unambiguous instruction telling the bot to begin implementing, editing, or modifying the repository right now (such as '@bot fix the flaky header test', '@bot please add hello.txt and commit it', or '@bot go ahead and add that flag'). Choose 'no' for questions, status checks, brainstorming, hypotheticals, greetings, or indirect remarks lacking a clear imperative to start work now. If destination is none, choose 'no'.",
+      criteria: {
+        yes: "Direct, explicit imperative or clear go-ahead telling the bot to start repository changes right now.",
+        no: "Anything not explicitly commanding the bot to start work now (questions, brainstorming, hypotheticals, indirect observations, greetings, or destination=none).",
+      },
+    },
+    work_request: {
+      type: "choice",
+      instructions:
+        "Decide strictly whether incoming_message is asking or expecting the bot to take on a concrete repository task right now (either explicitly OR phrased politely/indirectly, such as '@bot the CI build is flaky, could you take a look?' or '@bot this button looks broken'). MUST be 'no' for questions about how code works, status queries, greetings ('what's up?'), brainstorming, future possibilities, or hypotheticals ('what would it take to...', 'should we eventually...', 'what do you think about...'). If destination is none, choose 'no'.",
+      criteria: {
+        yes: "User is asking or expecting the bot to perform a concrete repository task or fix right now (explicitly or politely/indirectly).",
+        no: "Questions, status checks, brainstorming, hypotheticals, social chat, human-to-human discussion, or anything without a request to perform concrete work.",
+      },
+    },
   };
 
   return { model: input.model, state, questions };
@@ -405,12 +425,20 @@ export async function routeMessage(input: RouteMessageInput): Promise<RouteMessa
   const destination = destAns.choice;
   const readiness: DecisionReadiness =
     destination === "none" ? "dispatch" : readyAns.choice === "hold" ? "hold" : "dispatch";
+  const rawExplicit = response.answers?.explicit_work_start?.choice;
+  const rawWorkReq = response.answers?.work_request?.choice;
+  const explicitWorkStart: "yes" | "no" =
+    destination !== "none" && rawExplicit === "yes" ? "yes" : "no";
+  const workRequest: "yes" | "no" =
+    destination !== "none" && (explicitWorkStart === "yes" || rawWorkReq === "yes") ? "yes" : "no";
   const confidence = Number(destAns.confidence ?? 0);
-  const reason = `destination=${destination} (${(confidence * 100).toFixed(0)}%), readiness=${readiness} (${(Number(readyAns.confidence ?? 0) * 100).toFixed(0)}%)`;
+  const reason = `destination=${destination} (${(confidence * 100).toFixed(0)}%), readiness=${readiness} (${(Number(readyAns.confidence ?? 0) * 100).toFixed(0)}%), explicit=${explicitWorkStart}, request=${workRequest}`;
 
   return {
     destination,
     readiness,
+    explicitWorkStart,
+    workRequest,
     confidence,
     reason,
     rawJson: JSON.stringify(response),
@@ -435,7 +463,9 @@ export async function testDecisionModel(
     const res = await callSystemOne(config, payload);
     const dest = res.answers?.destination?.choice;
     const ready = res.answers?.readiness?.choice;
-    if (!dest || !ready) {
+    const explicitStart = res.answers?.explicit_work_start?.choice;
+    const workReq = res.answers?.work_request?.choice;
+    if (!dest || !ready || !explicitStart || !workReq) {
       return {
         ok: false,
         latency_ms: Date.now() - start,

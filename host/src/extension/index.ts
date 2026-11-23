@@ -298,6 +298,44 @@ export default function (pi: ExtensionAPI) {
         }
       },
     });
+  } else if (role === "queue") {
+    pi.registerTool({
+      name: "resume_and_land",
+      label: "Resume and Land",
+      description:
+        "Re-run repository verification checks in the landing clone and fast-forward onto the default branch after reconciliation.",
+      parameters: Type.Object({
+        summary: Type.Optional(
+          Type.String({ description: "Short human-friendly note of how the conflict or failure was reconciled" }),
+        ),
+      }),
+      async execute(_toolCallId, params) {
+        try {
+          const res = await callHost("resume_and_land", { summary: params.summary ?? "" });
+          return textResult(res);
+        } catch (err) {
+          return textResult(err instanceof Error ? err.message : String(err), true);
+        }
+      },
+    });
+
+    pi.registerTool({
+      name: "eject_to_implementer",
+      label: "Eject to Implementer",
+      description:
+        "Return the paused branch to the implementer with an explanation and unpause the merge queue.",
+      parameters: Type.Object({
+        reason: Type.String({ description: "Clear explanation of what needs to be fixed on the branch" }),
+      }),
+      async execute(_toolCallId, params) {
+        try {
+          const res = await callHost("eject_to_implementer", { reason: params.reason });
+          return textResult(res);
+        } catch (err) {
+          return textResult(err instanceof Error ? err.message : String(err), true);
+        }
+      },
+    });
   } else {
     pi.registerTool({
       name: "land_request",

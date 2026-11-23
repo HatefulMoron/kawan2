@@ -58,6 +58,8 @@ export async function startStubProvider(): Promise<StubProviderServer> {
         answers: {
           destination: { type: "choice", choice: "orchestrator", confidence: 0.99, probabilities: { orchestrator: 0.99, none: 0.01 } },
           readiness: { type: "choice", choice: "dispatch", confidence: 0.99, probabilities: { dispatch: 0.99, hold: 0.01 } },
+          explicit_work_start: { type: "choice", choice: "yes", confidence: 0.99, probabilities: { yes: 0.99, no: 0.01 } },
+          work_request: { type: "choice", choice: "yes", confidence: 0.99, probabilities: { yes: 0.99, no: 0.01 } },
         },
       },
     });
@@ -235,7 +237,10 @@ export async function startStubProvider(): Promise<StubProviderServer> {
       sysOneHandler = h;
     },
     close() {
-      return new Promise((resolve) => server.close(() => resolve()));
+      return new Promise((resolve) => {
+        server.close(() => resolve());
+        server.closeAllConnections?.();
+      });
     },
   };
 }

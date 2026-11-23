@@ -26,7 +26,12 @@ interface RoutingCase {
     matchesThreadSessionId?: string;
     body: string;
   };
-  expected: { destination: string; readiness: "dispatch" | "hold" };
+  expected: {
+    destination: string;
+    readiness: "dispatch" | "hold";
+    explicit_work_start?: "yes" | "no";
+    work_request?: "yes" | "no";
+  };
 }
 
 async function main(): Promise<void> {
@@ -53,6 +58,10 @@ async function main(): Promise<void> {
 
   let destMatches = 0;
   let readyMatches = 0;
+  let explicitMatches = 0;
+  let explicitTotal = 0;
+  let requestMatches = 0;
+  let requestTotal = 0;
   let exactMatches = 0;
   const disagreements: string[] = [];
 
@@ -167,13 +176,26 @@ async function main(): Promise<void> {
 
     const dOk = result.destination === c.expected.destination;
     const rOk = result.readiness === c.expected.readiness;
+    const eOk =
+      !c.expected.explicit_work_start ||
+      result.explicitWorkStart === c.expected.explicit_work_start;
+    const wOk =
+      !c.expected.work_request || result.workRequest === c.expected.work_request;
     if (dOk) destMatches += 1;
     if (rOk) readyMatches += 1;
-    if (dOk && rOk) {
+    if (c.expected.explicit_work_start) {
+      explicitTotal += 1;
+      if (eOk) explicitMatches += 1;
+    }
+    if (c.expected.work_request) {
+      requestTotal += 1;
+      if (wOk) requestMatches += 1;
+    }
+    if (dOk && rOk && eOk && wOk) {
       exactMatches += 1;
     } else {
       disagreements.push(
-        `  - ${c.id}: expected (${c.expected.destination}, ${c.expected.readiness}), got (${result.destination}, ${result.readiness}) [${result.reason}]`,
+        `  - ${c.id}: expected (dest=${c.expected.destination}, ready=${c.expected.readiness}, explicit=${c.expected.explicit_work_start ?? "*"}, req=${c.expected.work_request ?? "*"}), got (dest=${result.destination}, ready=${result.readiness}, explicit=${result.explicitWorkStart}, req=${result.workRequest}) [${result.reason}]`,
       );
     }
   }
@@ -182,7 +204,8 @@ async function main(): Promise<void> {
   const accuracy = (exactMatches / total) * 100;
   console.log(
     `Routing harness (${mode}): ${exactMatches}/${total} exact (${accuracy.toFixed(1)}%), ` +
-      `destination ${destMatches}/${total}, readiness ${readyMatches}/${total}`,
+      `destination ${destMatches}/${total}, readiness ${readyMatches}/${total}, ` +
+      `explicit ${explicitMatches}/${explicitTotal}, work_request ${requestMatches}/${requestTotal}`,
   );
   if (disagreements.length > 0) {
     console.log("Disagreements:\n" + disagreements.join("\n"));

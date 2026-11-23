@@ -88,12 +88,15 @@ fn main_status_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -
     for sess in &workers {
         let land = app.land_for_session(&sess.id);
         let land_status = land.map(|l| l.status.as_str());
-        if land_status == Some("failed")
+        if matches!(land_status, Some("failed" | "paused"))
             || (sess.status == "failed" && land_status != Some("landed"))
+            || sess.status == "pending_approval"
         {
             needs_you.push((sess, land));
-        } else if matches!(land_status, Some("requested" | "verifying"))
-            || (sess.status == "review_requested" && land_status != Some("landed"))
+        } else if matches!(
+            land_status,
+            Some("requested" | "queued" | "rebasing" | "verifying")
+        ) || (sess.status == "review_requested" && land_status != Some("landed"))
         {
             waiting.push((sess, land));
         } else if matches!(sess.status.as_str(), "running" | "idle")
@@ -216,6 +219,59 @@ fn main_status_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -
                 )),
         );
     }
+
+    let (mq_summary, mq_color) = match &app.merge_queue {
+        Some(q) if q.settings.paused || q.paused_land.is_some() => {
+            let head_title = q
+                .head
+                .as_ref()
+                .and_then(|h| app.sessions_by_id.get(&h.session_id))
+                .map(session_display_title)
+                .unwrap_or_else(|| "head item".to_string());
+            (
+                format!("Paused on #1 · {head_title} ({} queued)", q.queued.len()),
+                theme::CATEGORY_VALS,
+            )
+        }
+        Some(q) if !q.queued.is_empty() => (
+            format!("Running · {} queued", q.queued.len()),
+            theme::CATEGORY_INDUSTRY,
+        ),
+        _ => ("Idle · 0 queued".to_string(), 0x284D32),
+    };
+
+    inner = inner.child(
+        div()
+            .w_full()
+            .px(px(14.0))
+            .py(px(9.0))
+            .rounded(px(2.0))
+            .border_1()
+            .border_color(theme.border_subtle)
+            .bg(theme.strip)
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(kit::swatch(theme::hex(mq_color), px(6.0)))
+                    .child(theme::micro("MERGE QUEUE", 9.0, theme.dark))
+                    .child(theme::body(mq_summary, 12.5, theme.fg_secondary)),
+            )
+            .child(
+                kit::secondary_button("status-open-mq", "Open Merge Queue →", theme).on_click(
+                    cx.listener(|this, _, window, cx| {
+                        this.open_merge_queue();
+                        window.focus(&this.focus_handle, cx);
+                        cx.notify();
+                    }),
+                ),
+            ),
+    );
 
     if !needs_you.is_empty() {
         inner = inner.child(status_section(
@@ -555,21 +611,71 @@ fn status_task_card(
             )),
         );
 
-    let approve_el: Option<AnyElement> = land.and_then(|l| {
+    let sid_confirm = sess.id.clone();
+    let sid_dismiss = sess.id.clone();
+    let action_area: AnyElement = if sess.status == "pending_approval" {
+        let confirm_id = if prefix == "st-needs" {
+            ("st-needs-start", idx)
+        } else {
+            ("st-wait-start", idx)
+        };
+        let dismiss_id = if prefix == "st-needs" {
+            ("st-needs-dismiss", idx)
+        } else {
+            ("st-wait-dismiss", idx)
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .child(
+                kit::ghost_button(dismiss_id, "Dismiss", theme).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.dismiss_session(&sid_dismiss);
+                        cx.notify();
+                    },
+                )),
+            )
+            .child(
+                kit::small_primary_button(confirm_id, "Start", theme).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.confirm_session(&sid_confirm);
+                        cx.notify();
+                    },
+                )),
+            )
+            .into_any_element()
+    } else if let Some(l) = land {
         if l.status == "requested" || l.status == "failed" {
             let lid = l.id.clone();
-            Some(
-                kit::small_primary_button(approve_btn_id, "Approve Land", theme)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.approve_land(&lid);
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-            )
+            kit::small_primary_button(approve_btn_id, "Approve Land", theme)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.approve_land(&lid);
+                    cx.notify();
+                }))
+                .into_any_element()
+        } else if l.status == "paused" {
+            kit::small_primary_button(approve_btn_id, "Open in Merge Queue →", theme)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_merge_queue();
+                    window.focus(&this.focus_handle, cx);
+                    cx.notify();
+                }))
+                .into_any_element()
+        } else if matches!(l.status.as_str(), "queued" | "rebasing" | "verifying") {
+            kit::ghost_button(approve_btn_id, "Merge Queue", theme)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_merge_queue();
+                    window.focus(&this.focus_handle, cx);
+                    cx.notify();
+                }))
+                .into_any_element()
         } else {
-            None
+            div().into_any_element()
         }
-    });
+    } else {
+        div().into_any_element()
+    };
 
     card.child(
         div()
@@ -584,7 +690,7 @@ fn status_task_card(
             .justify_between()
             .gap(px(8.0))
             .child(left_actions)
-            .children(approve_el),
+            .child(action_area),
     )
     .into_any_element()
 }
@@ -601,6 +707,8 @@ fn status_in_flight_row(
     let bot_name = format!("@{}", app.actor_name(&sess.bot_id));
     let sid_changes = sess.id.clone();
     let sid_inspect = sess.id.clone();
+    let sid_stop = sess.id.clone();
+    let is_running = sess.status == "running";
 
     let mut actions = div().flex().items_center().gap(px(6.0));
     if let Some(chip) = origin_chip(
@@ -612,6 +720,16 @@ fn status_in_flight_row(
         cx,
     ) {
         actions = actions.child(chip);
+    }
+    if is_running {
+        actions = actions.child(
+            kit::ghost_button(("st-flight-stop", idx), "Stop", theme).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.stop_session(&sid_stop);
+                    cx.notify();
+                },
+            )),
+        );
     }
     actions = actions
         .child(

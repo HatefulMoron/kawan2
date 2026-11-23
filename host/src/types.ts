@@ -1,10 +1,11 @@
 export type UserKind = "human" | "bot";
 export type UserRole = "admin" | "member";
-export type ConversationKind = "channel" | "dm";
+export type ConversationKind = "channel" | "dm" | "issue" | "merge_queue";
 export type DecisionReadiness = "dispatch" | "hold";
-export type SessionKind = "orchestrator" | "worker";
+export type SessionKind = "orchestrator" | "worker" | "queue" | "reviewer";
 export type SessionStatus =
   | "not_started"
+  | "pending_approval"
   | "running"
   | "idle"
   | "review_requested"
@@ -12,7 +13,17 @@ export type SessionStatus =
   | "failed"
   | "archived"
   | "stopped";
-export type LandStatus = "requested" | "verifying" | "landed" | "failed";
+export type LandStatus =
+  | "requested"
+  | "queued"
+  | "rebasing"
+  | "verifying"
+  | "paused"
+  | "landed"
+  | "failed"
+  | "removed";
+export type MergeConflictPolicy = "pause_on_issue" | "auto_resolve_trivial";
+export type LandingMode = "manual" | "auto";
 
 export interface UserRow {
   id: string;
@@ -90,6 +101,8 @@ export interface DecisionRow {
   redirected_from: string | null;
   redirected_by: string | null;
   hold_expires_at: number | null;
+  explicit_work_start?: string | null;
+  work_request?: string | null;
   created_at: number;
 }
 
@@ -137,6 +150,23 @@ export interface SoulRow {
   created_at: number;
 }
 
+export interface CheckRunItem {
+  name: string;
+  ok: boolean;
+  exit_code: number | null;
+  duration_ms: number;
+  output: string;
+  artifact_id?: string | null;
+}
+
+export interface RepoCheckResult {
+  ok: boolean;
+  source: "kawan_checks" | "kawan_ci" | "verify_command";
+  checks: CheckRunItem[];
+  summary: string;
+  combined_output: string;
+}
+
 export interface LandRow {
   id: string;
   session_id: string;
@@ -149,8 +179,38 @@ export interface LandRow {
   landed_sha: string | null;
   verify_output: string | null;
   error: string | null;
+  queue_position: number | null;
+  issue_id: string | null;
+  pause_reason: string | null;
+  queue_session_id: string | null;
+  queue_thread_id: string | null;
+  trigger: string;
+  checks_json: string | null;
+  touches_kawan: number;
   created_at: number;
   updated_at: number;
+}
+
+export interface SerializedLand extends Omit<LandRow, "touches_kawan"> {
+  checks: CheckRunItem[];
+  touches_kawan: boolean;
+}
+
+export function serializeLand(land: LandRow): SerializedLand {
+  let checks: CheckRunItem[] = [];
+  if (land.checks_json) {
+    try {
+      const parsed = JSON.parse(land.checks_json);
+      if (Array.isArray(parsed)) checks = parsed as CheckRunItem[];
+    } catch {
+      checks = [];
+    }
+  }
+  return {
+    ...land,
+    checks,
+    touches_kawan: Boolean(land.touches_kawan),
+  };
 }
 
 export interface RepoSettings {
@@ -200,9 +260,17 @@ export interface DefaultRoleSettings {
   thinking_level?: string;
 }
 
+export interface MergeQueueSettings {
+  bot_id?: string | null;
+  default_landing_mode?: LandingMode;
+  conflict_policy?: MergeConflictPolicy;
+  paused?: boolean;
+}
+
 export interface HostSettings {
   repo?: RepoSettings;
   verify_command?: string;
+  merge_queue?: MergeQueueSettings;
   providers: Record<string, ProviderSettings>;
   roles: {
     default?: DefaultRoleSettings;

@@ -27,7 +27,13 @@ import type {
   SessionRow,
   UserRow,
 } from "./types.js";
+import { serializeLand } from "./types.js";
 import type { KawanWsServer } from "./ws.js";
+
+export interface QueueToolHandlers {
+  resumeAndLand(session: SessionRow, summary?: string): Promise<unknown>;
+  ejectToImplementer(session: SessionRow, reason: string): Promise<unknown>;
+}
 
 const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
 const EXTENSION_ENTRY_PATH = resolve(
@@ -346,9 +352,14 @@ export class SessionManager {
   private readonly wsServer: KawanWsServer;
   private readonly disableSandbox: boolean;
   private readonly soulHandlers?: SoulHandlers;
+  private queueHandlers?: QueueToolHandlers;
   private socketServer: NetServer | null = null;
   private processes = new Map<string, PiRpcProcess>();
   private orchQueues = new Map<string, Promise<void>>();
+  private queueTurnChains = new Map<string, Promise<void>>();
+  private pendingDismissNotes = new Map<string, string[]>();
+  private closed = false;
+  private stopAfterTurn = new Set<string>();
   private activeContexts = new Map<
     string,
     {
@@ -356,8 +367,10 @@ export class SessionManager {
       threadId: string | null;
       triggerMessageId?: string | null;
       spawnedThreadId?: string | null;
+      spawnedSessionId?: string | null;
       reportedInTurn: boolean;
       sourceWorkerId?: string | null;
+      spawnIntent?: { explicitWorkStart: "yes" | "no"; workRequest: "yes" | "no" };
     }
   >();
   private workerRuns = new Map<string, Promise<void>>();
@@ -387,9 +400,15 @@ export class SessionManager {
   }
 
   async stopAll(): Promise<void> {
+    this.closed = true;
     const procs = [...this.processes.values()];
     this.processes.clear();
     await Promise.all(procs.map((p) => p.stop()));
+    await Promise.allSettled([
+      ...this.orchQueues.values(),
+      ...this.queueTurnChains.values(),
+      ...this.workerRuns.values(),
+    ]);
     if (this.socketServer) {
       await new Promise<void>((resolvePromise) => {
         this.socketServer!.close(() => resolvePromise());
@@ -399,6 +418,55 @@ export class SessionManager {
     rmSync(this.socketPath, { force: true });
   }
 
+  setQueueHandlers(handlers: QueueToolHandlers): void {
+    this.queueHandlers = handlers;
+  }
+
+  markStopAfterTurn(sessionId: string): void {
+    this.stopAfterTurn.add(sessionId);
+    const ctx = this.activeContexts.get(sessionId);
+    if (ctx) {
+      ctx.reportedInTurn = true;
+    }
+  }
+
+  serializePublicSession(session: SessionRow): Omit<SessionRow, "token"> {
+    return serializeSession(session);
+  }
+
+  createTextArtifact(input: {
+    content: string;
+    filename: string;
+    mimeType?: string;
+    sessionId?: string | null;
+    conversationId?: string | null;
+    messageId?: string | null;
+  }): ArtifactRow {
+    const bytes = Buffer.from(input.content, "utf8");
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    const artifactPath = join(this.dataDir, "artifacts", sha256);
+    if (!existsSync(artifactPath)) {
+      writeFileSync(artifactPath, bytes, { mode: 0o644 });
+    }
+    return this.db.createArtifact({
+      sha256,
+      mimeType: input.mimeType ?? (input.filename.endsWith(".md") ? "text/markdown" : "text/plain"),
+      byteSize: bytes.byteLength,
+      filename: input.filename,
+      sessionId: input.sessionId ?? null,
+      conversationId: input.conversationId ?? null,
+      messageId: input.messageId ?? null,
+    });
+  }
+
+  async stopProcessOnly(sessionId: string): Promise<void> {
+    const proc = this.processes.get(sessionId);
+    if (proc) {
+      this.processes.delete(sessionId);
+      await proc.stop();
+    }
+  }
+
   async stopSession(sessionId: string): Promise<void> {
     const proc = this.processes.get(sessionId);
     if (proc) {
@@ -406,7 +474,12 @@ export class SessionManager {
       await proc.stop();
     }
     const existing = this.db.getSession(sessionId);
-    if (existing && (existing.status === "running" || existing.status === "idle")) {
+    if (
+      existing &&
+      (existing.status === "running" ||
+        existing.status === "idle" ||
+        existing.status === "pending_approval")
+    ) {
       const updated = this.db.updateSession(sessionId, { status: "stopped" })!;
       this.wsServer.broadcast({ type: "session.update", session: serializeSession(updated) });
     }
@@ -419,6 +492,9 @@ export class SessionManager {
 
   private handleUnixConnection(conn: Socket): void {
     let buf = Buffer.alloc(0);
+    conn.on("error", () => {
+      // Ignore abrupt ECONNRESET/EPIPE when a child pi process exits mid-request
+    });
     conn.on("data", (chunk: Buffer) => {
       buf = Buffer.concat([buf, chunk]);
       while (true) {
@@ -434,11 +510,16 @@ export class SessionManager {
   }
 
   private async handleUnixLine(conn: Socket, line: string): Promise<void> {
+    const safeWrite = (payload: unknown) => {
+      if (!conn.destroyed && conn.writable) {
+        conn.write(`${JSON.stringify(payload)}\n`);
+      }
+    };
     let req: { id?: string; token?: string; tool?: string; params?: Record<string, unknown> };
     try {
       req = JSON.parse(line);
     } catch {
-      conn.write(`${JSON.stringify({ ok: false, error: "Invalid JSON" })}\n`);
+      safeWrite({ ok: false, error: "Invalid JSON" });
       return;
     }
 
@@ -448,15 +529,13 @@ export class SessionManager {
       const session = this.db.getSessionByToken(req.token);
       if (!session) throw new Error("Invalid session token");
       const result = await this.executeHostTool(session, req.tool ?? "", req.params ?? {});
-      conn.write(`${JSON.stringify({ id, ok: true, result })}\n`);
+      safeWrite({ id, ok: true, result });
     } catch (err) {
-      conn.write(
-        `${JSON.stringify({
-          id,
-          ok: false,
-          error: err instanceof Error ? err.message : String(err),
-        })}\n`,
-      );
+      safeWrite({
+        id,
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -551,6 +630,29 @@ export class SessionManager {
         }
         const summary = typeof params.summary === "string" ? params.summary : "";
         return await this.handleLandRequest(session, summary);
+      }
+
+      case "resume_and_land": {
+        if (session.kind !== "queue") {
+          throw new Error("Only merge queue sessions can call resume_and_land");
+        }
+        if (!this.queueHandlers) {
+          throw new Error("Merge queue handlers are not registered");
+        }
+        const summary = typeof params.summary === "string" ? params.summary : undefined;
+        return await this.queueHandlers.resumeAndLand(session, summary);
+      }
+
+      case "eject_to_implementer": {
+        if (session.kind !== "queue") {
+          throw new Error("Only merge queue sessions can call eject_to_implementer");
+        }
+        if (!this.queueHandlers) {
+          throw new Error("Merge queue handlers are not registered");
+        }
+        const reason = typeof params.reason === "string" ? params.reason.trim() : "";
+        if (!reason) throw new Error("reason is required");
+        return await this.queueHandlers.ejectToImplementer(session, reason);
       }
 
       case "soul_replace": {
@@ -650,6 +752,10 @@ export class SessionManager {
 
     const proc = new PiRpcProcess(spec);
     await proc.start();
+    if (this.closed) {
+      await proc.stop();
+      throw new Error("Host is shutting down");
+    }
     this.processes.set(session.id, proc);
 
     try {
@@ -665,15 +771,41 @@ export class SessionManager {
     return proc;
   }
 
+  private buildQueueSystemPrompt(bot: UserRow, taskTitle: string): string {
+    return [
+      `You are ${bot.name}, acting as the Merge Queue Bot for "${taskTitle}".`,
+      "You run inside the isolated landing clone after an attempted rebase onto the default branch.",
+      "Your messages go ONLY to #merge-queue (inside the active incident thread).",
+      "Tools:",
+      "- bash/read/edit/write to inspect conflicts or fix broken checks in this landing clone.",
+      "- report(text, artifact?): post updates into the #merge-queue incident thread.",
+      "- resume_and_land(summary?): re-run repository checks in this clone and fast-forward onto the default branch.",
+      "- eject_to_implementer(reason): return the change to the implementer worker and unpause the queue for later items.",
+      "Rules:",
+      "- Under policy 'pause_on_issue', diagnose the conflict or failing check concisely (2-4 sentences) and wait for human guidance before altering code or calling resume_and_land.",
+      "- Under policy 'auto_resolve_trivial', only auto-resolve small, unambiguous merge conflicts; otherwise pause and ask humans in this thread.",
+    ].join("\n");
+  }
+
   async dispatch(params: {
     bot: UserRow;
     destination: string;
     conversation: ConversationRow;
     threadId: string | null;
     messages: MessageRow[];
+    spawnIntent?: { explicitWorkStart: "yes" | "no"; workRequest: "yes" | "no" };
   }): Promise<void> {
     if (params.destination === "orchestrator") {
-      this.enqueueOrchestratorPrompt(params.bot, params.conversation, params.threadId, params.messages);
+      this.enqueueOrchestratorPrompt(
+        params.bot,
+        params.conversation,
+        params.threadId,
+        params.messages,
+        false,
+        undefined,
+        undefined,
+        params.spawnIntent,
+      );
       return;
     }
 
@@ -725,7 +857,7 @@ export class SessionManager {
         .pop();
       if (pendingLand) {
         const updatedLand = this.db.updateLand(pendingLand.id, { message_id: posted.id })!;
-        this.wsServer.broadcast({ type: "land.update", land: updatedLand });
+        this.wsServer.broadcast({ type: "land.update", land: serializeLand(updatedLand) });
       }
     }
 
@@ -745,11 +877,13 @@ export class SessionManager {
     _isInternalNotice = false,
     promptOverride?: string,
     sourceWorkerId?: string | null,
+    spawnIntent?: { explicitWorkStart: "yes" | "no"; workRequest: "yes" | "no" },
   ): void {
     const prev = this.orchQueues.get(bot.id) ?? Promise.resolve();
     const next = prev
       .catch(() => {})
       .then(async () => {
+        if (this.closed) return;
         const freshBot = this.db.getUser(bot.id);
         if (!freshBot) return;
         const orch = this.db.getActiveOrchestratorSession(bot.id);
@@ -768,13 +902,20 @@ export class SessionManager {
           threadId: targetThreadId,
           triggerMessageId,
           spawnedThreadId: null,
+          spawnedSessionId: null,
           reportedInTurn: false,
           sourceWorkerId: sourceWorkerId ?? null,
+          spawnIntent,
         });
 
-        const promptText =
+        let promptText =
           promptOverride ??
           this.formatHumanBatchPrompt(conversation, targetThreadId, messages);
+        const dismissNotes = this.pendingDismissNotes.get(freshBot.id);
+        if (dismissNotes && dismissNotes.length > 0) {
+          this.pendingDismissNotes.delete(freshBot.id);
+          promptText = `${dismissNotes.join("\n")}\n\n${promptText}`;
+        }
 
         try {
           const turn = await proc.runPrompt(promptText);
@@ -814,17 +955,21 @@ export class SessionManager {
           }
         } catch (err) {
           this.activeContexts.delete(orch.id);
-          this.wsServer.broadcastToConversation(conversation, {
-            type: "error",
-            conversation_id: conversation.id,
-            bot_id: freshBot.id,
-            message: err instanceof Error ? err.message : String(err),
-          });
+          if (!this.closed) {
+            this.wsServer.broadcastToConversation(conversation, {
+              type: "error",
+              conversation_id: conversation.id,
+              bot_id: freshBot.id,
+              message: err instanceof Error ? err.message : String(err),
+            });
+          }
         } finally {
-          const latestOrch = this.db.getSession(orch.id);
-          if (latestOrch && latestOrch.status === "running") {
-            const idle = this.db.updateSession(orch.id, { status: "idle" })!;
-            this.wsServer.broadcast({ type: "session.update", session: serializeSession(idle) });
+          if (!this.closed) {
+            const latestOrch = this.db.getSession(orch.id);
+            if (latestOrch && latestOrch.status === "running") {
+              const idle = this.db.updateSession(orch.id, { status: "idle" })!;
+              this.wsServer.broadcast({ type: "session.update", session: serializeSession(idle) });
+            }
           }
         }
       });
@@ -865,6 +1010,7 @@ export class SessionManager {
     title: string;
     status: string;
     thread_id: string | null;
+    message?: string;
   }> {
     const bot = this.db.getUser(orchSession.bot_id);
     if (!bot || bot.kind !== "bot") {
@@ -880,6 +1026,14 @@ export class SessionManager {
     }
     if (!bot.signing_key_path) {
       throw new Error("Bot is missing SSH signing key");
+    }
+
+    const explicitStart = ctx.spawnIntent?.explicitWorkStart ?? "yes";
+    const workReq = ctx.spawnIntent?.workRequest ?? "yes";
+    if (explicitStart === "no" && workReq === "no") {
+      throw new Error(
+        "Blocked: the user has not asked to start repository work (work_request=no). Reply conversationally without calling spawn_session or proposing a task.",
+      );
     }
 
     const conv = this.db.getConversation(ctx.conversationId);
@@ -898,10 +1052,71 @@ export class SessionManager {
     }
 
     const sessionId = randomUUID();
-    const branch = `kawan/${sessionId}`;
     const title = deriveTaskTitle(task, explicitTitle);
-    const clonePath = join(this.dataDir, "workspaces", sessionId);
-    const sessionBase = join(this.dataDir, "sessions", sessionId);
+    const latestSoul = this.db.getLatestSoul(bot.id);
+    const soulSnapshot = latestSoul ? filterSoulForWorker(latestSoul.content) : null;
+
+    if (explicitStart === "no") {
+      const pending = this.db.createSession({
+        id: sessionId,
+        botId: bot.id,
+        parentSessionId: orchSession.id,
+        kind: "worker",
+        conversationId: ctx.conversationId,
+        threadId: workerThreadId,
+        title,
+        task,
+        status: "pending_approval",
+        soulSnapshot,
+      });
+      ctx.spawnedSessionId = pending.id;
+      this.wsServer.broadcast({ type: "session.update", session: serializeSession(pending) });
+      return {
+        session_id: pending.id,
+        title,
+        status: "pending_approval",
+        thread_id: workerThreadId,
+        message: "Proposal card created awaiting user confirmation ([Start] / [Dismiss]).",
+      };
+    }
+
+    const workerSession = await this.launchWorkerCloneAndProcess({
+      sessionId,
+      bot,
+      parentSessionId: orchSession.id,
+      conversationId: ctx.conversationId,
+      threadId: workerThreadId,
+      title,
+      task,
+      soulSnapshot,
+    });
+    ctx.spawnedSessionId = workerSession.id;
+
+    return { session_id: workerSession.id, title, status: "running", thread_id: workerThreadId };
+  }
+
+  private async launchWorkerCloneAndProcess(params: {
+    sessionId: string;
+    bot: UserRow;
+    parentSessionId: string | null;
+    conversationId: string | null;
+    threadId: string | null;
+    title: string;
+    task: string;
+    soulSnapshot: string | null;
+    existingRow?: SessionRow;
+  }): Promise<SessionRow> {
+    const settings = this.db.getHostSettings();
+    if (!settings.repo?.bare_path || !existsSync(settings.repo.bare_path)) {
+      throw new Error("Cannot spawn session: no repository is attached");
+    }
+    if (!params.bot.signing_key_path) {
+      throw new Error("Bot is missing SSH signing key");
+    }
+
+    const branch = `kawan/${params.sessionId}`;
+    const clonePath = join(this.dataDir, "workspaces", params.sessionId);
+    const sessionBase = join(this.dataDir, "sessions", params.sessionId);
     const agentDir = join(sessionBase, "agent");
     const sessionDir = join(sessionBase, "pi-sessions");
 
@@ -910,36 +1125,41 @@ export class SessionManager {
       clonePath,
       defaultBranch: settings.repo.default_branch,
       branchName: branch,
-      botName: bot.name,
-      botEmail: bot.email ?? `${bot.name.toLowerCase()}@kawan.local`,
-      signingKeyPath: bot.signing_key_path,
+      botName: params.bot.name,
+      botEmail: params.bot.email ?? `${params.bot.name.toLowerCase()}@kawan.local`,
+      signingKeyPath: params.bot.signing_key_path,
     });
     ensureAllowedSigners(this.dataDir, this.db.listUsers("bot"));
     materializeSessionAgentDir(agentDir, settings);
 
-    const latestSoul = this.db.getLatestSoul(bot.id);
-    const soulSnapshot = latestSoul ? filterSoulForWorker(latestSoul.content) : null;
-
-    const workerSession = this.db.createSession({
-      id: sessionId,
-      botId: bot.id,
-      parentSessionId: orchSession.id,
-      kind: "worker",
-      conversationId: ctx.conversationId,
-      threadId: workerThreadId,
-      title,
-      task,
-      status: "running",
-      branch,
-      clonePath,
-      agentDir,
-      soulSnapshot,
-    });
+    const workerSession = params.existingRow
+      ? this.db.updateSession(params.sessionId, {
+          status: "running",
+          branch,
+          clone_path: clonePath,
+          agent_dir: agentDir,
+          last_report: null,
+        })!
+      : this.db.createSession({
+          id: params.sessionId,
+          botId: params.bot.id,
+          parentSessionId: params.parentSessionId,
+          kind: "worker",
+          conversationId: params.conversationId,
+          threadId: params.threadId,
+          title: params.title,
+          task: params.task,
+          status: "running",
+          branch,
+          clonePath,
+          agentDir,
+          soulSnapshot: params.soulSnapshot,
+        });
     this.wsServer.broadcast({ type: "session.update", session: serializeSession(workerSession) });
 
     const spec = composeSpawnSpec({
       role: "worker",
-      bot,
+      bot: params.bot,
       settings,
       agentDir,
       sessionDir,
@@ -947,12 +1167,17 @@ export class SessionManager {
       socketPath: this.socketPath,
       extensionPath: EXTENSION_ENTRY_PATH,
       sessionToken: workerSession.token,
-      systemPrompt: this.buildWorkerSystemPrompt(bot, workerSession),
+      systemPrompt: this.buildWorkerSystemPrompt(params.bot, workerSession),
       disableSandbox: this.disableSandbox,
     });
 
     const proc = new PiRpcProcess(spec);
     await proc.start();
+    const latestBeforeRun = this.db.getSession(workerSession.id);
+    if (this.closed || !latestBeforeRun || latestBeforeRun.status === "stopped") {
+      await proc.stop();
+      return latestBeforeRun ?? workerSession;
+    }
     this.processes.set(workerSession.id, proc);
     try {
       const st = await proc.getState();
@@ -964,10 +1189,227 @@ export class SessionManager {
       // non-fatal
     }
 
-    const runPromise = this.runWorkerTurn(proc, workerSession, bot, task);
+    const runPromise = this.runWorkerTurn(proc, workerSession, params.bot, params.task);
     this.workerRuns.set(workerSession.id, runPromise);
+    return this.db.getSession(workerSession.id)!;
+  }
 
-    return { session_id: workerSession.id, title, status: "running", thread_id: workerThreadId };
+  async confirmPendingSession(sessionId: string): Promise<{ session: Omit<SessionRow, "token"> }> {
+    const existing = this.db.getSession(sessionId);
+    if (!existing) throw new Error(`Session not found: ${sessionId}`);
+    if (existing.status !== "pending_approval") {
+      throw new Error(`Session ${sessionId} is ${existing.status}, not awaiting confirmation`);
+    }
+    const bot = this.db.getUser(existing.bot_id);
+    if (!bot || bot.kind !== "bot") throw new Error("Bot no longer exists");
+    const task = existing.task ?? "";
+    const title = deriveTaskTitle(task, existing.title);
+    const updated = await this.launchWorkerCloneAndProcess({
+      sessionId: existing.id,
+      bot,
+      parentSessionId: existing.parent_session_id,
+      conversationId: existing.conversation_id,
+      threadId: existing.thread_id,
+      title,
+      task,
+      soulSnapshot: existing.soul_snapshot,
+      existingRow: existing,
+    });
+    return { session: serializeSession(updated) };
+  }
+
+  async dismissPendingSession(sessionId: string): Promise<{ session: Omit<SessionRow, "token"> }> {
+    const existing = this.db.getSession(sessionId);
+    if (!existing) throw new Error(`Session not found: ${sessionId}`);
+    if (existing.status !== "pending_approval") {
+      throw new Error(`Session ${sessionId} is not pending approval`);
+    }
+    const updated = this.db.updateSession(sessionId, {
+      status: "stopped",
+      last_report: "Dismissed by user",
+    })!;
+    this.wsServer.broadcast({ type: "session.update", session: serializeSession(updated) });
+    const title = deriveTaskTitle(updated.task, updated.title);
+    const list = this.pendingDismissNotes.get(updated.bot_id) ?? [];
+    list.push(
+      `[Host note: The user dismissed your proposed task "${title}". Do not re-propose or spawn it unless the user explicitly asks to start it.]`,
+    );
+    this.pendingDismissNotes.set(updated.bot_id, list);
+    return { session: serializeSession(updated) };
+  }
+
+  async stopWorkerSession(sessionId: string): Promise<{ session: Omit<SessionRow, "token"> }> {
+    const existing = this.db.getSession(sessionId);
+    if (!existing) throw new Error(`Session not found: ${sessionId}`);
+    if (existing.status === "pending_approval") {
+      return await this.dismissPendingSession(sessionId);
+    }
+    const proc = this.processes.get(sessionId);
+    if (proc) {
+      this.processes.delete(sessionId);
+      await proc.stop();
+    }
+    const updated = this.db.updateSession(sessionId, {
+      status: "stopped",
+      last_report: existing.status === "landed" ? existing.last_report : "Stopped by user",
+    })!;
+    this.wsServer.broadcast({ type: "session.update", session: serializeSession(updated) });
+    return { session: serializeSession(updated) };
+  }
+
+  async ensureQueueSession(params: {
+    bot: UserRow;
+    land: LandRow;
+    mqConv: ConversationRow;
+    incidentThreadId: string | null;
+    landingDir: string;
+    taskTitle: string;
+  }): Promise<SessionRow> {
+    if (params.land.queue_session_id) {
+      const existing = this.db.getSession(params.land.queue_session_id);
+      if (existing && existing.status !== "archived") {
+        return existing;
+      }
+    }
+    const session = this.db.createSession({
+      botId: params.bot.id,
+      kind: "queue",
+      conversationId: params.mqConv.id,
+      threadId: params.incidentThreadId,
+      title: `Reconcile: ${params.taskTitle}`,
+      task: `Reconcile merge queue failure for ${params.taskTitle}`,
+      status: "idle",
+      clonePath: params.landingDir,
+    });
+    this.wsServer.broadcast({ type: "session.update", session: serializeSession(session) });
+    return session;
+  }
+
+  async runQueueTurn(sessionId: string, promptText: string): Promise<void> {
+    const prev = this.queueTurnChains.get(sessionId) ?? Promise.resolve();
+    const next = prev
+      .catch(() => {})
+      .then(async () => {
+        if (this.closed) return;
+        const session = this.db.getSession(sessionId);
+        if (!session || session.kind !== "queue" || !session.clone_path || !existsSync(session.clone_path)) {
+          return;
+        }
+        const bot = this.db.getUser(session.bot_id);
+        const mqConv = session.conversation_id
+          ? this.db.getConversation(session.conversation_id)
+          : this.db.getMergeQueueConversation();
+        if (!bot || !mqConv) return;
+
+        const running = this.db.updateSession(session.id, { status: "running" })!;
+        this.wsServer.broadcast({ type: "session.update", session: serializeSession(running) });
+
+        try {
+          let proc = this.processes.get(session.id);
+          if (!proc || !proc.isAlive) {
+            const settings = this.db.getHostSettings();
+            const sessionBase = join(this.dataDir, "sessions", session.id);
+            const agentDir = join(sessionBase, "agent");
+            const sessionDir = join(sessionBase, "pi-sessions");
+            materializeSessionAgentDir(agentDir, settings);
+
+            const spec = composeSpawnSpec({
+              role: "queue",
+              bot,
+              settings,
+              agentDir,
+              sessionDir,
+              cwd: session.clone_path,
+              socketPath: this.socketPath,
+              extensionPath: EXTENSION_ENTRY_PATH,
+              sessionToken: session.token,
+              systemPrompt: this.buildQueueSystemPrompt(bot, session.title ?? "Merge queue item"),
+              piSessionFile: session.pi_session_file,
+              disableSandbox: this.disableSandbox,
+            });
+            proc = new PiRpcProcess(spec);
+            await proc.start();
+            if (this.closed) {
+              await proc.stop();
+              return;
+            }
+            this.processes.set(session.id, proc);
+          }
+
+          this.activeContexts.set(session.id, {
+            conversationId: mqConv.id,
+            threadId: session.thread_id,
+            reportedInTurn: false,
+          });
+
+          const turn = await proc.runPrompt(promptText);
+          if (this.closed) {
+            this.activeContexts.delete(session.id);
+            return;
+          }
+          try {
+            const st = await proc.getState();
+            const entries = await proc.getEntries();
+            this.db.updateSession(session.id, {
+              pi_session_file: st.sessionFile ?? session.pi_session_file,
+              last_entry_id: entries.leafId,
+            });
+          } catch {
+            // ignore
+          }
+
+          const ctx = this.activeContexts.get(session.id);
+          this.activeContexts.delete(session.id);
+
+          const afterSession = this.db.getSession(session.id);
+          if (!afterSession || afterSession.status === "stopped") {
+            return;
+          }
+          if (turn.errorMessage) {
+            this.wsServer.broadcastToConversation(mqConv, {
+              type: "error",
+              conversation_id: mqConv.id,
+              session_id: session.id,
+              message: `Queue bot error: ${turn.errorMessage}`,
+            });
+          } else if (
+            !ctx?.reportedInTurn &&
+            turn.assistantText &&
+            turn.assistantText.trim() !== "NO_REPLY"
+          ) {
+            this.publishOrchestratorMessage({
+              bot,
+              conversation: mqConv,
+              threadId: session.thread_id,
+              body: turn.assistantText.trim(),
+            });
+          }
+        } catch (err) {
+          this.activeContexts.delete(session.id);
+          if (!this.closed) {
+            this.wsServer.broadcastToConversation(mqConv, {
+              type: "error",
+              conversation_id: mqConv.id,
+              session_id: session.id,
+              message: err instanceof Error ? err.message : String(err),
+            });
+          }
+        } finally {
+          if (!this.closed) {
+            if (this.stopAfterTurn.delete(session.id)) {
+              await this.stopSession(session.id);
+            } else {
+              const latest = this.db.getSession(session.id);
+              if (latest && latest.status === "running") {
+                const idle = this.db.updateSession(session.id, { status: "idle" })!;
+                this.wsServer.broadcast({ type: "session.update", session: serializeSession(idle) });
+              }
+            }
+          }
+        }
+      });
+    this.queueTurnChains.set(sessionId, next);
+    await next;
   }
 
   private async runWorkerTurn(
@@ -1003,6 +1445,9 @@ export class SessionManager {
       this.activeContexts.delete(session.id);
 
       const latest = this.db.getSession(session.id) ?? session;
+      if (this.closed || latest.status === "stopped") {
+        return;
+      }
       if (turn.errorMessage) {
         const failed = this.db.updateSession(session.id, { status: "failed" })!;
         this.wsServer.broadcast({ type: "session.update", session: serializeSession(failed) });
@@ -1025,6 +1470,9 @@ export class SessionManager {
       }
 
       const refreshed = this.db.getSession(session.id)!;
+      if (refreshed.status === "stopped") {
+        return;
+      }
       if (refreshed.status === "running") {
         const idle = this.db.updateSession(session.id, { status: "idle" })!;
         this.wsServer.broadcast({ type: "session.update", session: serializeSession(idle) });
@@ -1066,6 +1514,13 @@ export class SessionManager {
       }
     } catch (err) {
       this.activeContexts.delete(session.id);
+      if (this.closed) {
+        return;
+      }
+      const latest = this.db.getSession(session.id);
+      if (latest?.status === "stopped") {
+        return;
+      }
       const failed = this.db.updateSession(session.id, { status: "failed" });
       if (failed) {
         this.wsServer.broadcast({ type: "session.update", session: serializeSession(failed) });
@@ -1171,7 +1626,7 @@ export class SessionManager {
     const ctx = this.activeContexts.get(session.id);
     const conversationId = ctx?.conversationId || session.conversation_id;
     const effectiveThreadId =
-      session.kind === "worker"
+      session.kind === "worker" || session.kind === "queue"
         ? (ctx ? ctx.threadId : session.thread_id)
         : inThread === true
           ? (ctx?.threadId ?? ctx?.spawnedThreadId ?? ctx?.triggerMessageId ?? null)
@@ -1284,7 +1739,14 @@ export class SessionManager {
 
     const existing = this.db
       .listLands({ sessionId: session.id })
-      .find((l) => l.status === "requested" || l.status === "verifying");
+      .find(
+        (l) =>
+          l.status === "requested" ||
+          l.status === "queued" ||
+          l.status === "rebasing" ||
+          l.status === "verifying" ||
+          l.status === "paused",
+      );
     if (existing) {
       return { land_id: existing.id, status: existing.status, branch: session.branch };
     }
@@ -1300,7 +1762,7 @@ export class SessionManager {
       ...(trimmedSummary ? { last_report: trimmedSummary } : {}),
     })!;
     this.wsServer.broadcast({ type: "session.update", session: serializeSession(updated) });
-    this.wsServer.broadcast({ type: "land.update", land });
+    this.wsServer.broadcast({ type: "land.update", land: serializeLand(land) });
 
     const ctx = this.activeContexts.get(session.id);
     if (ctx) ctx.reportedInTurn = true;

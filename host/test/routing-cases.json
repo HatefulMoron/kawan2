@@ -7,7 +7,7 @@
     "recentMessages": [],
     "heldMessages": [],
     "incoming": { "author": "alice", "inThread": false, "body": "@kawan please add a hello.txt file with 'hi' and commit it" },
-    "expected": { "destination": "orchestrator", "readiness": "dispatch" }
+    "expected": { "destination": "orchestrator", "readiness": "dispatch", "explicit_work_start": "yes", "work_request": "yes" }
   },
   {
     "id": "direct-question-channel",
@@ -17,7 +17,7 @@
     "recentMessages": [],
     "heldMessages": [],
     "incoming": { "author": "bob", "inThread": false, "body": "@kawan what does the test command look like in this repo?" },
-    "expected": { "destination": "orchestrator", "readiness": "dispatch" }
+    "expected": { "destination": "orchestrator", "readiness": "dispatch", "explicit_work_start": "no", "work_request": "no" }
   },
   {
     "id": "dm-request",
@@ -27,7 +27,7 @@
     "recentMessages": [],
     "heldMessages": [],
     "incoming": { "author": "alice", "inThread": false, "body": "Can you summarize the open branches?" },
-    "expected": { "destination": "orchestrator", "readiness": "dispatch" }
+    "expected": { "destination": "orchestrator", "readiness": "dispatch", "explicit_work_start": "no", "work_request": "no" }
   },
   {
     "id": "fragment-ping-hey",
@@ -57,7 +57,7 @@
     "recentMessages": [{ "author": "alice", "kind": "human", "threadId": null, "body": "@kawan hey" }],
     "heldMessages": [{ "author": "alice", "body": "@kawan hey" }],
     "incoming": { "author": "alice", "inThread": false, "body": "can you check why the cargo build is failing on linux?" },
-    "expected": { "destination": "orchestrator", "readiness": "dispatch" }
+    "expected": { "destination": "orchestrator", "readiness": "dispatch", "explicit_work_start": "no" }
   },
   {
     "id": "human-aside-coffee",
@@ -69,7 +69,7 @@
     ],
     "heldMessages": [],
     "incoming": { "author": "bob", "inThread": false, "body": "alice: grabbing coffee, back in 10 mins" },
-    "expected": { "destination": "none", "readiness": "dispatch" }
+    "expected": { "destination": "none", "readiness": "dispatch", "explicit_work_start": "no", "work_request": "no" }
   },
   {
     "id": "human-to-human-question",
@@ -79,7 +79,7 @@
     "recentMessages": [],
     "heldMessages": [],
     "incoming": { "author": "alice", "inThread": false, "body": "@bob did you push your PR yet?" },
-    "expected": { "destination": "none", "readiness": "dispatch" }
+    "expected": { "destination": "none", "readiness": "dispatch", "explicit_work_start": "no", "work_request": "no" }
   },
   {
     "id": "acknowledgement-thanks",
@@ -91,7 +91,7 @@
     ],
     "heldMessages": [],
     "incoming": { "author": "alice", "inThread": false, "body": "thanks!" },
-    "expected": { "destination": "none", "readiness": "dispatch" }
+    "expected": { "destination": "none", "readiness": "dispatch", "explicit_work_start": "no", "work_request": "no" }
   },
   {
     "id": "acknowledgement-lgtm",
@@ -103,7 +103,7 @@
     ],
     "heldMessages": [],
     "incoming": { "author": "bob", "inThread": false, "body": "lgtm" },
-    "expected": { "destination": "none", "readiness": "dispatch" }
+    "expected": { "destination": "none", "readiness": "dispatch", "explicit_work_start": "no", "work_request": "no" }
   },
   {
     "id": "worker-thread-followup",
@@ -161,7 +161,7 @@
     "recentMessages": [],
     "heldMessages": [],
     "incoming": { "author": "bob", "inThread": false, "body": "@kawan please create a new worker to update README.md with setup instructions" },
-    "expected": { "destination": "orchestrator", "readiness": "dispatch" }
+    "expected": { "destination": "orchestrator", "readiness": "dispatch", "explicit_work_start": "yes", "work_request": "yes" }
   },
   {
     "id": "human-aside-while-worker-active",
@@ -181,7 +181,7 @@
     ],
     "heldMessages": [],
     "incoming": { "author": "bob", "inThread": false, "body": "On my way to the standup room" },
-    "expected": { "destination": "none", "readiness": "dispatch" }
+    "expected": { "destination": "none", "readiness": "dispatch", "explicit_work_start": "no", "work_request": "no" }
   },
   {
     "id": "bot-status-query",
@@ -199,7 +199,7 @@
     "recentMessages": [],
     "heldMessages": [],
     "incoming": { "author": "alice", "inThread": false, "body": "@kawan what are your workers currently doing?" },
-    "expected": { "destination": "orchestrator", "readiness": "dispatch" }
+    "expected": { "destination": "orchestrator", "readiness": "dispatch", "explicit_work_start": "no", "work_request": "no" }
   },
   {
     "id": "conversational-checkin-whats-up",
@@ -209,6 +209,68 @@
     "recentMessages": [],
     "heldMessages": [],
     "incoming": { "author": "alice", "inThread": false, "body": "@kawan what's up?" },
-    "expected": { "destination": "orchestrator", "readiness": "dispatch" }
+    "expected": { "destination": "orchestrator", "readiness": "dispatch", "explicit_work_start": "no", "work_request": "no" }
+  },
+  {
+    "id": "spawn-explicit-command",
+    "botName": "kawan",
+    "conversation": { "kind": "channel", "name": "engineering" },
+    "activeSessions": [],
+    "recentMessages": [],
+    "heldMessages": [],
+    "incoming": { "author": "alice", "inThread": false, "body": "@kawan refactor the retry logic in decisions.ts and add unit tests" },
+    "expected": { "destination": "orchestrator", "readiness": "dispatch", "explicit_work_start": "yes", "work_request": "yes" }
+  },
+  {
+    "id": "spawn-soft-ci-flaky",
+    "botName": "kawan",
+    "conversation": { "kind": "channel", "name": "engineering" },
+    "activeSessions": [],
+    "recentMessages": [],
+    "heldMessages": [],
+    "incoming": { "author": "bob", "inThread": false, "body": "@kawan the CI build is flaky lately, could you take a look?" },
+    "expected": { "destination": "orchestrator", "readiness": "dispatch", "explicit_work_start": "no", "work_request": "yes" }
+  },
+  {
+    "id": "spawn-soft-ui-broken",
+    "botName": "kawan",
+    "conversation": { "kind": "channel", "name": "general" },
+    "activeSessions": [],
+    "recentMessages": [],
+    "heldMessages": [],
+    "incoming": { "author": "alice", "inThread": false, "body": "@kawan this button in the drawer header gets clipped on narrow screens" },
+    "expected": { "destination": "orchestrator", "readiness": "dispatch", "explicit_work_start": "no", "work_request": "yes" }
+  },
+  {
+    "id": "brainstorm-hypothetical-dark-mode",
+    "botName": "kawan",
+    "conversation": { "kind": "channel", "name": "general" },
+    "activeSessions": [],
+    "recentMessages": [],
+    "heldMessages": [],
+    "incoming": { "author": "alice", "inThread": false, "body": "@kawan what would it take to add dark mode later?" },
+    "expected": { "destination": "orchestrator", "readiness": "dispatch", "explicit_work_start": "no", "work_request": "no" }
+  },
+  {
+    "id": "brainstorm-future-idea",
+    "botName": "kawan",
+    "conversation": { "kind": "channel", "name": "engineering" },
+    "activeSessions": [],
+    "recentMessages": [],
+    "heldMessages": [],
+    "incoming": { "author": "bob", "inThread": false, "body": "@kawan we might eventually want WebSockets over TLS — what do you think about that?" },
+    "expected": { "destination": "orchestrator", "readiness": "dispatch", "explicit_work_start": "no", "work_request": "no" }
+  },
+  {
+    "id": "human-brainstorm-no-bot",
+    "botName": "kawan",
+    "conversation": { "kind": "channel", "name": "engineering" },
+    "activeSessions": [],
+    "recentMessages": [
+      { "author": "alice", "kind": "human", "threadId": null, "body": "Thinking about Q4 roadmap items" }
+    ],
+    "heldMessages": [],
+    "incoming": { "author": "bob", "inThread": false, "body": "alice: should we rewrite the auth layer next quarter?" },
+    "expected": { "destination": "none", "readiness": "dispatch", "explicit_work_start": "no", "work_request": "no" }
   }
 ]

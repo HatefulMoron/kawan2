@@ -3,9 +3,10 @@
 use std::collections::HashMap;
 
 use crate::protocol::{
-    Artifact, BotSummary, Conversation, Decision, DecisionRoleView, DefaultRoleView, Land, Member,
-    Message, ModelDefView, ProviderView, RepoSettingsView, RolesView, SessionDiffFile,
-    SessionDiffSummary, SessionSummary, SettingsView, SetupStatus, StatusRepoInfo, UserSummary,
+    Artifact, BotSummary, CheckRunItem, Conversation, Decision, DecisionRoleView, DefaultRoleView,
+    Land, Member, MergeQueueSettingsView, MergeQueueSnapshot, Message, ModelDefView, ProviderView,
+    RepoSettingsView, RolesView, SessionDiffFile, SessionDiffSummary, SessionSummary, SettingsView,
+    SetupStatus, StatusRepoInfo, UserSummary,
 };
 use crate::state::{FocusTarget, KawanApp, LoadedArtifact, Screen, WorkspacePage};
 
@@ -15,6 +16,7 @@ pub fn populate_mock(app: &mut KawanApp) {
     let bot_id = "bot-kawan".to_string();
     let conv_general = "conv-general".to_string();
     let conv_runtime = "conv-runtime".to_string();
+    let conv_mq = "conv-merge-queue".to_string();
 
     app.current_user_id = alice_id.clone();
     app.current_user_name = "Alice".to_string();
@@ -75,6 +77,12 @@ pub fn populate_mock(app: &mut KawanApp) {
                 api_key_configured: true,
             }),
         },
+        merge_queue: Some(MergeQueueSettingsView {
+            bot_id: Some(bot_id.clone()),
+            default_landing_mode: "manual".to_string(),
+            conflict_policy: "pause_on_issue".to_string(),
+            paused: true,
+        }),
         setup: app.setup.clone(),
     };
 
@@ -171,19 +179,36 @@ pub fn populate_mock(app: &mut KawanApp) {
             unread_count: 0,
             members: members.clone(),
         },
+        Conversation {
+            id: conv_mq.clone(),
+            kind: "merge_queue".to_string(),
+            name: Some("merge-queue".to_string()),
+            topic: Some("Serialized merge train and reconciliation threads".to_string()),
+            next_seq: 3,
+            created_at: 3,
+            last_seq: 2,
+            last_read_seq: 1,
+            unread_count: 1,
+            members: members.clone(),
+        },
     ];
     app.members_by_conv
         .insert(conv_general.clone(), members.clone());
-    app.members_by_conv.insert(conv_runtime.clone(), members);
+    app.members_by_conv
+        .insert(conv_runtime.clone(), members.clone());
+    app.members_by_conv.insert(conv_mq.clone(), members);
     app.active_conversation_id = Some(conv_runtime.clone());
 
     let sess_0 = "1a4d0e22-0000-4000-8000-000000000000".to_string();
     let sess_1 = "8f2a9c41-0001-4000-8000-000000000001".to_string();
     let sess_2 = "3b71d20e-0002-4000-8000-000000000002".to_string();
+    let sess_3 = "9c12e800-0003-4000-8000-000000000003".to_string();
     let art_0 = "art-hold-report".to_string();
     let art_1 = "art-pty-check".to_string();
+    let art_mq = "art-mq-failure".to_string();
     let land_0 = "land-hold-countdown".to_string();
     let land_1 = "land-pty-check".to_string();
+    let land_2 = "land-verify-sigs".to_string();
 
     app.sessions_by_id.insert(
         sess_0.clone(),
@@ -247,16 +272,43 @@ pub fn populate_mock(app: &mut KawanApp) {
             thread_id: Some("msg-5".to_string()),
             title: Some("Verify SSH commit signatures".to_string()),
             task: Some("Wire SSH signature check on bare repository verify-commit".to_string()),
-            status: "running".to_string(),
+            status: "idle".to_string(),
             branch: Some(format!("kawan/{sess_2}")),
             clone_path: None,
             agent_dir: None,
             pi_session_file: None,
             last_entry_id: None,
-            last_report: Some("Running verify-commit against bot allowed_signers".to_string()),
+            last_report: Some("03-test failed on bare repo allowed_signers check".to_string()),
             soul_snapshot: None,
             created_at: 210,
             updated_at: 220,
+        },
+    );
+
+    app.sessions_by_id.insert(
+        sess_3.clone(),
+        SessionSummary {
+            id: sess_3,
+            bot_id: bot_id.clone(),
+            parent_session_id: Some("orch-1".to_string()),
+            kind: "worker".to_string(),
+            conversation_id: Some(conv_runtime.clone()),
+            thread_id: Some("msg-1".to_string()),
+            title: Some("Sweep stale staging timeout logs".to_string()),
+            task: Some(
+                "Inspect staging timeout log rotation settings and add a bounded retention policy."
+                    .to_string(),
+            ),
+            status: "pending_approval".to_string(),
+            branch: None,
+            clone_path: None,
+            agent_dir: None,
+            pi_session_file: None,
+            last_entry_id: None,
+            last_report: None,
+            soul_snapshot: None,
+            created_at: 230,
+            updated_at: 230,
         },
     );
 
@@ -309,9 +361,9 @@ pub fn populate_mock(app: &mut KawanApp) {
     app.expanded_artifacts.insert(art_1.clone());
 
     app.lands_by_id.insert(
-        land_0,
+        land_0.clone(),
         Land {
-            id: "land-hold-countdown".to_string(),
+            id: land_0.clone(),
             session_id: sess_0.clone(),
             conversation_id: conv_general,
             thread_id: None,
@@ -322,29 +374,116 @@ pub fn populate_mock(app: &mut KawanApp) {
             landed_sha: Some("c8a41f001122aabb".to_string()),
             verify_output: Some("13 passed, 0 failed".to_string()),
             error: None,
+            queue_position: None,
+            issue_id: None,
+            pause_reason: None,
+            queue_session_id: None,
+            queue_thread_id: None,
+            trigger: Some("manual_approve".to_string()),
+            checks: Vec::new(),
+            touches_kawan: false,
             created_at: 92,
             updated_at: 95,
         },
     );
 
-    app.lands_by_id.insert(
-        land_1,
-        Land {
-            id: "land-pty-check".to_string(),
-            session_id: sess_1.clone(),
-            conversation_id: conv_runtime.clone(),
-            thread_id: Some("msg-2".to_string()),
-            message_id: Some("msg-4".to_string()),
-            status: "requested".to_string(),
-            approved_by: None,
-            base_sha: Some("c8a41f001122".to_string()),
-            landed_sha: None,
-            verify_output: None,
-            error: None,
-            created_at: 196,
-            updated_at: 196,
+    let mock_checks = vec![
+        CheckRunItem {
+            name: "01-fmt".to_string(),
+            ok: true,
+            exit_code: Some(0),
+            duration_ms: 340,
+            output: String::new(),
+            artifact_id: None,
         },
-    );
+        CheckRunItem {
+            name: "02-clippy".to_string(),
+            ok: true,
+            exit_code: Some(0),
+            duration_ms: 820,
+            output: String::new(),
+            artifact_id: None,
+        },
+        CheckRunItem {
+            name: "03-test".to_string(),
+            ok: false,
+            exit_code: Some(101),
+            duration_ms: 1290,
+            output: "test ssh::verify_commit_sig ... FAILED\nmissing allowed_signers entry"
+                .to_string(),
+            artifact_id: Some(art_mq.clone()),
+        },
+    ];
+
+    let paused_head = Land {
+        id: land_2,
+        session_id: sess_2,
+        conversation_id: conv_runtime.clone(),
+        thread_id: Some("msg-5".to_string()),
+        message_id: None,
+        status: "paused".to_string(),
+        approved_by: Some(alice_id.clone()),
+        base_sha: Some("c8a41f001122".to_string()),
+        landed_sha: None,
+        verify_output: Some("03-test failed (2/3 passed)".to_string()),
+        error: Some(
+            "Verification failed (03-test exit 101):\ntest ssh::verify_commit_sig ... FAILED"
+                .to_string(),
+        ),
+        queue_position: Some(1),
+        issue_id: None,
+        pause_reason: Some("checks_failed".to_string()),
+        queue_session_id: None,
+        queue_thread_id: Some("mq-msg-1".to_string()),
+        trigger: Some("manual_approve".to_string()),
+        checks: mock_checks,
+        touches_kawan: false,
+        created_at: 215,
+        updated_at: 222,
+    };
+
+    let queued_second = Land {
+        id: land_1.clone(),
+        session_id: sess_1.clone(),
+        conversation_id: conv_runtime.clone(),
+        thread_id: Some("msg-2".to_string()),
+        message_id: Some("msg-4".to_string()),
+        status: "queued".to_string(),
+        approved_by: Some(alice_id.clone()),
+        base_sha: Some("c8a41f001122".to_string()),
+        landed_sha: None,
+        verify_output: None,
+        error: None,
+        queue_position: Some(2),
+        issue_id: None,
+        pause_reason: None,
+        queue_session_id: None,
+        queue_thread_id: None,
+        trigger: Some("manual_approve".to_string()),
+        checks: Vec::new(),
+        touches_kawan: false,
+        created_at: 196,
+        updated_at: 196,
+    };
+
+    app.lands_by_id
+        .insert(paused_head.id.clone(), paused_head.clone());
+    app.lands_by_id.insert(land_1, queued_second.clone());
+
+    let landed_copy = app.lands_by_id.get(&land_0).cloned();
+    app.merge_queue = Some(MergeQueueSnapshot {
+        conversation_id: conv_mq.clone(),
+        settings: MergeQueueSettingsView {
+            bot_id: Some(bot_id.clone()),
+            default_landing_mode: "manual".to_string(),
+            conflict_policy: "pause_on_issue".to_string(),
+            paused: true,
+        },
+        head: Some(paused_head.clone()),
+        queued: vec![paused_head, queued_second],
+        paused_land: Some(app.lands_by_id.get("land-verify-sigs").unwrap().clone()),
+        recent_landed: landed_copy.into_iter().collect(),
+    });
 
     app.selected_diff_file
         .insert(sess_1.clone(), "src/pty/teardown.rs".to_string());
@@ -407,7 +546,7 @@ pub fn populate_mock(app: &mut KawanApp) {
                 id: "msg-4".to_string(),
                 conversation_id: conv_runtime.clone(),
                 seq: 4,
-                author_id: bot_id,
+                author_id: bot_id.clone(),
                 thread_id: Some("msg-2".to_string()),
                 body: "Finished WorkerPty teardown fix in worker clone and verified across 200 simulated timeouts. Ready for human approval to land.".to_string(),
                 artifact_id: Some(art_1),
@@ -435,6 +574,8 @@ pub fn populate_mock(app: &mut KawanApp) {
                 redirected_from: None,
                 redirected_by: None,
                 hold_expires_at: None,
+                explicit_work_start: Some("yes".to_string()),
+                work_request: Some("yes".to_string()),
                 created_at: 1_795_400_001_000,
             },
             Decision {
@@ -453,6 +594,8 @@ pub fn populate_mock(app: &mut KawanApp) {
                 redirected_from: None,
                 redirected_by: None,
                 hold_expires_at: None,
+                explicit_work_start: Some("yes".to_string()),
+                work_request: Some("yes".to_string()),
                 created_at: 1_795_400_121_000,
             },
             Decision {
@@ -471,7 +614,59 @@ pub fn populate_mock(app: &mut KawanApp) {
                 redirected_from: None,
                 redirected_by: None,
                 hold_expires_at: None,
+                explicit_work_start: Some("yes".to_string()),
+                work_request: Some("yes".to_string()),
                 created_at: 1_795_400_241_000,
+            },
+        ],
+    );
+
+    app.artifacts_by_id.insert(
+        art_mq.clone(),
+        Artifact {
+            id: art_mq.clone(),
+            sha256: "e104ab7711223344".to_string(),
+            mime_type: "text/plain".to_string(),
+            byte_size: 98,
+            filename: Some("merge-failure.log".to_string()),
+            session_id: Some("3b71d20e-0002-4000-8000-000000000002".to_string()),
+            conversation_id: Some(conv_mq.clone()),
+            message_id: Some("mq-msg-1".to_string()),
+            created_at: 222,
+        },
+    );
+    app.loaded_artifacts.insert(
+        art_mq.clone(),
+        LoadedArtifact {
+            text_preview: Some(
+                "Verification failed (03-test exit 101):\ntest ssh::verify_commit_sig ... FAILED\nallowed_signers missing test key"
+                    .to_string(),
+            ),
+            image: None,
+        },
+    );
+    app.messages_by_conv.insert(
+        conv_mq.clone(),
+        vec![
+            Message {
+                id: "mq-msg-1".to_string(),
+                conversation_id: conv_mq.clone(),
+                seq: 1,
+                author_id: bot_id.clone(),
+                thread_id: None,
+                body: "Paused Merge Queue on \"Verify SSH commit signatures\" (#runtime · post-rebase verification failed).".to_string(),
+                artifact_id: Some(art_mq),
+                created_at: 1_795_401_000_000,
+            },
+            Message {
+                id: "mq-msg-2".to_string(),
+                conversation_id: conv_mq,
+                seq: 2,
+                author_id: bot_id,
+                thread_id: Some("mq-msg-1".to_string()),
+                body: "03-test failed because allowed_signers does not include the new signing fixture key. Reply to regenerate allowed_signers or send back to implementer.".to_string(),
+                artifact_id: None,
+                created_at: 1_795_401_020_000,
             },
         ],
     );

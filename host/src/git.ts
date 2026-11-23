@@ -1,9 +1,21 @@
-import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, renameSync, chmodSync, writeFileSync } from "node:fs";
+import { execFile, spawn } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  renameSync,
+  statSync,
+  chmodSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import type { SessionDiffFile, SessionDiffSummary } from "./types.js";
+import { composeCheckCommand } from "./spawn.js";
+import type { CheckRunItem, RepoCheckResult, SessionDiffFile, SessionDiffSummary } from "./types.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -223,15 +235,15 @@ export interface LandBranchResult {
   error?: string;
 }
 
-async function runShellCommand(
-  command: string,
-  cwd: string,
-): Promise<{ ok: boolean; output: string; code: number | null }> {
-  const { spawn } = await import("node:child_process");
+async function runCheckSpec(
+  spec: { command: string; args: string[]; cwd: string; env: Record<string, string> },
+  timeoutMs = 120_000,
+): Promise<{ ok: boolean; output: string; code: number | null; durationMs: number }> {
+  const started = Date.now();
   return await new Promise((resolve) => {
-    const child = spawn("sh", ["-c", command], {
-      cwd,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    const child = spawn(spec.command, spec.args, {
+      cwd: spec.cwd,
+      env: spec.env,
       stdio: ["ignore", "pipe", "pipe"],
     });
     const chunks: Buffer[] = [];
@@ -242,111 +254,301 @@ async function runShellCommand(
       resolve({
         ok: false,
         code: null,
-        output: `${Buffer.concat(chunks).toString("utf8")}\nTimed out after 120s`,
+        durationMs: Date.now() - started,
+        output: `${Buffer.concat(chunks).toString("utf8")}\nTimed out after ${Math.round(timeoutMs / 1000)}s`,
       });
-    }, 120_000);
+    }, timeoutMs);
+    child.once("error", (err) => {
+      clearTimeout(timer);
+      resolve({
+        ok: false,
+        code: null,
+        durationMs: Date.now() - started,
+        output: err.message,
+      });
+    });
     child.once("exit", (code) => {
       clearTimeout(timer);
       resolve({
         ok: code === 0,
         code,
+        durationMs: Date.now() - started,
         output: Buffer.concat(chunks).toString("utf8").trim(),
       });
     });
   });
 }
 
-export async function landBranch(params: LandBranchParams): Promise<LandBranchResult> {
+export async function branchTouchesKawanDir(workdir: string, baseRef: string): Promise<boolean> {
+  try {
+    const { stdout } = await runGit(["-C", workdir, "diff", "--name-only", baseRef, "HEAD"]);
+    return stdout
+      .split(/\r?\n/)
+      .some((line) => line.trim() === ".kawan" || line.trim().startsWith(".kawan/"));
+  } catch {
+    return false;
+  }
+}
+
+export async function runRepoChecks(params: {
+  workdir: string;
+  verifyCommand?: string | null;
+  sandboxEnabled?: boolean;
+  sandboxNetwork?: boolean;
+  disableSandbox?: boolean;
+  timeoutMs?: number;
+}): Promise<RepoCheckResult> {
+  const checksDir = join(params.workdir, ".kawan", "checks");
+  const ciScript = join(params.workdir, ".kawan", "ci");
+  const sandboxEnabled = params.sandboxEnabled ?? true;
+  const sandboxNetwork = params.sandboxNetwork ?? true;
+  const disableSandbox = Boolean(params.disableSandbox);
+  const timeoutMs = params.timeoutMs ?? 120_000;
+
+  let executableChecks: Array<{ name: string; command: string; args: string[] }> = [];
+  let source: RepoCheckResult["source"] = "verify_command";
+
+  if (existsSync(checksDir)) {
+    try {
+      const names = readdirSync(checksDir)
+        .filter((name) => !name.startsWith("."))
+        .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+      for (const name of names) {
+        const full = join(checksDir, name);
+        try {
+          const st = statSync(full);
+          if (st.isFile() && (st.mode & 0o111) !== 0) {
+            executableChecks.push({ name, command: full, args: [] });
+          }
+        } catch {
+          // ignore unreadable entry
+        }
+      }
+      if (executableChecks.length > 0) {
+        source = "kawan_checks";
+      }
+    } catch {
+      // fall through
+    }
+  }
+
+  if (executableChecks.length === 0 && existsSync(ciScript)) {
+    try {
+      const st = statSync(ciScript);
+      if (st.isFile() && (st.mode & 0o111) !== 0) {
+        source = "kawan_ci";
+        executableChecks = [{ name: "ci", command: ciScript, args: [] }];
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  if (executableChecks.length === 0) {
+    const cmd = params.verifyCommand?.trim() ?? "";
+    if (!cmd) {
+      return {
+        ok: false,
+        source: "verify_command",
+        checks: [
+          {
+            name: "verify",
+            ok: false,
+            exit_code: null,
+            duration_ms: 0,
+            output: "No .kawan/checks/* script or verify_command configured",
+          },
+        ],
+        summary: "verify failed (0/1)",
+        combined_output: "No .kawan/checks/* script or verify_command configured",
+      };
+    }
+    source = "verify_command";
+    executableChecks = [{ name: "verify", command: "sh", args: ["-c", cmd] }];
+  }
+
+  const results: CheckRunItem[] = [];
+  for (const chk of executableChecks) {
+    const spec = composeCheckCommand({
+      cwd: params.workdir,
+      command: chk.command,
+      args: chk.args,
+      sandboxEnabled,
+      sandboxNetwork,
+      disableSandbox,
+    });
+    const res = await runCheckSpec(spec, timeoutMs);
+    results.push({
+      name: chk.name,
+      ok: res.ok,
+      exit_code: res.code,
+      duration_ms: res.durationMs,
+      output: res.output,
+    });
+  }
+
+  const passed = results.filter((c) => c.ok).length;
+  const allOk = passed === results.length;
+  const combined = results
+    .map((c) => {
+      const hdr = `[${c.ok ? "PASS" : "FAIL"} exit=${c.exit_code ?? "timeout"}] ${c.name} (${c.duration_ms}ms)`;
+      return c.output ? `${hdr}\n${c.output}` : hdr;
+    })
+    .join("\n\n");
+
+  return {
+    ok: allOk,
+    source,
+    checks: results,
+    summary: allOk
+      ? `${source === "verify_command" ? "verify" : "checks"} passed (${passed}/${results.length})`
+      : `${results.find((c) => !c.ok)?.name ?? "check"} failed (${passed}/${results.length} passed)`,
+    combined_output: combined,
+  };
+}
+
+export interface PrepareLandingParams {
+  barePath: string;
+  clonePath: string;
+  branchName: string;
+  defaultBranch: string;
+  botName: string;
+  botEmail: string;
+  signingKeyPath: string;
+  landingDir: string;
+}
+
+export interface PrepareLandingResult {
+  ok: boolean;
+  baseSha: string;
+  touchesKawan: boolean;
+  error?: string;
+}
+
+export async function prepareLandingClone(params: PrepareLandingParams): Promise<PrepareLandingResult> {
   rmSync(params.landingDir, { recursive: true, force: true });
   mkdirSync(join(params.landingDir, ".."), { recursive: true });
 
-  let baseSha = "";
+  await runGit([
+    "clone",
+    "--local",
+    "--branch",
+    params.defaultBranch,
+    params.barePath,
+    params.landingDir,
+  ]);
+  const baseSha = await getBranchHead(params.landingDir, "HEAD");
+
+  await runGit(["-C", params.landingDir, "config", "user.name", params.botName]);
+  await runGit(["-C", params.landingDir, "config", "user.email", params.botEmail]);
+  await runGit(["-C", params.landingDir, "config", "gpg.format", "ssh"]);
+  await runGit(["-C", params.landingDir, "config", "commit.gpgsign", "true"]);
+  await runGit(["-C", params.landingDir, "config", "user.signingkey", params.signingKeyPath]);
+
+  await runGit(["-C", params.landingDir, "fetch", params.clonePath, params.branchName]);
+
+  const { stdout: aheadOut } = await runGit([
+    "-C",
+    params.landingDir,
+    "rev-list",
+    "--count",
+    "HEAD..FETCH_HEAD",
+  ]);
+  const aheadCount = Number.parseInt(aheadOut.trim(), 10) || 0;
+  if (aheadCount === 0) {
+    return {
+      ok: false,
+      baseSha,
+      touchesKawan: false,
+      error: "Branch has no commits ahead of default branch",
+    };
+  }
+
+  let isAncestor = false;
   try {
-    await runGit([
-      "clone",
-      "--local",
-      "--branch",
-      params.defaultBranch,
-      params.barePath,
-      params.landingDir,
-    ]);
-    baseSha = await getBranchHead(params.landingDir, "HEAD");
+    await runGit(["-C", params.landingDir, "merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD"]);
+    isAncestor = true;
+  } catch {
+    isAncestor = false;
+  }
 
-    await runGit(["-C", params.landingDir, "config", "user.name", params.botName]);
-    await runGit(["-C", params.landingDir, "config", "user.email", params.botEmail]);
-    await runGit(["-C", params.landingDir, "config", "gpg.format", "ssh"]);
-    await runGit(["-C", params.landingDir, "config", "commit.gpgsign", "true"]);
-    await runGit(["-C", params.landingDir, "config", "user.signingkey", params.signingKeyPath]);
+  await runGit(["-C", params.landingDir, "checkout", "-B", params.branchName, "FETCH_HEAD"]);
+  const touchesKawan = await branchTouchesKawanDir(params.landingDir, params.defaultBranch);
 
-    await runGit(["-C", params.landingDir, "fetch", params.clonePath, params.branchName]);
-
-    const { stdout: aheadOut } = await runGit([
-      "-C",
-      params.landingDir,
-      "rev-list",
-      "--count",
-      "HEAD..FETCH_HEAD",
-    ]);
-    const aheadCount = Number.parseInt(aheadOut.trim(), 10) || 0;
-    if (aheadCount === 0) {
-      return {
-        ok: false,
-        baseSha,
-        verifyOutput: "",
-        error: "Branch has no commits ahead of default branch",
-      };
-    }
-
-    let isAncestor = false;
+  if (!isAncestor) {
     try {
-      await runGit(["-C", params.landingDir, "merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD"]);
-      isAncestor = true;
-    } catch {
-      isAncestor = false;
-    }
-
-    await runGit(["-C", params.landingDir, "checkout", "-B", params.branchName, "FETCH_HEAD"]);
-    if (!isAncestor) {
-      try {
-        await runGit(["-C", params.landingDir, "rebase", params.defaultBranch]);
-      } catch (err) {
-        try {
-          await runGit(["-C", params.landingDir, "rebase", "--abort"]);
-        } catch {
-          // ignore abort failure
-        }
-        return {
-          ok: false,
-          baseSha,
-          verifyOutput: "",
-          error: `Rebase onto ${params.defaultBranch} failed: ${err instanceof Error ? err.message : String(err)}`,
-        };
-      }
-    }
-
-    const verify = await runShellCommand(params.verifyCommand, params.landingDir);
-    if (!verify.ok) {
+      await runGit(["-C", params.landingDir, "rebase", params.defaultBranch]);
+    } catch (err) {
       return {
         ok: false,
         baseSha,
-        verifyOutput: verify.output,
-        error: `Verify command failed (exit ${verify.code}):\n${verify.output}`,
+        touchesKawan,
+        error: `Rebase onto ${params.defaultBranch} failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+
+  return { ok: true, baseSha, touchesKawan };
+}
+
+export async function finalizeLandingPush(params: {
+  landingDir: string;
+  barePath: string;
+  defaultBranch: string;
+}): Promise<string> {
+  await runGit([
+    "-C",
+    params.landingDir,
+    "push",
+    params.barePath,
+    `HEAD:refs/heads/${params.defaultBranch}`,
+  ]);
+  return await getBranchHead(params.landingDir, "HEAD");
+}
+
+export async function landBranch(params: LandBranchParams): Promise<LandBranchResult> {
+  try {
+    const prep = await prepareLandingClone(params);
+    if (!prep.ok) {
+      try {
+        await runGit(["-C", params.landingDir, "rebase", "--abort"]);
+      } catch {
+        // ignore if no rebase active
+      }
+      return {
+        ok: false,
+        baseSha: prep.baseSha,
+        verifyOutput: "",
+        error: prep.error,
       };
     }
 
-    await runGit([
-      "-C",
-      params.landingDir,
-      "push",
-      params.barePath,
-      `HEAD:refs/heads/${params.defaultBranch}`,
-    ]);
-    const landedSha = await getBranchHead(params.landingDir, "HEAD");
+    const checks = await runRepoChecks({
+      workdir: params.landingDir,
+      verifyCommand: params.verifyCommand,
+      sandboxEnabled: false,
+      disableSandbox: true,
+    });
+    if (!checks.ok) {
+      const firstFail = checks.checks.find((c) => !c.ok);
+      return {
+        ok: false,
+        baseSha: prep.baseSha,
+        verifyOutput: checks.combined_output,
+        error: `Verify command failed (exit ${firstFail?.exit_code ?? "null"}):\n${checks.combined_output}`,
+      };
+    }
+
+    const landedSha = await finalizeLandingPush({
+      landingDir: params.landingDir,
+      barePath: params.barePath,
+      defaultBranch: params.defaultBranch,
+    });
     return {
       ok: true,
-      baseSha,
+      baseSha: prep.baseSha,
       landedSha,
-      verifyOutput: verify.output,
+      verifyOutput: checks.combined_output,
     };
   } finally {
     rmSync(params.landingDir, { recursive: true, force: true });
