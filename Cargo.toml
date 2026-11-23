@@ -10,6 +10,7 @@ description = "Kawan GPUI desktop client"
 base64 = "0.22"
 gpui = { package = "gpui-ce", version = "0.3" }
 gpui_platform = { package = "gpui_ce_platform", version = "0.3" }
+pulldown-cmark = { version = "0.13", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
