@@ -1092,24 +1092,23 @@ pub(crate) fn conversation_stream_and_composer(
                                     ))
                             } else {
                                 div()
-                                    .flex()
-                                    .items_center()
-                                    .flex_wrap()
-                                    .child(
+                                    .w_full()
+                                    .min_w(px(0.0))
+                                    .font_family(theme::MONO)
+                                    .text_size(px(12.0))
+                                    .line_height(px(17.0))
+                                    .text_color(theme.ink)
+                                    .child(app.composer_text.clone())
+                                    // An inline box keeps the caret in the text flow across soft wraps.
+                                    .children(focused.then(|| {
                                         div()
-                                            .font_family(theme::MONO)
-                                            .text_size(px(12.0))
-                                            .line_height(px(17.0))
-                                            .text_color(theme.ink)
-                                            .child(app.composer_text.clone()),
-                                    )
-                                    .child(div().ml(px(1.0)).w(px(1.5)).h(px(14.0)).bg(
-                                        if focused {
-                                            theme.ink
-                                        } else {
-                                            gpui::transparent_black()
-                                        },
-                                    ))
+                                            .inline_flex()
+                                            .align_middle()
+                                            .ml(px(1.0))
+                                            .w(px(1.5))
+                                            .h(px(14.0))
+                                            .bg(theme.ink)
+                                    }))
                             },
                         ))
                         .child(
