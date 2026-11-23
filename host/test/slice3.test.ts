@@ -649,3 +649,89 @@ test("Slice 3: orchestrator controls top-level vs threaded replies and report.md
     rmSync(dataDir, { recursive: true, force: true });
   }
 });
+
+test("Slice 3: transient provider error recovered by pi auto-retry publishes reply without error banner", async () => {
+  const stub = await startStubProvider();
+  const repo = await createFixtureBareRepo();
+  const dataDir = mkdtempSync(join(tmpdir(), "kawan-slice3-retry-"));
+  const adminKey = await TestKeyPair.generate("admin@kawan");
+
+  let orchAttempts = 0;
+  stub.setHandler(() => {
+    orchAttempts += 1;
+    if (orchAttempts === 1) {
+      return {
+        status: 503,
+        errorBody: { error: { message: "transient upstream 503", type: "server_error" } },
+      };
+    }
+    return { text: "Recovered cleanly after transient error." };
+  });
+
+  const host = await startHost({
+    dataDir,
+    quiet: true,
+    disableSandbox: true,
+    decisionMode: "live",
+  });
+
+  try {
+    const admin = await WsTestClient.connect(host.url);
+    await admin.bootstrap(host.bootstrapToken!, "alice", adminKey);
+    await admin.request("settings.update", {
+      repo: { url: repo.barePath, default_branch: repo.defaultBranch },
+      verify_command: "true",
+      providers: {
+        stub: {
+          baseUrl: stub.baseUrl,
+          api: "openai-completions",
+          apiKey: "stub-key",
+          models: [{ id: "stub-model", name: "stub-model", reasoning: false, contextWindow: 128000, maxTokens: 16384 }],
+        },
+      },
+      roles: {
+        default: { provider: "stub", model: "stub-model", thinking_level: "off" },
+        decision: { provider: "stub", baseUrl: stub.systemOneBaseUrl, model: "stub-snap", apiKey: "stub-key" },
+      },
+    });
+
+    const created = await admin.request<{ bot: any }>("bot.create", {
+      name: "kawan",
+      persona: "Orchestrator",
+      sandbox_enabled: false,
+    });
+    const botId = created.bot.id;
+    const convs = await admin.request<{ conversations: Array<{ id: string; name: string }> }>("conversation.list");
+    const generalId = convs.conversations.find((c) => c.name === "general")!.id;
+    await admin.request("conversation.add_member", { conversation_id: generalId, user_id: botId });
+
+    const replyWait = admin.waitForNextFrame(
+      (f) => f.type === "message.new" && f.author?.kind === "bot",
+      25_000,
+    );
+    await admin.request("message.send", {
+      conversation_id: generalId,
+      body: "@kawan u there?",
+    });
+
+    const replyFrame = await replyWait;
+    assert.equal(replyFrame.message.body, "Recovered cleanly after transient error.");
+
+    const orchDeadline = Date.now() + 15_000;
+    while (host.db.getActiveOrchestratorSession(botId)?.status === "running" && Date.now() < orchDeadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
+    assert.equal(orchAttempts, 2);
+    const errFrames = admin.frames.filter((f) => f.type === "error");
+    assert.equal(errFrames.length, 0, `Expected no error frames after auto-retry, got: ${JSON.stringify(errFrames)}`);
+
+    admin.close();
+  } finally {
+    await host.close();
+    await stub.close();
+    repo.cleanup();
+    adminKey.cleanup();
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});

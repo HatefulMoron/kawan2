@@ -235,6 +235,8 @@ export class PiRpcProcess {
           const msg = ev.message;
           if (msg.stopReason === "error" || msg.errorMessage) {
             errorMessage = msg.errorMessage || "LLM provider error";
+          } else {
+            errorMessage = null;
           }
           if (Array.isArray(msg.content)) {
             const texts = msg.content
@@ -244,8 +246,12 @@ export class PiRpcProcess {
               lastAssistantText = texts.join("\n").trim();
             }
           }
-        } else if (ev.type === "auto_retry_end" && ev.success === false) {
-          errorMessage = ev.finalError || errorMessage || "Auto-retry failed";
+        } else if (ev.type === "auto_retry_end") {
+          if (ev.success === true) {
+            errorMessage = null;
+          } else if (ev.success === false) {
+            errorMessage = ev.finalError || errorMessage || "Auto-retry failed";
+          }
         } else if (ev.type === "extension_error") {
           errorMessage = `Extension error (${ev.event}): ${ev.error}`;
         } else if (ev.type === "agent_settled") {
