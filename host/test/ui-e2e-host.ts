@@ -33,13 +33,15 @@ async function main() {
               {
                 name: "report",
                 arguments: {
-                  text: "Added land_ok.txt and verified locally — ready for your approval.",
-                  artifact: {
-                    filename: "report.md",
-                    mime_type: "text/markdown",
-                    content:
-                      "# Verification Report\n\n- Created `land_ok.txt` with `ready`.\n- Committed cleanly on worker branch.\n- Ready to land on `main`.\n",
-                  },
+                  text: "Added land_ok.txt and verified locally — it is proposed in #merge-queue.",
+                  artifacts: [
+                    {
+                      filename: "report.md",
+                      mime_type: "text/markdown",
+                      content:
+                        "# Verification Report\n\n- Created `land_ok.txt` with `ready`.\n- Committed cleanly on worker branch.\n- Ready to land on `main`.\n",
+                    },
+                  ],
                 },
               },
             ],
@@ -54,7 +56,7 @@ async function main() {
               name: "spawn_session",
               arguments: {
                 title: "Add land_ok.txt",
-                task: "Create land_ok.txt containing 'ready', commit it, and call land_request.",
+                task: "Create land_ok.txt containing 'ready', commit it, and call propose_merge.",
               },
             },
           ],
@@ -81,8 +83,8 @@ async function main() {
       return {
         toolCalls: [
           {
-            name: "land_request",
-            arguments: { summary: "Added land_ok.txt containing 'ready'." },
+            name: "propose_merge",
+            arguments: { summary_md: "Added land_ok.txt containing 'ready'." },
           },
         ],
       };

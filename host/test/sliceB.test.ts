@@ -175,10 +175,10 @@ test("Slice B: serialized FIFO merge queue fast-path + .kawan/checks + touches_k
               arguments: {
                 title: isKawan ? "Update check script" : isSecond ? "Add two.txt" : "Add one.txt",
                 task: isKawan
-                  ? "Add executable .kawan/checks/03-extra.sh, commit it, and call land_request."
+                  ? "Add executable .kawan/checks/03-extra.sh, commit it, and call propose_merge."
                   : isSecond
-                    ? "Create two.txt containing 'two', commit it, and call land_request."
-                    : "Create one.txt containing 'one', commit it, and call land_request.",
+                    ? "Create two.txt containing 'two', commit it, and call propose_merge."
+                    : "Create one.txt containing 'one', commit it, and call propose_merge.",
               },
             },
           ],
@@ -202,7 +202,12 @@ test("Slice B: serialized FIFO merge queue fast-path + .kawan/checks + touches_k
     }
     if (toolCount === 1) {
       return {
-        toolCalls: [{ name: "land_request", arguments: { summary: "Committed changes cleanly." } }],
+        toolCalls: [
+          {
+            name: "propose_merge",
+            arguments: { summary_md: "Added the requested file so the queue test can land it." },
+          },
+        ],
       };
     }
     return { text: "Done." };
@@ -246,12 +251,12 @@ test("Slice B: serialized FIFO merge queue fast-path + .kawan/checks + touches_k
     await alice.request("conversation.add_member", { conversation_id: generalId, user_id: botRes.bot.id });
 
     // Create two non-conflicting land requests
-    const l1Wait = alice.waitForFrame((f) => f.type === "land.update" && f.land?.status === "requested", 25_000);
+    const l1Wait = alice.waitForFrame((f) => f.type === "land.update" && f.land?.status === "proposed", 25_000);
     await alice.request("message.send", { conversation_id: generalId, body: "@kawan do TASK_ONE please" });
     const l1Id = (await l1Wait).land.id as string;
 
     const l2Wait = alice.waitForFrame(
-      (f) => f.type === "land.update" && f.land?.status === "requested" && f.land?.id !== l1Id,
+      (f) => f.type === "land.update" && f.land?.status === "proposed" && f.land?.id !== l1Id,
       25_000,
     );
     await alice.request("message.send", { conversation_id: generalId, body: "@kawan do TASK_TWO please" });
@@ -261,8 +266,8 @@ test("Slice B: serialized FIFO merge queue fast-path + .kawan/checks + touches_k
     const landed1 = alice.waitForFrame((f) => f.type === "land.update" && f.land?.id === l1Id && f.land?.status === "landed", 25_000);
     const landed2 = alice.waitForFrame((f) => f.type === "land.update" && f.land?.id === l2Id && f.land?.status === "landed", 25_000);
     const [res1, res2] = await Promise.all([
-      alice.request<{ land: { id: string; status: string } }>("land.approve", { land_id: l1Id, async: true }),
-      alice.request<{ land: { id: string; status: string } }>("land.approve", { land_id: l2Id, async: true }),
+      alice.request<{ land: { id: string; status: string } }>("land.merge", { land_id: l1Id, async: true }),
+      alice.request<{ land: { id: string; status: string } }>("land.merge", { land_id: l2Id, async: true }),
     ]);
     assert.ok(["queued", "rebasing", "verifying", "landed"].includes(res1.land.status));
     assert.ok(["queued", "rebasing", "verifying", "landed"].includes(res2.land.status));
@@ -275,9 +280,14 @@ test("Slice B: serialized FIFO merge queue fast-path + .kawan/checks + touches_k
     assert.equal(ev1.land.touches_kawan, false);
     assert.equal(ev2.land.touches_kawan, false);
 
-    // Fast path posts zero messages in #merge-queue
+    // Fast path posts no incident chatter in #merge-queue: only the two proposals
     const mqOpen = await alice.request<{ messages: any[] }>("conversation.open", { conversation_id: mqConv.id });
-    assert.equal(mqOpen.messages.length, 0, "Fast path must not clutter #merge-queue");
+    assert.equal(
+      mqOpen.messages.filter((m: any) => m.thread_id).length,
+      0,
+      "Fast path must not open incident threads in #merge-queue",
+    );
+    assert.equal(mqOpen.messages.length, 2, "Only the two proposal messages belong in #merge-queue");
 
     const mqSnap = await alice.request<{ queue: { queued: any[]; recent_landed: any[]; settings: { paused: boolean } } }>(
       "merge_queue.read",
@@ -288,12 +298,12 @@ test("Slice B: serialized FIFO merge queue fast-path + .kawan/checks + touches_k
 
     // Worker touching .kawan/checks/* sets touches_kawan = true
     const l3Wait = alice.waitForFrame(
-      (f) => f.type === "land.update" && f.land?.status === "requested" && f.land?.id !== l1Id && f.land?.id !== l2Id,
+      (f) => f.type === "land.update" && f.land?.status === "proposed" && f.land?.id !== l1Id && f.land?.id !== l2Id,
       25_000,
     );
     await alice.request("message.send", { conversation_id: generalId, body: "@kawan do TASK_KAWAN please" });
     const l3Id = (await l3Wait).land.id as string;
-    const settled3 = await alice.request<{ land: { touches_kawan: boolean; status: string } }>("land.approve", {
+    const settled3 = await alice.request<{ land: { touches_kawan: boolean; status: string } }>("land.merge", {
       land_id: l3Id,
     });
     assert.equal(settled3.land.status, "landed");
@@ -388,10 +398,10 @@ test("Slice B: merge queue friction pause -> #merge-queue Queue Bot reconcile ->
               arguments: {
                 title: isEject ? "Failing eject task" : isSecond ? "Good second task" : "Bad status task",
                 task: isEject
-                  ? "Write BAD into status.txt, commit it, and call land_request."
+                  ? "Write BAD into status.txt, commit it, and call propose_merge."
                   : isSecond
-                    ? "Write unrelated ok.txt without touching status.txt, commit it, and call land_request."
-                    : "Write BAD into status.txt, commit it, and call land_request.",
+                    ? "Write unrelated ok.txt without touching status.txt, commit it, and call propose_merge."
+                    : "Write BAD into status.txt, commit it, and call propose_merge.",
               },
             },
           ],
@@ -410,7 +420,7 @@ test("Slice B: merge queue friction pause -> #merge-queue Queue Bot reconcile ->
       return { toolCalls: [{ name: "bash", arguments: { command: cmd } }] };
     }
     if (toolCount === 1) {
-      return { toolCalls: [{ name: "land_request", arguments: { summary: "Ready." } }] };
+      return { toolCalls: [{ name: "propose_merge", arguments: { summary_md: "Ready for the queue." } }] };
     }
     return { text: "Done." };
   });
@@ -450,12 +460,12 @@ test("Slice B: merge queue friction pause -> #merge-queue Queue Bot reconcile ->
     await alice.request("conversation.add_member", { conversation_id: generalId, user_id: botRes.bot.id });
 
     // Spawn bad task 1 + clean task 2
-    const l1Wait = alice.waitForFrame((f) => f.type === "land.update" && f.land?.status === "requested", 25_000);
+    const l1Wait = alice.waitForFrame((f) => f.type === "land.update" && f.land?.status === "proposed", 25_000);
     await alice.request("message.send", { conversation_id: generalId, body: "@kawan run QUEUE_ONE" });
     const l1Id = (await l1Wait).land.id as string;
 
     const l2Wait = alice.waitForFrame(
-      (f) => f.type === "land.update" && f.land?.status === "requested" && f.land?.id !== l1Id,
+      (f) => f.type === "land.update" && f.land?.status === "proposed" && f.land?.id !== l1Id,
       25_000,
     );
     await alice.request("message.send", { conversation_id: generalId, body: "@kawan run QUEUE_TWO" });
@@ -476,8 +486,8 @@ test("Slice B: merge queue friction pause -> #merge-queue Queue Bot reconcile ->
     );
 
     await Promise.all([
-      alice.request("land.approve", { land_id: l1Id, async: true }),
-      alice.request("land.approve", { land_id: l2Id, async: true }),
+      alice.request("land.merge", { land_id: l1Id, async: true }),
+      alice.request("land.merge", { land_id: l2Id, async: true }),
     ]);
 
     const pausedEv = await pausedWait;
@@ -514,7 +524,7 @@ test("Slice B: merge queue friction pause -> #merge-queue Queue Bot reconcile ->
 
     // Test merge_queue.pause / merge_queue.remove / merge_queue.eject
     const l3Wait = alice.waitForFrame(
-      (f) => f.type === "land.update" && f.land?.status === "requested" && f.land?.id !== l1Id && f.land?.id !== l2Id,
+      (f) => f.type === "land.update" && f.land?.status === "proposed" && f.land?.id !== l1Id && f.land?.id !== l2Id,
       25_000,
     );
     await alice.request("message.send", { conversation_id: generalId, body: "@kawan run QUEUE_EJECT" });
@@ -523,7 +533,7 @@ test("Slice B: merge queue friction pause -> #merge-queue Queue Bot reconcile ->
     const l3SessionId = l3Frame.land.session_id as string;
 
     await alice.request("merge_queue.pause");
-    const queuedWhilePaused = await alice.request<{ land: { status: string } }>("land.approve", {
+    const queuedWhilePaused = await alice.request<{ land: { status: string } }>("land.merge", {
       land_id: l3Id,
       async: true,
     });
@@ -533,7 +543,7 @@ test("Slice B: merge queue friction pause -> #merge-queue Queue Bot reconcile ->
       land_id: l3Id,
     });
     assert.equal(afterRemove.queue.queued.length, 0);
-    assert.equal(host.db.getLand(l3Id)!.status, "requested");
+    assert.equal(host.db.getLand(l3Id)!.status, "proposed");
 
     // Unpause queue and re-approve l3 -> pause -> eject back to implementer
     await alice.request("merge_queue.resume");
@@ -541,7 +551,7 @@ test("Slice B: merge queue friction pause -> #merge-queue Queue Bot reconcile ->
       (f) => f.type === "land.update" && f.land?.id === l3Id && f.land?.status === "paused",
       25_000,
     );
-    await alice.request("land.approve", { land_id: l3Id, async: true });
+    await alice.request("land.merge", { land_id: l3Id, async: true });
     await l3Paused;
 
     const afterEject = await alice.request<{ queue: { settings: { paused: boolean }; queued: any[] } }>(
@@ -550,7 +560,7 @@ test("Slice B: merge queue friction pause -> #merge-queue Queue Bot reconcile ->
     );
     assert.equal(afterEject.queue.settings.paused, false);
     assert.equal(afterEject.queue.queued.length, 0);
-    assert.equal(host.db.getLand(l3Id)!.status, "failed");
+    assert.equal(host.db.getLand(l3Id)!.status, "proposed");
     assert.equal(host.db.getSession(l3SessionId)!.status, "idle");
   } finally {
     await alice?.close();

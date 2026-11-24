@@ -10,7 +10,7 @@ import {
 } from "./auth.js";
 import type { KawanDb } from "./db.js";
 import type { ClientRequest, ConversationRow, UserRow, WsEventFrame, WsResponseFrame } from "./types.js";
-import { serializeLand } from "./types.js";
+import { serializeLand, serializeMessage } from "./types.js";
 
 type PendingAuth =
   | {
@@ -620,7 +620,7 @@ export class KawanWsServer {
           name: m.name,
           role: m.role,
         }));
-        const messages = db.listMessages(convId, since);
+        const messages = db.listMessages(convId, since).map(serializeMessage);
         const decisions = db.listDecisions(convId, since);
         const sessions = db.listSessions({ conversationId: convId }).map((s) => {
           const { token: _t, ...pub } = s;
@@ -702,7 +702,7 @@ export class KawanWsServer {
         db.markConversationRead(user.id, convId, message.seq);
         this.broadcastToConversation(conv, {
           type: "message.new",
-          message,
+          message: serializeMessage(message),
           author: { id: user.id, kind: user.kind, name: user.name },
         });
         if (this.opts.onMessageCreated) {
@@ -717,7 +717,7 @@ export class KawanWsServer {
             });
           });
         }
-        return { message };
+        return { message: serializeMessage(message) };
       }
 
       default:

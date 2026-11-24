@@ -62,8 +62,8 @@ test("Slice 4: passing verify lands signed commit onto bare repo; failing verify
                 title: scenarioPhase === "pass" ? "Add land_ok.txt" : "Add bad_change.txt",
                 task:
                   scenarioPhase === "pass"
-                    ? "Create land_ok.txt containing 'ready', commit it, and call land_request."
-                    : "Create bad_change.txt containing 'broken', commit it, and call land_request.",
+                    ? "Create land_ok.txt containing 'ready', commit it, and call propose_merge."
+                    : "Create bad_change.txt containing 'broken', commit it, and call propose_merge.",
               },
             },
           ],
@@ -90,8 +90,8 @@ test("Slice 4: passing verify lands signed commit onto bare repo; failing verify
       return {
         toolCalls: [
           {
-            name: "land_request",
-            arguments: { summary: "Added the file and committed it cleanly." },
+            name: "propose_merge",
+            arguments: { summary_md: "Added the file so the flow works end to end." },
           },
         ],
       };
@@ -170,7 +170,7 @@ test("Slice 4: passing verify lands signed commit onto bare repo; failing verify
 
     // --- PART A: Passing verification lands commit onto bare repo ---
     const landReq1Wait = admin.waitForNextFrame(
-      (f) => (f.type === "land.update" && f.land?.status === "requested") || f.type === "error",
+      (f) => (f.type === "land.update" && f.land?.status === "proposed") || f.type === "error",
       waitTimeout,
     );
     const wrapMsgWait = admin.waitForNextFrame(
@@ -183,7 +183,7 @@ test("Slice 4: passing verify lands signed commit onto bare repo; failing verify
     );
     await admin.request("message.send", {
       conversation_id: generalId,
-      body: "@kawan please create a file named land_ok.txt containing 'ready', commit it with git, and call land_request so I can approve landing it.",
+      body: "@kawan please create a file named land_ok.txt containing 'ready', commit it with git, and propose it for merge so I can approve landing it.",
     });
 
     const landReq1 = await landReq1Wait;
@@ -194,9 +194,14 @@ test("Slice 4: passing verify lands signed commit onto bare repo; failing verify
     assert.ok(existsSync(worker1ClonePath));
 
     if (!useLiveLlm) {
-      const wrapMsg = await wrapMsgWait;
+      await wrapMsgWait;
+      // The proposal message is the handback: it lives in #merge-queue and the
+      // orchestrator's chat recap is ordinary commentary, not linked to the land.
       const linkedLand = host.db.getLand(land1Id)!;
-      assert.equal(linkedLand.message_id, wrapMsg.message.id);
+      assert.ok(linkedLand.message_id, "Proposal land row must carry its proposal message");
+      const proposalMessage = host.db.getMessage(linkedLand.message_id!)!;
+      const mqConv = host.db.getMergeQueueConversation()!;
+      assert.equal(proposalMessage.conversation_id, mqConv.id);
       assert.ok(
         !host.db.listMessages(generalId).some((m) => m.body.startsWith("Ready to land")),
         "Host must not post automated 'Ready to land' messages",
@@ -207,7 +212,7 @@ test("Slice 4: passing verify lands signed commit onto bare repo; failing verify
       (f) => f.type === "land.update" && f.land?.id === land1Id && f.land?.status === "landed",
       20_000,
     );
-    const approveRes1 = await admin.request<{ land: any; session: any }>("land.approve", {
+    const approveRes1 = await admin.request<{ land: any; session: any }>("land.merge", {
       land_id: land1Id,
     });
     await landedWait;
@@ -260,12 +265,12 @@ test("Slice 4: passing verify lands signed commit onto bare repo; failing verify
     await admin.request("conversation.add_member", { conversation_id: failChanId, user_id: botId });
 
     const landReq2Wait = admin.waitForNextFrame(
-      (f) => (f.type === "land.update" && f.land?.status === "requested") || f.type === "error",
+      (f) => (f.type === "land.update" && f.land?.status === "proposed") || f.type === "error",
       waitTimeout,
     );
     await admin.request("message.send", {
       conversation_id: failChanId,
-      body: "@kawan please create a file named bad_change.txt containing 'broken', commit it with git, and call land_request so I can test verification.",
+      body: "@kawan please create a file named bad_change.txt containing 'broken', commit it with git, and propose it for merge so I can test verification.",
     });
 
     const landReq2 = await landReq2Wait;
@@ -281,7 +286,7 @@ test("Slice 4: passing verify lands signed commit onto bare repo; failing verify
         f.message.body.includes("FAIL: lint check broken at line 42"),
       20_000,
     );
-    const approveRes2 = await admin.request<{ land: any; session: any }>("land.approve", {
+    const approveRes2 = await admin.request<{ land: any; session: any }>("land.merge", {
       land_id: land2Id,
     });
     assert.equal(approveRes2.land.status, "paused");
@@ -297,13 +302,13 @@ test("Slice 4: passing verify lands signed commit onto bare repo; failing verify
     assert.equal(headAfterFail.trim(), approveRes1.land.landed_sha);
     assert.equal(existsSync(worker2ClonePath), true, "Failed worker clone should remain for inspection");
 
-    // Ejecting paused land marks it failed and unpauses queue
+    // Ejecting a paused item returns it to `proposed` (amendment-friendly) and unpauses queue
     const ejectRes = await admin.request<{ queue: any }>("merge_queue.eject", {
       land_id: land2Id,
       reason: "Fix lint check",
     });
     assert.equal(ejectRes.queue.settings.paused, false);
-    assert.equal(host.db.getLand(land2Id)!.status, "failed");
+    assert.equal(host.db.getLand(land2Id)!.status, "proposed");
 
     admin.close();
   } finally {

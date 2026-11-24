@@ -26,7 +26,7 @@ import type {
   SessionRow,
   UserRow,
 } from "./types.js";
-import { serializeLand } from "./types.js";
+import { serializeLand, serializeMessage } from "./types.js";
 import type { KawanWsServer } from "./ws.js";
 
 export class IssueManager {
@@ -191,16 +191,22 @@ export class IssueManager {
     this.wsServer.broadcast({ type: "issue.update", issue });
   }
 
-  private postHostNote(conv: ConversationRow, bot: UserRow, body: string, artifactId?: string | null): MessageRow {
+  private postHostNote(
+    conv: ConversationRow,
+    bot: UserRow,
+    body: string,
+    attachmentIds: string[] = [],
+  ): MessageRow {
     const msg = this.db.appendMessage({
       conversationId: conv.id,
       authorId: bot.id,
       body,
-      artifactId: artifactId ?? null,
+      attachmentIds,
     });
+    // Host-authored notices bypass routing: they are never sent to a bot.
     this.wsServer.broadcastToConversation(conv, {
       type: "message.new",
-      message: msg,
+      message: serializeMessage(msg),
       author: { id: bot.id, kind: "bot", name: bot.name },
     });
     return msg;
@@ -471,14 +477,14 @@ export class IssueManager {
             conv,
             bot,
             `Checkpoint: ${aheadLabel} · Checks passed (${current.checks_summary ?? "ok"}).`,
-            current.checks_artifact_id,
+            current.checks_artifact_id ? [current.checks_artifact_id] : [],
           );
         } else if (current.checks_status === "failed") {
           this.postHostNote(
             conv,
             bot,
             `Checkpoint: ${aheadLabel} · Checks failed (${current.checks_summary ?? "failed"}).`,
-            current.checks_artifact_id,
+            current.checks_artifact_id ? [current.checks_artifact_id] : [],
           );
         } else {
           this.postHostNote(conv, bot, `Checkpoint: ${aheadLabel}.`);
@@ -937,10 +943,17 @@ export class IssueManager {
     };
   }
 
-  async landIssue(
-    issueRef: string | number,
-    userId: string,
-  ): Promise<{ issue: SerializedIssue; land: SerializedLand }> {
+  /**
+   * Issue room **Propose**: the same proposal path as everywhere else, with
+   * `lands.issue_id` set. It creates or amends the issue branch's proposal; it
+   * never enqueues. A human (or auto mode) accepts it from #merge-queue.
+   */
+  async proposeIssue(issueRef: string | number): Promise<{
+    issue: SerializedIssue;
+    land: SerializedLand;
+    message: MessageRow;
+    created: boolean;
+  }> {
     const issue = this.resolveIssueRef(issueRef);
     if (issue.status !== "open") {
       throw new Error(`Issue #${issue.number} is ${issue.status}, not open`);
@@ -951,32 +964,20 @@ export class IssueManager {
     }
     const sess = issue.active_session_id ? this.db.getSession(issue.active_session_id) : null;
     if (!sess || !sess.clone_path || !existsSync(sess.clone_path) || !sess.branch) {
-      throw new Error(`Issue #${issue.number} has no active branch to land`);
+      throw new Error(`Issue #${issue.number} has no active branch to propose`);
     }
     if (sess.status === "running") {
-      throw new Error("Wait for the active worker turn to finish (or Stop it) before landing");
+      throw new Error("Wait for the active worker turn to finish (or Stop it) before proposing");
     }
     const clean = await isWorkingTreeClean(sess.clone_path);
     if (!clean) {
-      throw new Error("Worker clone has uncommitted changes; commit before landing");
+      throw new Error("Worker clone has uncommitted changes; commit before proposing");
     }
     const ahead = await commitsAhead(sess.clone_path, settings.repo.default_branch);
     if (ahead < 1) {
       throw new Error(
-        `Branch has 0 commits ahead of ${settings.repo.default_branch}; commit changes before landing`,
+        `Branch has 0 commits ahead of ${settings.repo.default_branch}; commit changes before proposing`,
       );
-    }
-
-    const existingLands = this.db.listLands({ sessionId: sess.id });
-    const activeLand = existingLands.find(
-      (l) =>
-        l.status === "queued" ||
-        l.status === "rebasing" ||
-        l.status === "verifying" ||
-        l.status === "paused",
-    );
-    if (activeLand) {
-      throw new Error(`Issue #${issue.number} is already in the merge queue (${activeLand.status})`);
     }
 
     await this.cancelActiveReviewers(issue.id);
@@ -988,47 +989,22 @@ export class IssueManager {
     })!;
     this.broadcastIssue(this.serializeIssue(updatedIssue));
 
-    const reusable = [...existingLands]
-      .reverse()
-      .find((l) => l.status === "requested" || l.status === "failed" || l.status === "removed");
-
-    const landRow = reusable
-      ? this.db.updateLand(reusable.id, {
-          status: "requested",
-          issue_id: issue.id,
-          conversation_id: issue.conversation_id,
-          thread_id: null,
-          checks_json: updatedIssue.checks_json,
-          touches_kawan: touchesKawan ? 1 : 0,
-          error: null,
-        })!
-      : (() => {
-          const created = this.db.createLand({
-            sessionId: sess.id,
-            conversationId: issue.conversation_id,
-            issueId: issue.id,
-          });
-          return this.db.updateLand(created.id, {
-            checks_json: updatedIssue.checks_json,
-            touches_kawan: touchesKawan ? 1 : 0,
-          })!;
-        })();
-
-    const conv = this.db.getConversation(issue.conversation_id);
-    const bot = this.db.getUser(sess.bot_id);
-    if (conv && bot) {
-      const kawanWarn = touchesKawan ? " (Modifies `.kawan/` checks.)" : "";
-      this.postHostNote(conv, bot, `Enqueued Issue #${issue.number} onto #merge-queue.${kawanWarn}`);
-    }
-
-    const enqueued = await this.mergeQueue.enqueueLand({
-      landId: landRow.id,
-      approvedBy: userId,
-      trigger: "manual_approve",
-      waitForSettlement: false,
+    const summary =
+      sess.last_report?.trim() || `Implements #${issue.number}: ${issue.title}`;
+    const result = await this.mergeQueue.proposeLand({
+      sessionId: sess.id,
+      bodyMd: summary,
+      title: `#${issue.number} ${issue.title}`,
+      issueId: issue.id,
     });
+
     const latest = this.db.getIssue(issue.id) ?? updatedIssue;
-    return { issue: this.serializeIssue(latest), land: enqueued.land };
+    return {
+      issue: this.serializeIssue(latest),
+      land: serializeLand(result.land),
+      message: result.message,
+      created: result.created,
+    };
   }
 
   async handleAskOwner(

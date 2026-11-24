@@ -12,6 +12,19 @@ import { startStubProvider } from "./stub-provider.js";
 
 const execFileAsync = promisify(execFile);
 
+async function waitUntil(
+  predicate: () => boolean,
+  timeoutMs: number,
+  label: string,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for ${label}`);
+}
+
 async function git(args: string[], cwd?: string): Promise<string> {
   const { stdout } = await execFileAsync("git", args, { cwd });
   return stdout.trim();
@@ -316,6 +329,16 @@ test("Slice D: bot-to-bot routing everywhere, read-only multi-reviewers, .kawan/
       body: "@coder please ask @rev1 what style rule applies",
     });
     await rev1ReplyWait;
+    // Both replies are in flight: coder's bot-to-bot message routes to rev1 and
+    // rev1 answers the human's mention. Wait for the routed call, don't race it.
+    await waitUntil(
+      () =>
+        snapCalls.some(
+          (c) => c.bot === "rev1" && c.author === "coder" && c.authorKind === "bot" && c.conv === "channel",
+        ),
+      15_000,
+      "rev1 to receive coder's bot-to-bot message",
+    );
     assert.ok(
       snapCalls.some(
         (c) => c.bot === "rev1" && c.author === "coder" && c.authorKind === "bot" && c.conv === "channel",
@@ -390,12 +413,16 @@ test("Slice D: bot-to-bot routing everywhere, read-only multi-reviewers, .kawan/
       "Host checkpoint notes must NEVER re-enter SubQ Snap",
     );
 
-    // Human clicks direct Land -> lands cleanly -> post-land Soul Digest updates @coder's soul.md
+    // Human clicks Propose then Merge -> lands cleanly -> post-land Soul Digest updates @coder's soul.md
     const landedWait = alice.waitForNextFrame(
       (f) => f.type === "issue.update" && f.issue?.id === issueId && f.issue?.status === "landed",
       25_000,
     );
-    await alice.request("issue.land", { issue_id: issueId });
+    const proposed = await alice.request<{ land: { id: string; status: string } }>("issue.propose", {
+      issue_id: issueId,
+    });
+    assert.equal(proposed.land.status, "proposed");
+    await alice.request("land.merge", { land_id: proposed.land.id });
     await landedWait;
 
     const landedApp = await git(["show", `refs/heads/${repo.defaultBranch}:app.txt`], hostBare);
@@ -428,14 +455,13 @@ test("Slice D: bot-to-bot routing everywhere, read-only multi-reviewers, .kawan/
   }
 });
 
-test("Slice D: single-bot self-review via review_issue and blocking land_request on issue workers", async () => {
+test("Slice D: single-bot self-review via review_issue and issue-worker proposals", async () => {
   const decisionMode: DecisionMode = "live";
   const stub = await startStubProvider();
   const repo = await createFixtureBareRepo({ "README.md": "# Single Bot Self Review\n" });
   const dataDir = mkdtempSync(join(tmpdir(), "kawan-sliceD-singlebot-"));
   const adminKey = await TestKeyPair.generate("admin@kawan");
 
-  let sawLandRequestError = false;
   let sawUpdatedSpecInReviewer = false;
 
   stub.setHandler((reqBody) => {
@@ -478,14 +504,7 @@ test("Slice D: single-bot self-review via review_issue and blocking land_request
       return { text: "NO_REPLY" };
     }
 
-    // Worker tries land_request -> must be rejected cleanly inside an issue session!
-    const lastTool = [...msgs].reverse().find((m: any) => m.role === "tool");
-    if (lastTool && JSON.stringify(lastTool).includes("cannot call land_request")) {
-      sawLandRequestError = true;
-      return {
-        toolCalls: [{ name: "report", arguments: { text: "Committed work.txt cleanly." } }],
-      };
-    }
+    // Issue workers propose on their own branch instead of asking to land.
     const toolCount = msgs.filter((m: any) => m.role === "tool").length;
     if (toolCount === 0) {
       return {
@@ -499,7 +518,12 @@ test("Slice D: single-bot self-review via review_issue and blocking land_request
     }
     if (toolCount === 1) {
       return {
-        toolCalls: [{ name: "land_request", arguments: { summary: "trying land_request" } }],
+        toolCalls: [
+          {
+            name: "propose_merge",
+            arguments: { summary_md: "Added work.txt so the solo flow has a file to build on." },
+          },
+        ],
       };
     }
     return { text: "NO_REPLY" };
@@ -549,9 +573,16 @@ test("Slice D: single-bot self-review via review_issue and blocking land_request
       (f) => f.type === "issue.update" && f.issue?.id === issueId && f.issue?.commits_ahead === 1,
       20_000,
     );
+    const proposalWait = alice.waitForNextFrame(
+      (f) => f.type === "land.update" && f.land?.status === "proposed",
+      25_000,
+    );
     await alice.request("message.send", { conversation_id: convId, body: "@kawan write work.txt now" });
     await committedWait;
-    assert.equal(sawLandRequestError, true, "land_request must be rejected cleanly inside issue sessions");
+    const proposalEv = await proposalWait;
+    assert.equal(proposalEv.land.issue_id, issueId, "issue worker proposal must link the issue");
+    assert.ok(proposalEv.land.message_id, "issue worker proposal must own a message");
+    assert.equal(host.db.getLand(proposalEv.land.id)!.status, "proposed");
 
     // Edit spec live, then ask @kawan to self-review -> review_issue spawns fresh read-only reviewer seeing updated spec!
     await alice.request("issue.update", { issue_id: issueId, body_md: "Write work.txt.\nInclude audit trail." });

@@ -13,7 +13,7 @@ export const REQUIRED_SOUL_HEADINGS = [
 
 export const INITIAL_SOUL_DOCUMENT = `## Working agreements
 
-- Keep changes focused, commit with clear messages, and verify before requesting land.
+- Keep changes focused, commit with clear messages, and verify before proposing the merge.
 
 ## Project facts
 

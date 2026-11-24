@@ -60,7 +60,7 @@
         "type": "choice",
         "choice": "orchestrator",
         "probabilities": {
-          "none": 0.00008240147872129455,
+          "none": 8.240147872129455e-05,
           "orchestrator": 0.9999176263809204
         },
         "confidence": 0.9998352527618408
@@ -105,7 +105,97 @@
         "type": "choice",
         "choice": "orchestrator",
         "probabilities": {
-          "none": 0.00006188244151417166,
+          "none": 6.188244151417166e-05,
+          "orchestrator": 0.9999381303787231
+        },
+        "confidence": 0.9998762607574463
+      },
+      "readiness": {
+        "type": "choice",
+        "choice": "dispatch",
+        "probabilities": {
+          "dispatch": 0.9991666078567505,
+          "hold": 0.0008334204903803766
+        },
+        "confidence": 0.998333215713501
+      },
+      "explicit_work_start": {
+        "type": "choice",
+        "choice": "yes",
+        "probabilities": {
+          "yes": 0.9998356103897095,
+          "no": 0.0001643988216528669
+        },
+        "confidence": 0.999671220779419
+      },
+      "work_request": {
+        "type": "choice",
+        "choice": "yes",
+        "probabilities": {
+          "yes": 0.9998295307159424,
+          "no": 0.0001703908492345363
+        },
+        "confidence": 0.9996590614318848
+      }
+    },
+    "usage": {
+      "input_tokens": 963,
+      "output_tokens": 0
+    }
+  },
+  "1a24bac8ddd0e9490e782a51": {
+    "model": "subq-snap-1.2",
+    "answers": {
+      "destination": {
+        "type": "choice",
+        "choice": "orchestrator",
+        "probabilities": {
+          "none": 8.240147872129455e-05,
+          "orchestrator": 0.9999176263809204
+        },
+        "confidence": 0.9998352527618408
+      },
+      "readiness": {
+        "type": "choice",
+        "choice": "dispatch",
+        "probabilities": {
+          "dispatch": 0.9989641904830933,
+          "hold": 0.0010357650462538004
+        },
+        "confidence": 0.9979283809661865
+      },
+      "explicit_work_start": {
+        "type": "choice",
+        "choice": "yes",
+        "probabilities": {
+          "yes": 0.9998225569725037,
+          "no": 0.00017750379629433155
+        },
+        "confidence": 0.9996451139450073
+      },
+      "work_request": {
+        "type": "choice",
+        "choice": "yes",
+        "probabilities": {
+          "yes": 0.9997983574867249,
+          "no": 0.0002016089711105451
+        },
+        "confidence": 0.9995967149734497
+      }
+    },
+    "usage": {
+      "input_tokens": 963,
+      "output_tokens": 0
+    }
+  },
+  "c4785916e4972da4e4157f20": {
+    "model": "subq-snap-1.2",
+    "answers": {
+      "destination": {
+        "type": "choice",
+        "choice": "orchestrator",
+        "probabilities": {
+          "none": 6.188244151417166e-05,
           "orchestrator": 0.9999381303787231
         },
         "confidence": 0.9998762607574463

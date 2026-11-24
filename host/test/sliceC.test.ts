@@ -233,7 +233,7 @@ test("Slice C: issue.md live injection, chat-first spawn, and unconfigured check
   }
 });
 
-test("Slice C: chat-first spawn gate, ask_owner (open), implicit check fail (no auto-retry), sync_main, fix -> pass, issue.land", async () => {
+test("Slice C: chat-first spawn gate, ask_owner (open), implicit check fail (no auto-retry), sync_main, fix -> pass, issue.propose + land.merge", async () => {
   const decisionMode: DecisionMode = "live";
   const stub = await startStubProvider();
   const repo = await createFixtureBareRepo({ "README.md": "# Collaborative Issue Repo\n" });
@@ -339,7 +339,7 @@ test("Slice C: chat-first spawn gate, ask_owner (open), implicit check fail (no 
               name: "report",
               arguments: {
                 text: "First draft ready for check",
-                artifact: { filename: "notes.txt", mime_type: "text/plain", content: "wrote READY\n" },
+                artifacts: [{ filename: "notes.txt", mime_type: "text/plain", content: "wrote READY\n" }],
               },
             },
           ],
@@ -433,12 +433,9 @@ test("Slice C: chat-first spawn gate, ask_owner (open), implicit check fail (no 
     assert.equal(niEv.issue.status, "open");
     await askIdleWait;
 
-    const statusRes = await alice.request<{ issues: Array<{ id: string; status: string; needs_input_question: string | null }> }>(
-      "status.read",
-    );
-    assert.ok(
-      statusRes.issues.some((i) => i.id === issueId && i.status === "open" && i.needs_input_question !== null),
-    );
+    const issueRow = host.db.listIssues().find((i) => i.id === issueId)!;
+    assert.equal(issueRow.status, "open");
+    assert.ok(issueRow.needs_input_question);
 
     // Owner reply in issue room bypasses SubQ Snap -> worker commits READY -> implicit check FAILS with NO auto-retry!
     const decisionsBefore = host.db.listDecisions(issueConvId).length;
@@ -505,15 +502,25 @@ test("Slice C: chat-first spawn gate, ask_owner (open), implicit check fail (no 
     assert.equal(passedEv.issue.status, "open");
     assert.equal(passedEv.issue.checks_status, "passed");
 
-    // Direct one-click issue.land -> enqueues onto Merge Queue -> lands cleanly
+    // One-click issue.propose -> proposal in #merge-queue -> land.merge lands cleanly
+    const proposedRes = await alice.request<{
+      land: { id: string; issue_id: string; status: string };
+      message: { id: string; conversation_id: string };
+      created: boolean;
+    }>("issue.propose", { issue_id: issueId });
+    assert.equal(proposedRes.land.issue_id, issueId);
+    assert.equal(proposedRes.land.status, "proposed");
+    assert.equal(proposedRes.created, true);
+    assert.equal(host.db.getLand(proposedRes.land.id)!.message_id, proposedRes.message.id);
+
     const landedIssueWait = alice.waitForNextFrame(
       (f) => f.type === "issue.update" && f.issue?.id === issueId && f.issue?.status === "landed",
       25_000,
     );
-    const landedRes = await alice.request<{ land: { id: string; issue_id: string } }>("issue.land", {
-      issue_id: issueId,
+    const mergedRes = await alice.request<{ land: { status: string } }>("land.merge", {
+      land_id: proposedRes.land.id,
     });
-    assert.equal(landedRes.land.issue_id, issueId);
+    assert.equal(mergedRes.land.status, "landed");
     await landedIssueWait;
 
     const landedContent = await git(["show", `refs/heads/${repo.defaultBranch}:ready.txt`], hostBareRepo);
@@ -554,7 +561,7 @@ test("Slice C: Promote to Issue, Stop, and Abandon/Close", async () => {
               name: "spawn_session",
               arguments: {
                 title: "Ad-hoc change",
-                task: "Write adhoc.txt, commit it, attach report, and call land_request.",
+                task: "Write adhoc.txt, commit it, attach report, and call propose_merge.",
               },
             },
           ],
@@ -581,14 +588,14 @@ test("Slice C: Promote to Issue, Stop, and Abandon/Close", async () => {
             name: "report",
             arguments: {
               text: "Committed adhoc.txt",
-              artifact: { filename: "adhoc-report.txt", mime_type: "text/plain", content: "adhoc\n" },
+              artifacts: [{ filename: "adhoc-report.txt", mime_type: "text/plain", content: "adhoc\n" }],
             },
           },
         ],
       };
     }
     if (toolCount === 2) {
-      return { toolCalls: [{ name: "land_request", arguments: { summary: "adhoc ready" } }] };
+      return { toolCalls: [{ name: "propose_merge", arguments: { summary_md: "Added adhoc.txt for the promote flow." } }] };
     }
     return { text: "Done." };
   });
@@ -625,7 +632,7 @@ test("Slice C: Promote to Issue, Stop, and Abandon/Close", async () => {
     });
     await alice.request("conversation.add_member", { conversation_id: generalId, user_id: botRes.bot.id });
 
-    const landWait = alice.waitForFrame((f) => f.type === "land.update" && f.land?.status === "requested", 25_000);
+    const landWait = alice.waitForFrame((f) => f.type === "land.update" && f.land?.status === "proposed", 25_000);
     await alice.request("message.send", { conversation_id: generalId, body: "@kawan add adhoc.txt now" });
     const landFrame = await landWait;
     const workerId = landFrame.land.session_id as string;

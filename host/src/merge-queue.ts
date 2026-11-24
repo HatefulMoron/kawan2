@@ -1,7 +1,16 @@
 import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { KawanDb } from "./db.js";
-import { finalizeLandingPush, prepareLandingClone, runRepoChecks } from "./git.js";
+import {
+  branchTouchesKawanDir,
+  commitsAhead,
+  commitsBehindMain,
+  finalizeLandingPush,
+  isWorkingTreeClean,
+  prepareLandingClone,
+  runGit,
+  runRepoChecks,
+} from "./git.js";
 import type { SessionManager } from "./sessions.js";
 import { deriveTaskTitle } from "./sessions.js";
 import type {
@@ -11,11 +20,12 @@ import type {
   LandingMode,
   MergeConflictPolicy,
   MessageRow,
+  ProposalCard,
   SerializedLand,
   SessionRow,
   UserRow,
 } from "./types.js";
-import { serializeLand } from "./types.js";
+import { OPEN_LAND_STATUSES, serializeLand, serializeMessage } from "./types.js";
 import type { KawanWsServer } from "./ws.js";
 
 export interface MergeQueueSnapshot {
@@ -26,10 +36,28 @@ export interface MergeQueueSnapshot {
     conflict_policy: MergeConflictPolicy;
     paused: boolean;
   };
+  /** Open proposals awaiting a human **Merge** (or auto mode). */
+  proposed: ProposalCard[];
   head: SerializedLand | null;
   queued: SerializedLand[];
   paused_land: SerializedLand | null;
   recent_landed: SerializedLand[];
+}
+
+export interface ProposeLandInput {
+  sessionId: string;
+  bodyMd: string;
+  title?: string | null;
+  attachmentIds?: string[];
+  issueId?: string | null;
+}
+
+export interface ProposeLandResult {
+  land: LandRow;
+  message: MessageRow;
+  title: string;
+  created: boolean;
+  status: string;
 }
 
 export class MergeQueueManager {
@@ -44,6 +72,8 @@ export class MergeQueueManager {
   private closed = false;
   private settlementWaiters = new Map<string, Array<(land: LandRow) => void>>();
   private onIssueLandSync?: (land: LandRow) => void;
+  /** Branch metrics for proposal rows; refreshed whenever we evaluate a proposal. */
+  private proposalMetrics = new Map<string, { commitsAhead: number; behindMain: number }>();
 
   constructor(opts: {
     dataDir: string;
@@ -62,6 +92,16 @@ export class MergeQueueManager {
       resumeAndLand: (queueSession, summary) => this.handleBotResumeAndLand(queueSession, summary),
       ejectToImplementer: (queueSession, reason) =>
         this.handleBotEjectToImplementer(queueSession, reason),
+    });
+    this.sessionManager.setProposalHandlers({
+      propose: (input) =>
+        this.proposeLand({
+          sessionId: input.sessionId,
+          bodyMd: input.bodyMd,
+          title: input.title,
+          attachmentIds: input.attachmentIds,
+        }),
+      withdraw: (input) => this.withdrawBranchProposal(input.sessionId, input.by, input.reason),
     });
   }
 
@@ -163,6 +203,10 @@ export class MergeQueueManager {
       .sort((a, b) => b.updated_at - a.updated_at)
       .slice(0, 10)
       .map(serializeLand);
+    const proposed = this.db
+      .listProposedLands()
+      .map((land) => this.buildProposalCard(land))
+      .filter((card): card is ProposalCard => card !== null);
 
     return {
       conversation_id: conv.id,
@@ -172,10 +216,42 @@ export class MergeQueueManager {
         conflict_policy: settings.merge_queue?.conflict_policy ?? "pause_on_issue",
         paused: Boolean(settings.merge_queue?.paused || pausedLand),
       },
+      proposed,
       head,
       queued: activeQueue.map(serializeLand),
       paused_land: pausedLand,
       recent_landed: recentLanded,
+    };
+  }
+
+  private buildProposalCard(land: LandRow): ProposalCard | null {
+    if (!land.message_id) return null;
+    const message = this.db.getMessage(land.message_id);
+    if (!message) return null;
+    const author = this.db.getUser(message.author_id);
+    if (!author) return null;
+    const session = this.db.getSession(land.session_id);
+    const issue = land.issue_id ? this.db.getIssue(land.issue_id) : null;
+    const metrics = this.proposalMetrics.get(land.id);
+    let checks: CheckRunItem[] = [];
+    if (land.checks_json) {
+      try {
+        const parsed = JSON.parse(land.checks_json);
+        if (Array.isArray(parsed)) checks = parsed as CheckRunItem[];
+      } catch {
+        checks = [];
+      }
+    }
+    return {
+      land: serializeLand(land),
+      message: serializeMessage(message),
+      author: { id: author.id, kind: author.kind, name: author.name },
+      session_title: session?.title ?? null,
+      checks,
+      commits_ahead: metrics?.commitsAhead ?? issue?.commits_ahead ?? 0,
+      behind_main: metrics?.behindMain ?? issue?.behind_main ?? 0,
+      issue_number: issue?.number ?? null,
+      updated_at: land.updated_at,
     };
   }
 
@@ -255,38 +331,446 @@ export class MergeQueueManager {
     return this.getSnapshot();
   }
 
-  async enqueueLand(params: {
-    landId?: string;
-    sessionId?: string;
-    approvedBy: string;
-    trigger?: "manual_approve" | "auto_land";
-    waitForSettlement?: boolean;
-  }): Promise<{ land: SerializedLand; session: Omit<SessionRow, "token"> }> {
-    let land: LandRow | null = null;
-    if (params.landId) {
-      land = this.db.getLand(params.landId);
-    } else if (params.sessionId) {
-      const list = this.db.listLands({ sessionId: params.sessionId });
-      land =
-        [...list]
-          .reverse()
-          .find((l) => l.status === "requested" || l.status === "failed" || l.status === "removed") ??
-        null;
+  // ---- Proposals: create / amend, accept, withdraw ----
+
+  private findOpenLand(sessionId: string): LandRow | null {
+    const open = this.db
+      .listLands({ sessionId })
+      .filter((l) => OPEN_LAND_STATUSES.includes(l.status));
+    return open.length > 0 ? open[open.length - 1] : null;
+  }
+
+  private proposalTitle(land: LandRow, session: SessionRow): string {
+    const issue = land.issue_id ? this.db.getIssue(land.issue_id) : null;
+    if (issue) return `#${issue.number} ${issue.title}`;
+    return deriveTaskTitle(session.task, session.title);
+  }
+
+  private postHostNotice(
+    conversation: ConversationRow | null,
+    bot: UserRow | null,
+    body: string,
+    threadId: string | null = null,
+  ): void {
+    if (!conversation || !bot) return;
+    const msg = this.db.appendMessage({
+      conversationId: conversation.id,
+      authorId: bot.id,
+      threadId,
+      body,
+    });
+    // Host-authored notices are broadcast directly and never routed to bots.
+    this.wsServer.broadcastToConversation(conversation, {
+      type: "message.new",
+      message: serializeMessage(msg),
+      author: { id: bot.id, kind: bot.kind, name: bot.name },
+    });
+  }
+
+  /**
+   * Create or amend the branch's proposal. The proposal is an ordinary message in
+   * #merge-queue plus a `lands` row in state `proposed`; the message body is the
+   * changelog of record. Calling this again on the same branch rewrites that same
+   * message and row instead of opening a second proposal.
+   */
+  async proposeLand(input: ProposeLandInput): Promise<ProposeLandResult> {
+    const bodyMd = input.bodyMd.trim();
+    if (!bodyMd) throw new Error("proposal summary cannot be empty");
+
+    const session = this.db.getSession(input.sessionId);
+    if (!session) throw new Error(`Session not found: ${input.sessionId}`);
+    if (!session.clone_path || !existsSync(session.clone_path)) {
+      throw new Error("Worker clone directory is missing");
     }
-    if (!land) throw new Error("Land request not found");
+    const settings = this.db.getHostSettings();
+    const repo = settings.repo;
+    if (!repo?.bare_path) throw new Error("Repository is not configured");
+
+    const { stdout: branchOut } = await runGit([
+      "-C",
+      session.clone_path,
+      "rev-parse",
+      "--abbrev-ref",
+      "HEAD",
+    ]);
+    const currentBranch = branchOut.trim();
+    if (session.branch && currentBranch !== session.branch) {
+      throw new Error(
+        `Currently on branch '${currentBranch}'; commits must be on your assigned session branch '${session.branch}'.`,
+      );
+    }
+    if (!(await isWorkingTreeClean(session.clone_path))) {
+      throw new Error(
+        "Working tree has uncommitted changes; run git add && git commit before proposing",
+      );
+    }
+    const ahead = await commitsAhead(session.clone_path, repo.default_branch);
+    if (ahead < 1) {
+      throw new Error(
+        `Branch ${session.branch ?? currentBranch} has 0 commits ahead of ${repo.default_branch}; commit changes before proposing`,
+      );
+    }
+
+    const bot = this.db.getUser(session.bot_id);
+    if (!bot) throw new Error("Bot not found");
+    const issue =
+      (input.issueId ? this.db.getIssue(input.issueId) : null) ??
+      this.db.getIssueBySessionId(session.id) ??
+      (session.conversation_id ? this.db.getIssueByConversationId(session.conversation_id) : null);
+    const origin = issue
+      ? this.db.getConversation(issue.conversation_id)
+      : session.conversation_id
+        ? this.db.getConversation(session.conversation_id)
+        : null;
+    const mqConv = this.ensureConversation();
+    const touchesKawan = await branchTouchesKawanDir(session.clone_path, repo.default_branch);
+    const attachmentIds = input.attachmentIds ?? [];
+    const existing = this.findOpenLand(session.id);
+
+    let land: LandRow;
+    let message: MessageRow;
+    let title: string;
+    const created = !existing;
+
+    if (existing) {
+      const existingMessage = existing.message_id ? this.db.getMessage(existing.message_id) : null;
+      message = existingMessage
+        ? this.db.updateProposalMessage(existingMessage.id, {
+            body: bodyMd,
+            // An amendment without evidence keeps the attachments already on the
+            // proposal; the orchestrator has no way to re-supply them by id.
+            ...(attachmentIds.length > 0 ? { attachmentIds } : {}),
+          })
+        : this.db.createProposalMessage({
+            conversationId: mqConv.id,
+            authorId: bot.id,
+            body: bodyMd,
+            attachmentIds,
+          });
+      const reopen = existing.status === "failed";
+      const previousAttachmentIds = new Set(
+        (existingMessage?.attachments ?? []).map((a) => a.id),
+      );
+      land = this.db.updateLand(existing.id, {
+        status: reopen ? "proposed" : existing.status,
+        message_id: message.id,
+        conversation_id: origin?.id ?? existing.conversation_id,
+        thread_id: session.thread_id,
+        issue_id: issue?.id ?? existing.issue_id,
+        touches_kawan: touchesKawan ? 1 : 0,
+        checks_json: issue?.checks_json ?? existing.checks_json,
+        queue_position: reopen ? null : existing.queue_position,
+        // A fresh evaluation follows, so stale reopen failure text is cleared;
+        // a paused/queued item keeps the reason the head card shows.
+        error: reopen ? null : existing.error,
+      })!;
+      title = input.title?.trim() || this.proposalTitle(land, session);
+      this.proposalMetrics.set(land.id, {
+        commitsAhead: ahead,
+        behindMain: issue?.behind_main ?? this.proposalMetrics.get(land.id)?.behindMain ?? 0,
+      });
+      // Mirror the create branch so `message.*` stays truthful for live consumers.
+      this.wsServer.broadcastToConversation(mqConv, {
+        type: "message.new",
+        message: serializeMessage(message),
+        author: { id: bot.id, kind: bot.kind, name: bot.name },
+      });
+      for (const attachment of message.attachments) {
+        if (previousAttachmentIds.has(attachment.id)) continue;
+        this.wsServer.broadcastToConversation(mqConv, {
+          type: "artifact.new",
+          artifact: attachment,
+        });
+      }
+      this.emitLandUpdate(land);
+      this.broadcastSnapshot();
+      this.postHostNotice(origin, bot, `Proposal updated: ${title}`, session.thread_id);
+      void this.evaluateProposal(land.id);
+    } else {
+      message = this.db.createProposalMessage({
+        conversationId: mqConv.id,
+        authorId: bot.id,
+        body: bodyMd,
+        attachmentIds,
+      });
+      land = this.db.createLand({
+        sessionId: session.id,
+        conversationId: origin?.id ?? mqConv.id,
+        threadId: session.thread_id,
+        messageId: message.id,
+        issueId: issue?.id ?? null,
+        trigger: "proposal",
+      });
+      land = this.db.updateLand(land.id, {
+        touches_kawan: touchesKawan ? 1 : 0,
+        checks_json: issue?.checks_json ?? null,
+      })!;
+      title = input.title?.trim() || this.proposalTitle(land, session);
+      this.proposalMetrics.set(land.id, {
+        commitsAhead: ahead,
+        behindMain: issue?.behind_main ?? 0,
+      });
+
+      this.wsServer.broadcastToConversation(mqConv, {
+        type: "message.new",
+        message: serializeMessage(message),
+        author: { id: bot.id, kind: bot.kind, name: bot.name },
+      });
+      for (const attachment of message.attachments) {
+        this.wsServer.broadcastToConversation(mqConv, {
+          type: "artifact.new",
+          artifact: attachment,
+        });
+      }
+      this.emitLandUpdate(land);
+      this.broadcastSnapshot();
+      this.postHostNotice(origin, bot, `Proposed for merge: ${title} → Merge Queue`, session.thread_id);
+      void this.evaluateProposal(land.id);
+    }
+
+    return { land, message, title, created, status: land.status };
+  }
+
+  /** Warm the proposal rows' branch metrics (they are not persisted). */
+  async refreshProposalMetrics(): Promise<void> {
+    const repo = this.db.getHostSettings().repo;
+    if (!repo?.bare_path) return;
+    for (const land of this.db.listProposedLands()) {
+      const session = this.db.getSession(land.session_id);
+      if (this.closed) return;
+      if (!session?.clone_path || !existsSync(session.clone_path)) continue;
+      const [ahead, behind] = await Promise.all([
+        commitsAhead(session.clone_path, repo.default_branch).catch(() => 0),
+        commitsBehindMain(repo.bare_path, session.clone_path, repo.default_branch).catch(() => 0),
+      ]);
+      this.proposalMetrics.set(land.id, { commitsAhead: ahead, behindMain: behind });
+    }
+    if (!this.closed) this.broadcastSnapshot();
+  }
+
+  private withdrawBranchProposal(
+    sessionId: string,
+    by: string,
+    reason?: string | null,
+  ): Promise<MergeQueueSnapshot> {
+    const land = this.findOpenLand(sessionId);
+    if (!land) throw new Error("This branch has no open proposal to withdraw");
+    return this.withdrawProposal(land.id, by, reason ?? undefined);
+  }
+
+  /** Pull an open proposal back: `withdrawn`, out of the train, never landed. */
+  async withdrawProposal(
+    landId: string,
+    by: string,
+    reason?: string,
+  ): Promise<MergeQueueSnapshot> {
+    return await this.withQueueLock(async () => {
+      const land = this.db.getLand(landId);
+      if (!land) throw new Error(`Proposal not found: ${landId}`);
+      if (land.status === "landed") throw new Error("Proposal has already landed");
+      if (land.status === "withdrawn") return this.getSnapshot();
+
+      if (land.queue_session_id) {
+        await this.sessionManager.stopSession(land.queue_session_id);
+      }
+      rmSync(join(this.dataDir, "workspaces", `landing-${land.id}`), {
+        recursive: true,
+        force: true,
+      });
+      const wasPaused = land.status === "paused";
+      const trimmedReason = reason?.trim() ?? "";
+      const updated = this.db.updateLand(land.id, {
+        status: "withdrawn",
+        queue_position: null,
+        pause_reason: null,
+        error: trimmedReason || null,
+      })!;
+      this.emitLandUpdate(updated);
+
+      const session = this.db.getSession(land.session_id);
+      if (
+        session &&
+        session.status !== "landed" &&
+        session.status !== "stopped" &&
+        session.status !== "running"
+      ) {
+        const idle = this.db.updateSession(session.id, { status: "idle" })!;
+        this.wsServer.broadcast({
+          type: "session.update",
+          session: this.sessionManager.serializePublicSession(idle),
+        });
+      }
+
+      if (wasPaused) {
+        this.setPausedFlag(false);
+      }
+      const bot = session ? this.db.getUser(session.bot_id) : null;
+      const title = session ? this.proposalTitle(updated, session) : "proposal";
+      const actor = this.db.getUser(by);
+      const actorSuffix = actor && actor.kind === "human" ? ` by @${actor.name}` : "";
+      this.postHostNotice(
+        this.db.getConversation(land.conversation_id),
+        bot,
+        trimmedReason
+          ? `Proposal withdrawn${actorSuffix}: ${title} — ${trimmedReason}`
+          : `Proposal withdrawn${actorSuffix}: ${title}`,
+        land.thread_id,
+      );
+
+      this.resolveWaiters(updated);
+      this.broadcastSnapshot();
+      setImmediate(() => {
+        void this.kickLoop();
+      });
+      return this.getSnapshot();
+    });
+  }
+
+  /**
+   * Trial-run a fresh proposal: rebase a throwaway clone and run the repo checks
+   * so the proposal row can show honest check pills and commit counts. Under
+   * `default_landing_mode: "auto"` a clean proposal is accepted straight into the
+   * train; under `manual` it stays in `proposed` for a human **Merge**.
+   */
+  private async evaluateProposal(landId: string): Promise<void> {
+    if (this.closed) return;
+    const land = this.db.getLand(landId);
+    if (!land || land.status !== "proposed") return;
+    const session = this.db.getSession(land.session_id);
+    const bot = session ? this.db.getUser(session.bot_id) : null;
+    const settings = this.db.getHostSettings();
+    const repo = settings.repo;
     if (
-      land.status === "landed" ||
-      land.status === "queued" ||
-      land.status === "rebasing" ||
-      land.status === "verifying" ||
-      land.status === "paused"
+      !session?.clone_path ||
+      !session.branch ||
+      !existsSync(session.clone_path) ||
+      !bot?.signing_key_path ||
+      !repo?.bare_path
     ) {
-      throw new Error(`Land ${land.id} is already ${land.status}`);
+      return;
+    }
+
+    const landingDir = join(this.dataDir, "workspaces", `proposal-${land.id}`);
+    let prep;
+    try {
+      prep = await prepareLandingClone({
+        barePath: repo.bare_path,
+        clonePath: session.clone_path,
+        branchName: session.branch,
+        defaultBranch: repo.default_branch,
+        botName: bot.name,
+        botEmail: bot.email ?? `${bot.name.toLowerCase()}@kawan.local`,
+        signingKeyPath: bot.signing_key_path,
+        landingDir,
+      });
+    } catch (err) {
+      prep = {
+        ok: false,
+        baseSha: "",
+        // The trial never ran, so the persisted `.kawan/` guard stands: clearing it
+        // here would silently drop the second-confirmation requirement.
+        touchesKawan: land.touches_kawan === 1,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+
+    const [ahead, behind] = await Promise.all([
+      commitsAhead(session.clone_path, repo.default_branch).catch(() => 0),
+      commitsBehindMain(repo.bare_path, session.clone_path, repo.default_branch).catch(() => 0),
+    ]);
+    this.proposalMetrics.set(land.id, { commitsAhead: ahead, behindMain: behind });
+
+    let checks: CheckRunItem[] = [];
+    let verifyOutput = "";
+    let checksOk = false;
+    if (prep.ok) {
+      try {
+        const res = await runRepoChecks({
+          workdir: landingDir,
+          verifyCommand: settings.verify_command,
+          sandboxEnabled: Boolean(bot.sandbox_enabled),
+          sandboxNetwork: Boolean(bot.sandbox_network),
+          disableSandbox: this.disableSandbox,
+        });
+        checks = res.checks;
+        verifyOutput = res.combined_output;
+        checksOk = res.ok;
+      } catch (err) {
+        prep = {
+          ...prep,
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+    }
+    rmSync(landingDir, { recursive: true, force: true });
+    if (this.closed) return;
+
+    const current = this.db.getLand(land.id);
+    if (!current || current.status !== "proposed") {
+      this.broadcastSnapshot();
+      return;
+    }
+    const updated = this.db.updateLand(land.id, {
+      base_sha: prep.ok ? prep.baseSha : current.base_sha,
+      touches_kawan: prep.touchesKawan || current.touches_kawan === 1 ? 1 : 0,
+      checks_json: checks.length > 0 ? JSON.stringify(checks) : current.checks_json,
+      verify_output: verifyOutput || current.verify_output,
+      error: prep.ok ? null : (prep.error ?? "Rebase onto the default branch failed"),
+    })!;
+    this.emitLandUpdate(updated);
+    this.broadcastSnapshot();
+
+    const mode = this.db.getHostSettings().merge_queue?.default_landing_mode ?? "manual";
+    if (mode !== "auto" || !prep.ok || !checksOk || prep.touchesKawan) return;
+    await this.acceptWhenIdle(land.id);
+  }
+
+  /** Auto mode must not yank the branch out from under a still-running worker turn. */
+  private async acceptWhenIdle(landId: string): Promise<void> {
+    for (let attempt = 0; attempt < 240; attempt += 1) {
+      if (this.closed) return;
+      const land = this.db.getLand(landId);
+      if (!land || land.status !== "proposed") return;
+      const session = this.db.getSession(land.session_id);
+      if (!session || session.status !== "running") break;
+      await new Promise((resolveWait) => setTimeout(resolveWait, 250));
+    }
+    if (this.closed) return;
+    const land = this.db.getLand(landId);
+    if (!land || land.status !== "proposed") return;
+    try {
+      await this.acceptProposal(landId, {
+        by: null,
+        trigger: "auto_land",
+        waitForSettlement: false,
+      });
+    } catch {
+      // Leave the proposal in `proposed`; a human Merge will surface the reason.
+    }
+  }
+
+  /**
+   * Human **Merge** (or auto mode): `proposed` → `queued`, then the train starts in
+   * queue order exactly as before. Accepting needs no separate approval step.
+   */
+  async acceptProposal(
+    landId: string,
+    params: {
+      by: string | null;
+      trigger?: "manual_approve" | "auto_land";
+      waitForSettlement?: boolean;
+    },
+  ): Promise<{ land: SerializedLand; session: Omit<SessionRow, "token"> }> {
+    const land = this.db.getLand(landId);
+    if (!land) throw new Error(`Proposal not found: ${landId}`);
+    if (land.status !== "proposed" && land.status !== "failed") {
+      throw new Error(`Proposal ${land.id} is already ${land.status}`);
     }
 
     const session = this.db.getSession(land.session_id);
     if (!session || !session.clone_path || !session.branch) {
-      throw new Error("Worker session or clone missing for land");
+      throw new Error("Worker session or clone missing for proposal");
     }
     if (!existsSync(session.clone_path)) {
       throw new Error(`Worker clone no longer exists: ${session.clone_path}`);
@@ -300,13 +784,13 @@ export class MergeQueueManager {
       throw new Error("Repository is not configured");
     }
 
-    // Stop live worker process cleanly so no concurrent edits happen after queueing
+    // Stop live worker process cleanly so no concurrent edits happen after accepting
     await this.sessionManager.stopProcessOnly(session.id);
 
     const queuePos = this.db.nextQueuePosition();
     const queuedLand = this.db.updateLand(land.id, {
       status: "queued",
-      approved_by: params.approvedBy,
+      approved_by: params.by,
       trigger: params.trigger ?? "manual_approve",
       queue_position: queuePos,
       pause_reason: null,
@@ -326,9 +810,9 @@ export class MergeQueueManager {
       };
     }
 
-    const settledPromise = new Promise<LandRow>((resolve) => {
+    const settledPromise = new Promise<LandRow>((resolveSettled) => {
       const existing = this.settlementWaiters.get(land.id) ?? [];
-      existing.push(resolve);
+      existing.push(resolveSettled);
       this.settlementWaiters.set(land.id, existing);
     });
     void this.kickLoop();
@@ -361,7 +845,7 @@ export class MergeQueueManager {
 
   private async processHeadUnsafe(landId: string): Promise<void> {
     const land = this.db.getLand(landId);
-    if (!land || land.status === "landed" || land.status === "removed" || land.status === "failed") {
+    if (!land || land.status === "landed" || land.status === "withdrawn" || land.status === "failed") {
       return;
     }
     const session = this.db.getSession(land.session_id);
@@ -410,7 +894,8 @@ export class MergeQueueManager {
       prep = {
         ok: false,
         baseSha: "",
-        touchesKawan: false,
+        // Same guard as the trial: keep what the row already knows on failure.
+        touchesKawan: land.touches_kawan === 1,
         error: err instanceof Error ? err.message : String(err),
       };
     }
@@ -623,15 +1108,12 @@ export class MergeQueueManager {
         conversationId: mqConv.id,
         authorId: queueBot.id,
         body: `Paused Merge Queue on "${params.taskTitle}" (${originLabel} · ${reasonLabel}).\n${firstLine}`,
-        artifactId: incidentArtId,
+        attachmentIds: incidentArtId ? [incidentArtId] : [],
       });
       incidentMsgId = msg.id;
-      if (incidentArtId) {
-        this.db.linkArtifactMessage(incidentArtId, msg.id);
-      }
       this.wsServer.broadcastToConversation(mqConv, {
         type: "message.new",
-        message: msg,
+        message: serializeMessage(msg),
         author: { id: queueBot.id, kind: "bot", name: queueBot.name },
       });
     }
@@ -829,7 +1311,7 @@ export class MergeQueueManager {
       .find((l) => l.queue_session_id === queueSession.id || l.status === "paused");
     if (!land) throw new Error("No paused merge queue item found");
     await this.ejectLand(land.id, reason, queueSession.id);
-    return { land_id: land.id, status: "failed" };
+    return { land_id: land.id, status: "proposed" };
   }
 
   async retryLand(landId?: string): Promise<MergeQueueSnapshot> {
@@ -879,7 +1361,7 @@ export class MergeQueueManager {
         force: true,
       });
       const updated = this.db.updateLand(land.id, {
-        status: "failed",
+        status: "proposed",
         queue_position: null,
         pause_reason: null,
         error: reason,
@@ -955,7 +1437,7 @@ export class MergeQueueManager {
 
       const wasPaused = land.status === "paused";
       const restored = this.db.updateLand(land.id, {
-        status: "requested",
+        status: "proposed",
         queue_position: null,
         pause_reason: null,
         error: null,
@@ -964,10 +1446,10 @@ export class MergeQueueManager {
 
       const worker = this.db.getSession(land.session_id);
       if (worker && worker.status !== "landed") {
-        const reviewed = this.db.updateSession(worker.id, { status: "review_requested" })!;
+        const idle = this.db.updateSession(worker.id, { status: "idle" })!;
         this.wsServer.broadcast({
           type: "session.update",
-          session: this.sessionManager.serializePublicSession(reviewed),
+          session: this.sessionManager.serializePublicSession(idle),
         });
       }
 

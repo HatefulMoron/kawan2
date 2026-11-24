@@ -8,20 +8,33 @@ export type SessionStatus =
   | "pending_approval"
   | "running"
   | "idle"
-  | "review_requested"
   | "landed"
   | "failed"
   | "archived"
   | "stopped";
+/**
+ * A proposal is a message plus a `lands` row. `proposed` is the open state a
+ * human (or auto mode) accepts into the train with **Merge**; `withdrawn` is
+ * the agent/owner pulling it back. Nothing else about the train changed.
+ */
 export type LandStatus =
-  | "requested"
+  | "proposed"
   | "queued"
   | "rebasing"
   | "verifying"
   | "paused"
   | "landed"
   | "failed"
-  | "removed";
+  | "withdrawn";
+/** Statuses that still own the branch/session and are worth amending. */
+export const OPEN_LAND_STATUSES: LandStatus[] = [
+  "proposed",
+  "queued",
+  "rebasing",
+  "verifying",
+  "paused",
+  "failed",
+];
 export type MergeConflictPolicy = "pause_on_issue" | "auto_resolve_trivial";
 export type LandingMode = "manual" | "auto";
 export type IssueStatus = "open" | "landed" | "closed";
@@ -76,6 +89,12 @@ export interface MemberRow {
   joined_at: number;
 }
 
+export interface MessageAuthor {
+  id: string;
+  kind: UserKind;
+  name: string;
+}
+
 export interface MessageRow {
   id: string;
   conversation_id: string;
@@ -83,8 +102,17 @@ export interface MessageRow {
   author_id: string;
   thread_id: string | null;
   body: string;
-  artifact_id: string | null;
   created_at: number;
+  /** Ordered by `message_artifacts.position`; empty when the message has none. */
+  attachments: ArtifactRow[];
+}
+
+/** Wire shape for `message.*` frames: ordinary fields plus explicit attachments. */
+export function serializeMessage(message: MessageRow): MessageRow {
+  return {
+    ...message,
+    attachments: message.attachments ?? [],
+  };
 }
 
 export interface DecisionRow {
@@ -196,6 +224,22 @@ export interface LandRow {
 export interface SerializedLand extends Omit<LandRow, "touches_kawan"> {
   checks: CheckRunItem[];
   touches_kawan: boolean;
+}
+
+/**
+ * One open proposal row in the Merge Queue's `Proposed (N)` section. The
+ * proposal body lives on `message`; `land` owns the branch.
+ */
+export interface ProposalCard {
+  land: SerializedLand;
+  message: MessageRow;
+  author: MessageAuthor;
+  session_title: string | null;
+  checks: CheckRunItem[];
+  commits_ahead: number;
+  behind_main: number;
+  issue_number: number | null;
+  updated_at: number;
 }
 
 export function serializeLand(land: LandRow): SerializedLand {

@@ -5,18 +5,8 @@ import { createServer, type Server as NetServer, type Socket } from "node:net";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { KawanDb } from "./db.js";
-import {
-  commitsAhead,
-  createSessionClone,
-  ensureAllowedSigners,
-  getBranchHead,
-  getSessionDiff,
-  isWorkingTreeClean,
-  landBranch,
-  removeClone,
-  runGit,
-} from "./git.js";
-import { REVIEW_CARD_SUMMARY_RULES } from "./prompts.js";
+import { createSessionClone, ensureAllowedSigners, getSessionDiff } from "./git.js";
+import { PROPOSAL_WRITING_RULES } from "./prompts.js";
 import { composeSpawnSpec, materializeSessionAgentDir } from "./spawn.js";
 import { filterSoulForWorker } from "./soul.js";
 import type {
@@ -29,12 +19,22 @@ import type {
   SessionRow,
   UserRow,
 } from "./types.js";
-import { serializeLand } from "./types.js";
+import { serializeMessage } from "./types.js";
 import type { KawanWsServer } from "./ws.js";
 
 export interface QueueToolHandlers {
   resumeAndLand(session: SessionRow, summary?: string): Promise<unknown>;
   ejectToImplementer(session: SessionRow, reason: string): Promise<unknown>;
+}
+
+export interface ProposalToolHandlers {
+  propose(input: {
+    sessionId: string;
+    bodyMd: string;
+    title?: string | null;
+    attachmentIds: string[];
+  }): Promise<unknown>;
+  withdraw(input: { sessionId: string; by: string; reason?: string | null }): Promise<unknown>;
 }
 
 export interface IssueToolHandlers {
@@ -89,6 +89,23 @@ export function deriveTaskTitle(
   if (!firstLine) return "Worker task";
   if (firstLine.length <= 48) return firstLine;
   return `${firstLine.slice(0, 45).trimEnd()}...`;
+}
+
+/**
+ * Proposals and reports attach exactly what the caller declared. Uploads that the
+ * Markdown body does not already reference get an inline image ref appended so a
+ * screenshot shows up where the agent meant it to.
+ */
+export function appendUnreferencedAttachmentRefs(
+  bodyMd: string,
+  attachments: Array<{ id: string; filename: string | null }>,
+): string {
+  const missing = attachments.filter((a) => !bodyMd.includes(`kawan://artifact/${a.id}`));
+  if (missing.length === 0) return bodyMd;
+  const refs = missing
+    .map((a) => `![${a.filename ?? "attachment"}](kawan://artifact/${a.id})`)
+    .join("\n");
+  return `${bodyMd.trimEnd()}\n\n${refs}\n`;
 }
 
 export interface PiTurnResult {
@@ -398,6 +415,7 @@ export class SessionManager {
   private readonly disableSandbox: boolean;
   private readonly soulHandlers?: SoulHandlers;
   private queueHandlers?: QueueToolHandlers;
+  private proposalHandlers?: ProposalToolHandlers;
   private issueHandlers?: IssueToolHandlers;
   private onBotMessageCallback?: (ev: {
     conversation: ConversationRow;
@@ -472,6 +490,10 @@ export class SessionManager {
 
   setQueueHandlers(handlers: QueueToolHandlers): void {
     this.queueHandlers = handlers;
+  }
+
+  setProposalHandlers(handlers: ProposalToolHandlers): void {
+    this.proposalHandlers = handlers;
   }
 
   setIssueHandlers(handlers: IssueToolHandlers): void {
@@ -702,20 +724,72 @@ export class SessionManager {
       case "report": {
         const text = typeof params.text === "string" ? params.text : "";
         if (!text.trim()) throw new Error("report text cannot be empty");
-        const artifactParam =
-          params.artifact && typeof params.artifact === "object"
-            ? (params.artifact as { filename?: string; mime_type?: string; base64?: string })
-            : undefined;
+        const artifacts = this.collectArtifactParams(params);
         const inThread = typeof params.in_thread === "boolean" ? params.in_thread : undefined;
-        return await this.handleReport(session, text, artifactParam, inThread);
+        return await this.handleReport(session, text, artifacts, inThread);
       }
 
-      case "land_request": {
-        if (session.kind !== "worker") {
-          throw new Error("Only worker sessions can call land_request");
+      case "propose_merge": {
+        if (!this.proposalHandlers) {
+          throw new Error("Proposal handlers are not registered");
         }
-        const summary = typeof params.summary === "string" ? params.summary : "";
-        return await this.handleLandRequest(session, summary);
+        if (session.kind !== "worker" && session.kind !== "orchestrator") {
+          throw new Error("Only worker or orchestrator sessions can propose a merge");
+        }
+        const summaryMd = typeof params.summary_md === "string" ? params.summary_md.trim() : "";
+        if (!summaryMd) throw new Error("summary_md is required");
+        const ctx = this.activeContexts.get(session.id);
+        const targetSessionId =
+          session.kind === "worker" ? session.id : (ctx?.sourceWorkerId ?? null);
+        if (!targetSessionId) {
+          throw new Error(
+            "propose_merge needs a worker branch: call it from the worker session itself or while handling a [worker-report] notice",
+          );
+        }
+        const target = this.db.getSession(targetSessionId);
+        if (!target) throw new Error(`Session not found: ${targetSessionId}`);
+        const attachments = this.collectArtifactParams(params).map((input) =>
+          this.uploadArtifact(input, {
+            sessionId: target.id,
+            conversationId: ctx?.conversationId ?? session.conversation_id,
+          }),
+        );
+        const bodyMd = appendUnreferencedAttachmentRefs(summaryMd, attachments);
+        const result = await this.proposalHandlers.propose({
+          sessionId: target.id,
+          bodyMd,
+          title: typeof params.title === "string" ? params.title : null,
+          attachmentIds: attachments.map((a) => a.id),
+        });
+        if (ctx) ctx.reportedInTurn = true;
+        const reported = this.db.updateSession(target.id, { last_report: summaryMd })!;
+        this.wsServer.broadcast({ type: "session.update", session: serializeSession(reported) });
+        return result;
+      }
+
+      case "withdraw_proposal": {
+        if (!this.proposalHandlers) {
+          throw new Error("Proposal handlers are not registered");
+        }
+        if (session.kind !== "worker" && session.kind !== "orchestrator") {
+          throw new Error("Only worker or orchestrator sessions can withdraw a proposal");
+        }
+        const ctx = this.activeContexts.get(session.id);
+        const targetSessionId =
+          session.kind === "worker" ? session.id : (ctx?.sourceWorkerId ?? null);
+        if (!targetSessionId) {
+          throw new Error(
+            "withdraw_proposal needs a worker branch: call it from the worker session itself or while handling a [worker-report] notice",
+          );
+        }
+        const reason = typeof params.reason === "string" ? params.reason.trim() : "";
+        const result = await this.proposalHandlers.withdraw({
+          sessionId: targetSessionId,
+          by: session.bot_id,
+          reason: reason || null,
+        });
+        if (ctx) ctx.reportedInTurn = true;
+        return result;
       }
 
       case "resume_and_land": {
@@ -924,26 +998,28 @@ export class SessionManager {
       bot.persona ? `Persona: ${bot.persona}` : "Persona: Helpful, concise software engineer.",
       `Only you speak in chat for ${bot.name}. Channel/DM worker sessions run quietly in isolated clones and never post directly to humans (while issue-bound workers and read-only reviewers speak directly inside their issue room).`,
       "Host tools:",
-      "- spawn_session(title?, task, in_thread?): delegate repository inspection, coding, tests, and git commits to a worker session. Pass a short 3-6 word `title` for the Tasks UI. Each worker already has its own clone, dedicated branch, bash/file tools, report(), and land_request(). Inside an issue room, spawning claims the writable branch (or runs a read-only review if another bot owns it).",
+      "- spawn_session(title?, task, in_thread?): delegate repository inspection, coding, tests, and git commits to a worker session. Pass a short 3-6 word `title` for the session list. Each worker already has its own clone, dedicated branch, bash/file tools, report(), propose_merge(), and withdraw_proposal(). Inside an issue room, spawning claims the writable branch (or runs a read-only review if another bot owns it).",
       "- message_session(session_id, message): answer a worker's question or steer an existing worker directly.",
       "- session_status(): inspect your child worker sessions.",
-      "- report(text, artifact?, in_thread?): post a message or attach evidence/reports into the active conversation.",
+      "- report(text, artifacts?, in_thread?): post a message and optionally attach evidence artifacts (screenshots, report.md) declared explicitly in the `artifacts` array.",
+      "- propose_merge(summary_md, evidence?, title?): post the branch's proposal in #merge-queue. Calling it again for the same branch amends that proposal; the proposal message is the handback, not a chat card.",
+      "- withdraw_proposal(reason?): pull back the branch's open proposal.",
       "- create_issue / update_issue / list_issues: create and maintain Issue (#N) markdown specifications (`kawan://issue.md`).",
       "- review_issue(issue_ref?, focus?): launch a fresh read-only reviewer session against an issue's branch clone; findings are posted directly to the issue room.",
       "- soul_replace(anchor, text) and soul_write(document): maintain durable project knowledge in your soul (injected each turn at kawan://soul.md).",
       "Thread & formatting guidance:",
       "- Casual top-level channel Q&A defaults to a regular top-level channel reply. Use a thread (`in_thread: true` on `report()`, or the default on `spawn_session` in channels) when delegating a task or having a multi-turn discussion that belongs grouped under the triggering message, or pass `in_thread: false` to reply top-level in the channel. When a human writes inside a thread, stay in that thread.",
       "- Prefer concise plain prose in chat (usually 1-3 sentences) rather than long markdown walls or nested bullet lists.",
-      "- When a task produces detailed multi-file breakdowns, verification logs, or lengthy technical notes, prefer attaching those details as an expandable `report.md` artifact via `report(short_summary, { filename: 'report.md', mime_type: 'text/markdown', content: full_details })` while keeping the chat message brief.",
+      "- When a task produces detailed multi-file breakdowns, verification logs, or lengthy technical notes, attach them to the proposal as evidence or in a `report.md` artifact via `report(short_summary, { artifacts: [{ filename: 'report.md', mime_type: 'text/markdown', content: full_details }] })` while keeping the chat message brief.",
       "Workflow rules:",
       "- Do not pretend to inspect or edit files directly — delegate repository work via spawn_session() or review_issue().",
       "- In an issue room: consult `kawan://issue.md`. When initiating a review via review_issue() (or spawn_session when another bot owns the branch), output NO_REPLY or a brief acknowledgement since the reviewer posts findings directly.",
       "- When delegating in a channel/DM, reply with at most one brief acknowledgement (e.g. 'On it.') or output NO_REPLY — live task status is already shown in the UI.",
       "- When collaborating with another bot in chat, reply only when you have substantive answers, feedback, or requested work; output NO_REPLY rather than sending empty pleasantries.",
       "- When a worker calls you with a question you can answer from conversation context or kawan://soul.md, reply to it directly with message_session(session_id, answer) and output NO_REPLY. Only ask the human in chat if you do not know.",
-      "- When a worker finishes or requests landing, write ONE review-card summary: rewrite the worker's implementation notes into the user-visible outcome, and note it is ready for review/approval if awaiting land. Follow the review-card summary rules below.",
+      "- When a worker finishes, call `propose_merge(summary_md, evidence?)` with a short user-facing changelog and its evidence (screenshots, report.md). The proposal lives in #merge-queue and the host posts the origin notice; a chat recap is optional commentary that should point at the proposal instead of restating the changelog.",
       "",
-      REVIEW_CARD_SUMMARY_RULES,
+      PROPOSAL_WRITING_RULES,
       "- Always check kawan://soul.md before claiming you do not know a project fact — durable project facts learned in earlier sessions live there.",
       "- If you receive an internal [worker-report] notice and nothing needs to be posted to humans, output exactly: NO_REPLY",
     ].join("\n");
@@ -955,12 +1031,12 @@ export class SessionManager {
       `Task: ${_session.task}`,
       "Instructions:",
       "1. Inspect the repository, make the requested changes or collect the requested information, and verify your work.",
-      "2. You report to your orchestrator, but the summary you give is what humans see in the Status view and approval cards. Write it for the person deciding whether to approve, not for a code reviewer.",
+      "2. Your handback is a proposal, not a chat card: humans read the proposal in #merge-queue and either Merge or ask for changes.",
       "3. If blocked on an ambiguity or need human input, call `report(question)` and stop your turn so your orchestrator can answer or ask humans.",
-      "4. For code changes meant to land on the default branch, commit on your current branch (`git add` && `git commit`), verify cleanly (`git status`), and call `land_request(summary)` using the review-card summary rules below. Do NOT create/switch branches and do NOT run `git push`.",
-      "5. Call `report(text, artifact?)` if you are answering a read-only question, sharing findings, or attaching an evidence artifact. When you finish, call `report()` with the summary or end your turn with it; otherwise your final assistant text becomes the review card.",
+      "4. For code changes meant to land on the default branch, commit on your current branch (`git add` && `git commit`), verify cleanly (`git status`), and call `propose_merge(summary_md, evidence?)` using the proposal writing rules below. Calling it again later amends the same proposal. Do NOT create/switch branches and do NOT run `git push`.",
+      "5. Call `report(text)` if you are answering a read-only question or sharing findings. Evidence for branch work (screenshots, report.md) belongs in `propose_merge(summary_md, evidence?)`: artifacts attached to a channel worker's `report()` are not carried into its proposal.",
       "",
-      REVIEW_CARD_SUMMARY_RULES,
+      PROPOSAL_WRITING_RULES,
     ].join("\n");
   }
 
@@ -968,18 +1044,18 @@ export class SessionManager {
     return [
       `You are the collaborative implementer for ${bot.name} on Issue #${issue.number}: "${issue.title}" inside an isolated git clone.`,
       "Conversation & collaboration:",
-      "- You speak directly inside Issue #" + issue.number + " via report(text, artifact?) or normal replies.",
+      "- You speak directly inside Issue #" + issue.number + " via report(text, artifacts?) or normal replies.",
       "- Latest issue details, branch state, and checks are always attached at `kawan://issue.md`.",
       "- Humans or reviewer bots may critique changes, post findings, or update `kawan://issue.md`. Adapt cleanly, verify, commit on your branch, and reply concisely.",
-      "- Your final update also becomes the review card humans approve from, so close with the user-visible outcome even when the room discussion is technical. Follow the review-card summary rules below.",
-      "- Do NOT call `land_request()` inside an issue session — commit on your branch, share your update, and let humans click Land when ready.",
+      "- When the branch is ready, call `propose_merge(summary_md, evidence?)`. The proposal is posted in #merge-queue and linked to this issue; calling it again amends it. Follow the proposal writing rules below.",
+      "- Use `withdraw_proposal(reason?)` if the proposal should be pulled back for rework.",
       "- Keep the issue spec aligned with agreed changes using `update_issue(title?, body_md?)` when helpful.",
       "- Use `review_issue(focus?)` only if explicitly asked to launch a fresh read-only review pass against your own branch.",
       "- Use `ask_owner(question)` ONLY if blocked on an owner decision so the owner is pinged directly.",
       "- Use `sync_with_main()` when requested or if behind default branch.",
       "- Do NOT create/switch branches or run git push.",
       "",
-      REVIEW_CARD_SUMMARY_RULES,
+      PROPOSAL_WRITING_RULES,
       `Current specification:\n${issue.body_md || "(No markdown specification provided yet.)"}`,
     ].join("\n");
   }
@@ -1191,7 +1267,7 @@ export class SessionManager {
       "Your messages go ONLY to #merge-queue (inside the active incident thread).",
       "Tools:",
       "- bash/read/edit/write to inspect conflicts or fix broken checks in this landing clone.",
-      "- report(text, artifact?): post updates into the #merge-queue incident thread.",
+      "- report(text, artifacts?): post updates into the #merge-queue incident thread.",
       "- resume_and_land(summary?): re-run repository checks in this clone and fast-forward onto the default branch.",
       "- eject_to_implementer(reason): return the change to the implementer worker and unpause the queue for later items.",
       "Rules:",
@@ -1233,27 +1309,19 @@ export class SessionManager {
     conversation: ConversationRow;
     threadId: string | null;
     body: string;
-    artifactRow?: ArtifactRow | null;
-    sourceWorkerId?: string | null;
+    /** Attachments are always explicit: only what this call declares is attached. */
+    attachmentRows?: ArtifactRow[];
   }): MessageRow {
-    let artifactRow = params.artifactRow ?? null;
-    if (!artifactRow && params.sourceWorkerId) {
-      const unlinked = this.db
-        .listArtifacts({ sessionId: params.sourceWorkerId })
-        .filter((a) => !a.message_id);
-      artifactRow = unlinked[unlinked.length - 1] ?? null;
-    }
-
+    const attachmentRows = params.attachmentRows ?? [];
     const posted = this.db.appendMessage({
       conversationId: params.conversation.id,
       authorId: params.bot.id,
       threadId: params.threadId,
       body: params.body,
-      artifactId: artifactRow?.id ?? null,
+      attachmentIds: attachmentRows.map((a) => a.id),
     });
 
-    if (artifactRow) {
-      this.db.linkArtifactMessage(artifactRow.id, posted.id);
+    for (const artifactRow of attachmentRows) {
       const refreshedArt = this.db.getArtifact(artifactRow.id);
       if (refreshedArt) {
         this.wsServer.broadcastToConversation(params.conversation, {
@@ -1263,20 +1331,9 @@ export class SessionManager {
       }
     }
 
-    if (params.sourceWorkerId) {
-      const pendingLand = this.db
-        .listLands({ sessionId: params.sourceWorkerId })
-        .filter((l) => (l.status === "requested" || l.status === "failed") && !l.message_id)
-        .pop();
-      if (pendingLand) {
-        const updatedLand = this.db.updateLand(pendingLand.id, { message_id: posted.id })!;
-        this.wsServer.broadcast({ type: "land.update", land: serializeLand(updatedLand) });
-      }
-    }
-
     this.wsServer.broadcastToConversation(params.conversation, {
       type: "message.new",
-      message: posted,
+      message: serializeMessage(posted),
       author: { id: params.bot.id, kind: "bot", name: params.bot.name },
     });
     if (!this.closed && this.onBotMessageCallback) {
@@ -1388,7 +1445,6 @@ export class SessionManager {
               conversation,
               threadId: ctx?.spawnedThreadId ?? targetThreadId,
               body: turn.assistantText.trim(),
-              sourceWorkerId: ctx?.sourceWorkerId,
             });
           }
         } catch (err) {
@@ -1586,14 +1642,12 @@ export class SessionManager {
       soulSnapshot,
       ...(issue
         ? {
+            issueId: issue.id,
             branchOverride: `kawan/issue-${issue.number}-${sessionId.slice(0, 8)}`,
             systemPromptOverride: this.buildIssueWorkerSystemPrompt(bot, issue),
           }
         : {}),
     });
-    if (issue) {
-      this.issueHandlers?.bindWorkerSession(issue.id, bot.id, workerSession.id);
-    }
     ctx.spawnedSessionId = workerSession.id;
 
     return { session_id: workerSession.id, title, status: "running", thread_id: workerThreadId };
@@ -1609,6 +1663,7 @@ export class SessionManager {
     task: string;
     soulSnapshot: string | null;
     existingRow?: SessionRow;
+    issueId?: string;
     branchOverride?: string;
     systemPromptOverride?: string;
   }): Promise<SessionRow> {
@@ -1662,6 +1717,11 @@ export class SessionManager {
           soulSnapshot: params.soulSnapshot,
         });
     this.wsServer.broadcast({ type: "session.update", session: serializeSession(workerSession) });
+    // Bind the issue before the first turn so its very first report/proposal already
+    // belongs to the issue room and carries `lands.issue_id`.
+    if (params.issueId) {
+      this.issueHandlers?.bindWorkerSession(params.issueId, params.bot.id, workerSession.id);
+    }
 
     const spec = composeSpawnSpec({
       role: "worker",
@@ -1736,14 +1796,12 @@ export class SessionManager {
       existingRow: existing,
       ...(issue
         ? {
+            issueId: issue.id,
             branchOverride: `kawan/issue-${issue.number}-${existing.id.slice(0, 8)}`,
             systemPromptOverride: this.buildIssueWorkerSystemPrompt(bot, issue),
           }
         : {}),
     });
-    if (issue) {
-      this.issueHandlers?.bindWorkerSession(issue.id, bot.id, updated.id);
-    }
     return { session: serializeSession(updated) };
   }
 
@@ -2006,7 +2064,6 @@ export class SessionManager {
             conversation: conv,
             threadId: null,
             body: trimmedReply,
-            sourceWorkerId: session.id,
           });
         }
       }
@@ -2039,19 +2096,14 @@ export class SessionManager {
       }
 
       const reportSummary = refreshed.last_report ?? turn.assistantText;
-      if (conv && (reportSummary || refreshed.status === "review_requested")) {
+      if (conv && reportSummary) {
         const taskTitle = deriveTaskTitle(refreshed.task, refreshed.title);
-        const workerArtifacts = this.db
-          .listArtifacts({ sessionId: session.id })
-          .map((a) => a.filename ?? a.mime_type);
-        const pendingLand = this.db
+        const openProposal = this.db
           .listLands({ sessionId: session.id })
-          .find((l) => l.status === "requested" || l.status === "failed");
-        const statusNote = pendingLand
-          ? `status=${refreshed.status}, land_approval=pending`
-          : `status=${refreshed.status}`;
-        const artifactNote =
-          workerArtifacts.length > 0 ? `\nArtifacts attached: ${workerArtifacts.join(", ")}` : "";
+          .find((l) => l.status === "proposed" || l.status === "queued" || l.status === "paused");
+        const proposalNote = openProposal
+          ? `\nOpen proposal: land_id=${openProposal.id} (status=${openProposal.status}) in #merge-queue.`
+          : "";
 
         this.enqueueOrchestratorPrompt(
           bot,
@@ -2060,15 +2112,16 @@ export class SessionManager {
           [],
           true,
           [
-            `[worker-report for "${taskTitle}" (session_id=${session.id}, ${statusNote})]${artifactNote}`,
-            reportSummary || "(Worker submitted committed changes for review without extra text.)",
+            `[worker-report for "${taskTitle}" (session_id=${session.id}, status=${refreshed.status})]${proposalNote}`,
+            reportSummary || "(Worker submitted committed changes without extra text.)",
             "",
             "Remember: ONLY you represent the bot in chat (this report was not shown to humans).",
             "- If the worker asked a question you can answer from conversation context or kawan://soul.md, call `message_session(session_id, answer)` and output NO_REPLY.",
             "- If you need human input to unblock the worker, ask concisely in chat.",
-            "- If the worker completed the task or requested landing (`land_approval=pending`), write ONE review-card summary using the rules below; mention it is ready for review/approval if pending. If the worker attached a screenshot or image, just call `report()` normally; the most recent worker artifact is linked to your message automatically.",
+            `- If the worker finished branch work, call \`propose_merge(summary_md, evidence?)\` with the short user-facing changelog and its evidence (screenshots, report.md). ${openProposal ? "That amends the worker's existing proposal — use it to improve the changelog rather than opening a second one." : "That creates the proposal humans Merge or ask to change."}`, 
+            "- Chat commentary is optional: if you do write something, point at the proposal in #merge-queue instead of restating the changelog.",
             "",
-            REVIEW_CARD_SUMMARY_RULES,
+            PROPOSAL_WRITING_RULES,
             "- If a durable project fact, agreement, or decision was uncovered, save it via `soul_replace` or `soul_write`.",
           ].join("\n"),
           session.id,
@@ -2179,12 +2232,80 @@ export class SessionManager {
     }
   }
 
+  /** Accept the wire shape for artifacts: an array of upload payloads. */
+  private collectArtifactParams(params: Record<string, unknown>): Array<{
+    filename?: string;
+    mime_type?: string;
+    base64?: string;
+    content?: string;
+  }> {
+    if (params.artifact !== undefined) {
+      throw new Error(
+        "report/propose_merge take `artifacts: [...]`; the single `artifact` parameter is gone",
+      );
+    }
+    // `evidence` is the documented propose_merge name; `artifacts` is the wire field.
+    const raw = params.artifacts ?? params.evidence;
+    if (raw === undefined || raw === null) return [];
+    if (!Array.isArray(raw)) throw new Error("artifacts must be an array");
+    return raw.map((entry, index) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        throw new Error(
+          `artifacts[${index}] must be an object with filename/mime_type or content/base64`,
+        );
+      }
+      const item = entry as Record<string, unknown>;
+      return {
+        filename: typeof item.filename === "string" ? item.filename : undefined,
+        mime_type: typeof item.mime_type === "string" ? item.mime_type : undefined,
+        base64: typeof item.base64 === "string" ? item.base64 : undefined,
+        content: typeof item.content === "string" ? item.content : undefined,
+      };
+    });
+  }
+
+  private uploadArtifact(
+    input: { filename?: string; mime_type?: string; base64?: string; content?: string },
+    opts: { sessionId: string | null; conversationId: string | null },
+  ): ArtifactRow {
+    const bytes =
+      typeof input.base64 === "string"
+        ? Buffer.from(input.base64, "base64")
+        : typeof input.content === "string"
+          ? Buffer.from(input.content, "utf8")
+          : null;
+    if (!bytes) {
+      throw new Error("artifact upload is missing its bytes (base64 or content)");
+    }
+    if (bytes.byteLength > MAX_ARTIFACT_BYTES) {
+      throw new Error(`Artifact exceeds 10 MB limit (${bytes.byteLength} bytes)`);
+    }
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    const artifactPath = join(this.dataDir, "artifacts", sha256);
+    if (!existsSync(artifactPath)) {
+      writeFileSync(artifactPath, bytes, { mode: 0o644 });
+    }
+    return this.db.createArtifact({
+      sha256,
+      mimeType: input.mime_type || "text/plain",
+      byteSize: bytes.byteLength,
+      filename: input.filename ?? null,
+      sessionId: opts.sessionId,
+      conversationId: opts.conversationId,
+    });
+  }
+
   private async handleReport(
     session: SessionRow,
     text: string,
-    artifactInput?: { filename?: string; mime_type?: string; base64?: string },
+    artifactInputs: Array<{
+      filename?: string;
+      mime_type?: string;
+      base64?: string;
+      content?: string;
+    }>,
     inThread?: boolean,
-  ): Promise<{ message_id: string | null; artifact_id: string | null }> {
+  ): Promise<{ message_id: string | null; artifact_ids: string[] }> {
     const bot = this.db.getUser(session.bot_id);
     if (!bot) throw new Error("Bot not found");
 
@@ -2209,29 +2330,13 @@ export class SessionManager {
       ctx.reportedInTurn = true;
     }
 
-    let artifactRow: ArtifactRow | null = null;
-    if (artifactInput?.base64) {
-      const bytes = Buffer.from(artifactInput.base64, "base64");
-      if (bytes.byteLength > MAX_ARTIFACT_BYTES) {
-        throw new Error(`Artifact exceeds 10 MB limit (${bytes.byteLength} bytes)`);
-      }
-      const sha256 = createHash("sha256").update(bytes).digest("hex");
-      const artifactPath = join(this.dataDir, "artifacts", sha256);
-      if (!existsSync(artifactPath)) {
-        writeFileSync(artifactPath, bytes, { mode: 0o644 });
-      }
-      artifactRow = this.db.createArtifact({
-        sha256,
-        mimeType: artifactInput.mime_type || "text/plain",
-        byteSize: bytes.byteLength,
-        filename: artifactInput.filename ?? null,
-        sessionId:
-          session.kind === "orchestrator"
-            ? (ctx?.sourceWorkerId ?? session.id)
-            : session.id,
-        conversationId: conv.id,
-      });
-      const isIssueWorker = session.kind === "worker" && Boolean(this.db.getIssueBySessionId(session.id));
+    const artifactSessionId =
+      session.kind === "orchestrator" ? (ctx?.sourceWorkerId ?? session.id) : session.id;
+    const artifactRows = artifactInputs.map((input) =>
+      this.uploadArtifact(input, { sessionId: artifactSessionId, conversationId: conv.id }),
+    );
+    const isIssueWorker = session.kind === "worker" && Boolean(this.db.getIssueBySessionId(session.id));
+    for (const artifactRow of artifactRows) {
       if (session.kind === "worker" && !isIssueWorker) {
         this.wsServer.broadcastToConversation(conv, {
           type: "artifact.new",
@@ -2249,7 +2354,7 @@ export class SessionManager {
     if ((session.kind === "worker" && !linkedIssue) || ctx?.suppressChatPublish) {
       return {
         message_id: null,
-        artifact_id: artifactRow?.id ?? null,
+        artifact_ids: artifactRows.map((a) => a.id),
       };
     }
 
@@ -2258,212 +2363,13 @@ export class SessionManager {
       conversation: conv,
       threadId: isIssuePublisher ? null : effectiveThreadId,
       body: text,
-      artifactRow,
-      sourceWorkerId: linkedIssue ? session.id : ctx?.sourceWorkerId,
+      attachmentRows: artifactRows,
     });
 
     return {
       message_id: msg.id,
-      artifact_id: artifactRow?.id ?? null,
+      artifact_ids: artifactRows.map((a) => a.id),
     };
-  }
-
-  async handleLandRequest(session: SessionRow, summary: string): Promise<{
-    land_id: string;
-    status: string;
-    branch: string | null;
-  }> {
-    if (!session.clone_path || !existsSync(session.clone_path)) {
-      throw new Error("Worker clone directory is missing");
-    }
-    const settings = this.db.getHostSettings();
-    if (!settings.repo) {
-      throw new Error("Repository is not configured");
-    }
-    const { stdout: currentBranchOut } = await runGit([
-      "-C",
-      session.clone_path,
-      "rev-parse",
-      "--abbrev-ref",
-      "HEAD",
-    ]);
-    const currentBranch = currentBranchOut.trim();
-    if (session.branch && currentBranch !== session.branch) {
-      throw new Error(
-        `Currently on branch '${currentBranch}'; commits must be on your assigned session branch '${session.branch}'.`,
-      );
-    }
-    const clean = await isWorkingTreeClean(session.clone_path);
-    if (!clean) {
-      throw new Error(
-        "Working tree has uncommitted changes; run git add && git commit before calling land_request",
-      );
-    }
-    const ahead = await commitsAhead(session.clone_path, settings.repo.default_branch);
-    if (ahead < 1) {
-      throw new Error(
-        `Branch ${session.branch} has 0 commits ahead of ${settings.repo.default_branch}; commit changes before calling land_request`,
-      );
-    }
-
-    const linkedIssue = this.db.getIssueBySessionId(session.id);
-    if (linkedIssue) {
-      throw new Error(
-        "Issue worker sessions cannot call land_request; commit changes on your branch and report in the issue room. Humans trigger landing via the Land button.",
-      );
-    }
-
-    const existing = this.db
-      .listLands({ sessionId: session.id })
-      .find(
-        (l) =>
-          l.status === "requested" ||
-          l.status === "queued" ||
-          l.status === "rebasing" ||
-          l.status === "verifying" ||
-          l.status === "paused",
-      );
-    if (existing) {
-      return { land_id: existing.id, status: existing.status, branch: session.branch };
-    }
-
-    const land = this.db.createLand({
-      sessionId: session.id,
-      conversationId: session.conversation_id!,
-      threadId: session.thread_id,
-      issueId: null,
-    });
-    const trimmedSummary = summary.trim();
-    const updated = this.db.updateSession(session.id, {
-      status: "review_requested",
-      ...(trimmedSummary ? { last_report: trimmedSummary } : {}),
-    })!;
-    this.wsServer.broadcast({ type: "session.update", session: serializeSession(updated) });
-    this.wsServer.broadcast({ type: "land.update", land: serializeLand(land) });
-
-    const ctx = this.activeContexts.get(session.id);
-    if (ctx) ctx.reportedInTurn = true;
-
-    return { land_id: land.id, status: land.status, branch: updated.branch };
-  }
-
-  async approveLand(params: {
-    landId?: string;
-    sessionId?: string;
-    approvedBy: string;
-  }): Promise<{ land: LandRow; session: Omit<SessionRow, "token"> }> {
-    let land: LandRow | null = null;
-    if (params.landId) {
-      land = this.db.getLand(params.landId);
-    } else if (params.sessionId) {
-      const list = this.db.listLands({ sessionId: params.sessionId });
-      land = [...list].reverse().find((l) => l.status === "requested" || l.status === "failed") ?? null;
-    }
-    if (!land) throw new Error("Land request not found");
-    if (land.status === "landed" || land.status === "verifying") {
-      throw new Error(`Land ${land.id} is already ${land.status}`);
-    }
-
-    const session = this.db.getSession(land.session_id);
-    if (!session || !session.clone_path || !session.branch) {
-      throw new Error("Worker session or clone missing for land");
-    }
-    if (!existsSync(session.clone_path)) {
-      throw new Error(`Worker clone no longer exists: ${session.clone_path}`);
-    }
-    const bot = this.db.getUser(session.bot_id);
-    if (!bot || !bot.signing_key_path) {
-      throw new Error("Bot or bot signing key not found");
-    }
-    const settings = this.db.getHostSettings();
-    if (!settings.repo?.bare_path) {
-      throw new Error("Repository is not configured");
-    }
-    if (!settings.verify_command || !settings.verify_command.trim()) {
-      throw new Error("verify_command is not configured in host settings");
-    }
-
-    // Stop live worker process cleanly before landing/cleaning clone
-    const liveProc = this.processes.get(session.id);
-    if (liveProc) {
-      this.processes.delete(session.id);
-      await liveProc.stop();
-    }
-
-    let verifying = this.db.updateLand(land.id, {
-      status: "verifying",
-      approved_by: params.approvedBy,
-      error: null,
-    })!;
-    this.wsServer.broadcast({ type: "land.update", land: verifying });
-
-    const conv = this.db.getConversation(land.conversation_id);
-    const landingDir = join(this.dataDir, "workspaces", `landing-${land.id}`);
-    const result = await landBranch({
-      barePath: settings.repo.bare_path,
-      clonePath: session.clone_path,
-      branchName: session.branch,
-      defaultBranch: settings.repo.default_branch,
-      verifyCommand: settings.verify_command,
-      botName: bot.name,
-      botEmail: bot.email ?? `${bot.name.toLowerCase()}@kawan.local`,
-      signingKeyPath: bot.signing_key_path,
-      landingDir,
-    });
-
-    const taskTitle = deriveTaskTitle(session.task, session.title);
-
-    if (result.ok) {
-      removeClone(session.clone_path);
-      const landed = this.db.updateLand(land.id, {
-        status: "landed",
-        base_sha: result.baseSha,
-        landed_sha: result.landedSha ?? null,
-        verify_output: result.verifyOutput,
-        error: null,
-      })!;
-      const updatedSession = this.db.updateSession(session.id, { status: "landed" })!;
-      this.wsServer.broadcast({ type: "land.update", land: landed });
-      this.wsServer.broadcast({ type: "session.update", session: serializeSession(updatedSession) });
-      if (conv) {
-        const msg = this.db.appendMessage({
-          conversationId: conv.id,
-          authorId: bot.id,
-          threadId: land.thread_id,
-          body: `Landed "${taskTitle}" on \`${settings.repo.default_branch}\`.`,
-        });
-        this.wsServer.broadcastToConversation(conv, {
-          type: "message.new",
-          message: msg,
-          author: { id: bot.id, kind: "bot", name: bot.name },
-        });
-      }
-      return { land: landed, session: serializeSession(updatedSession) };
-    }
-
-    const failedLand = this.db.updateLand(land.id, {
-      status: "failed",
-      base_sha: result.baseSha,
-      verify_output: result.verifyOutput,
-      error: result.error ?? "Land failed",
-    })!;
-    const failedSession = this.db.updateSession(session.id, { status: "failed" })!;
-    this.wsServer.broadcast({ type: "land.update", land: failedLand });
-    this.wsServer.broadcast({ type: "session.update", session: serializeSession(failedSession) });
-    if (conv) {
-      const msg = this.db.appendMessage({
-        conversationId: conv.id,
-        authorId: bot.id,
-        threadId: land.thread_id,
-        body: `Land blocked for "${taskTitle}":\n${result.error ?? result.verifyOutput}`,
-      });
-      this.wsServer.broadcastToConversation(conv, {
-        type: "message.new",
-        message: msg,
-        author: { id: bot.id, kind: "bot", name: bot.name },
-      });
-    }
-    return { land: failedLand, session: serializeSession(failedSession) };
   }
 
   getArtifactPayload(artifactId: string): { artifact: ArtifactRow; base64: string; mime_type: string } {
