@@ -170,7 +170,7 @@ def main() -> int:
             ui.shot("/tmp/v1-05-settings-bots.png")
 
             # 6. Open #general via left rail
-            ui.click(100, 228)
+            ui.click(100, 199)
             ui.sleep(0.6)
             ui.shot("/tmp/v1-06-general-empty.png")
 
@@ -181,60 +181,35 @@ def main() -> int:
             ui.click(626, 105)  # @kawan pill in add-member strip
             ui.sleep(0.6)
 
-            # 8. Send prompt in composer and wait for APPROVE LAND button on the thread tray
+            # 8. Send prompt in composer; the orchestrator spawns a worker that proposes in #merge-queue
             ui.click(700, 828)
             ui.sleep(0.2)
-            ui.type("@kawan please create land_ok.txt containing ready, commit it, and request land")
+            ui.type("@kawan please create land_ok.txt containing ready, commit it, and propose it for merge")
             ui.key("Return")
 
-            approve_pos = None
-            deadline = time.monotonic() + 45.0
+            # 9. Open #merge-queue and wait for the proposal card's Merge button
+            ui.click(100, 85)
+            ui.sleep(1.0)
+
+            merge_pos = None
+            deadline = time.monotonic() + 90.0
             while time.monotonic() < deadline:
-                approve_pos = locate_optional(
-                    ui, "#102015", tolerance=12, region=(820, 120, 1250, 770), minimum=400
+                merge_pos = locate_optional(
+                    ui, "#102015", tolerance=12, region=(900, 120, 1290, 815), minimum=400
                 )
-                if approve_pos:
+                if merge_pos:
                     break
                 ui.sleep(1.0)
 
-            ui.shot("/tmp/v1-07-land-requested.png")
-            if not approve_pos:
-                raise TimeoutError("Timed out waiting for APPROVE LAND button on thread tray")
+            ui.shot("/tmp/v1-07-proposal.png")
+            if not merge_pos:
+                raise TimeoutError("Timed out waiting for the proposal card's Merge button in #merge-queue")
 
-            # 8b. Check Repository Status (Waiting to Land) and open live branch Changes drawer
-            ui.click(100, 85)
-            ui.sleep(0.6)
-            status_approve_pos = locate_optional(
-                ui, "#102015", tolerance=12, region=(1080, 180, 1280, 620), minimum=400
-            )
-            ui.shot("/tmp/v1-07c-status-waiting.png")
-            if not status_approve_pos:
-                raise RuntimeError("Could not locate APPROVE LAND button on Repository Status Waiting card")
-
-            ui.click(635, status_approve_pos[1])  # CHANGES button in card footer
-            ui.sleep(0.8)
-            ui.shot("/tmp/v1-07d-session-diff.png")
-
-            # Return to #general before continuing the Thread Drawer land approval
-            ui.click(100, 228)
-            ui.sleep(0.5)
-
-            # 9. Open the right-hand Thread Drawer via the Slack-style thread tray and inspect report.md card
-            ui.click(approve_pos[0] - 320, approve_pos[1])
-            ui.sleep(0.6)
-            ui.shot("/tmp/v1-07b-thread-drawer.png")
-
-            drawer_approve_pos = locate_optional(
-                ui, "#102015", tolerance=12, region=(1040, 120, 1430, 790), minimum=400
-            )
-            if not drawer_approve_pos:
-                raise TimeoutError("Timed out waiting for APPROVE LAND button inside Thread Drawer")
-
-            # 10. Click APPROVE LAND inside the drawer and verify git bare repo advances with signed commit
-            ui.click(*drawer_approve_pos)
+            # 10. Merge the proposal and verify the bare repo advances with a signed commit
+            ui.click(*merge_pos)
 
             new_head = None
-            land_deadline = time.monotonic() + 20.0
+            land_deadline = time.monotonic() + 30.0
             while time.monotonic() < land_deadline:
                 res = run_git(host_bare_repo, "rev-parse", "refs/heads/main")
                 if res.returncode == 0:
@@ -244,29 +219,14 @@ def main() -> int:
                         break
                 ui.sleep(0.5)
 
-            ui.sleep(0.6)
+            ui.sleep(0.8)
             ui.shot("/tmp/v1-08-landed.png")
 
-            # 11. Open @kawan DM to verify Tasks UX panel
-            ui.click(100, 304)
-            ui.sleep(0.5)
-            ui.shot("/tmp/v1-09-bot-dm-tasks.png")
+            # 11. The train is empty again and the proposal left Proposed (N)
+            ui.shot("/tmp/v1-09-merge-queue-landed.png")
 
-            # 12. Open Repository Status to verify task moved to Shipped and inspect bare-repo diff
-            ui.click(100, 85)
-            ui.sleep(0.6)
-            ui.shot("/tmp/v1-09b-status-shipped.png")
-            ui.click(644, 480)  # CHANGES button on Shipped card footer
-            ui.sleep(0.8)
-            ui.shot("/tmp/v1-09c-shipped-diff.png")
-
-            # 13. Open #merge-queue to verify Merge Queue rail & empty train state
+            # 12. Open Issues via left rail to verify Issues view
             ui.click(100, 118)
-            ui.sleep(0.6)
-            ui.shot("/tmp/v1-10-merge-queue.png")
-
-            # 14. Open Issues via left rail to verify Issues view
-            ui.click(100, 151)
             ui.sleep(0.6)
             ui.shot("/tmp/v1-11-issues.png")
 
