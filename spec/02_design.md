@@ -27,9 +27,6 @@ environments and `pi` agent sessions behind the scenes.
   tasks, owned by the bot that spawned them. Each worker owns an isolated
   **virtual environment** (its own clone, working tree, and sandbox). Git
   mechanics are managed entirely by the host.
-- **Bot profile:** Clicking a bot opens a structured view of its active
-  sessions, their current status, and their virtual environments/artifacts,
-  providing direct visibility without having to ask in chat.
 - **Threads:** Used when a topic or session needs deeper context-building,
   exploration, or focused steering without cluttering the main channel.
 
@@ -59,13 +56,13 @@ actually requested:
   choices gating `spawn_session` mechanically on the host (`work_request` stays
   strictly `no` for questions, brainstorming, and hypotheticals so it never fires
   on a hair trigger):
-  - `yes / yes` — start immediately and render an inline `[ Stop ]` task card (or
-    attach a writable branch if inside an issue room without one).
-  - `no / yes` — hold behind an inline `[ Start ] [ Dismiss ]` proposal card (zero
-    clone or worker tokens until confirmed; `[ Dismiss ]` notes the back-off in
-    orchestrator context).
+  - `yes / yes` — start immediately; the worker appears in the bottom session
+    strip (or attach a writable branch if inside an issue room without one).
+  - `no / yes` — hold behind the inline `[ Start ] [ Dismiss ]` spawn-approval row
+    (zero clone or worker tokens until confirmed; `[ Dismiss ]` notes the back-off
+    in orchestrator context).
   - `no / no` — block `spawn_session` and instruct the orchestrator to reply
-    conversationally with no proposal card.
+    conversationally; nothing is proposed.
 
 **Bot-to-bot messaging everywhere:** Conversational messages from both humans and
 bots flow through `route_message` in channels, DMs, and issue rooms alike. Two
@@ -87,16 +84,15 @@ and the reason beside it, and redirecting it is one click. A missing or failing
 decision model is a hard error shown in the conversation, not a quiet fallback to
 something dumber.
 
-## Repository Status
+## Proposals
 
-To answer what is moving, waiting, or merged across the project without translating
-git branches or scrolling through channels, Kawan provides a unified **Status**
-view covering both ad-hoc chat tasks and formal issues (`Needs You`,
-`Waiting to Land`, `In Flight`, `Shipped`). Every entry centers on its human title,
-status, participants, and expandable `report.md` artifact, keeping raw branch and
-commit identifiers tucked away unless inspected. Two-tier `read_cursors` track
-quiet unread dots separately from loud action badges (`@you`, `Waiting to Land`,
-`Merge Queue paused`).
+A finished branch shows up as a proposal: an ordinary message — Markdown plus zero
+or more attachments — posted in `#merge-queue` and linked to a branch. The message
+renderer is the only renderer, so inline `![alt](kawan://artifact/<id>)` images
+render in the body at column width and open the artifact drawer on click. The Merge
+Queue shows a `Proposed (N)` section above the train, and the existing read cursor
+marks a proposal updated since it was last viewed. Bots reach out in ordinary chat
+messages when something needs attention. See `09_proposals.md`.
 
 ## Issues & Epics
 
@@ -127,23 +123,26 @@ branch once a bot begins implementing:
   auto-retrying on failure) and displays concrete state in a compact branch bar:
   branch owner, working/reviewing indicator, commit count, divergence from
   `default_branch` (`Sync with main`), `Checks ✓/✗`, `[ Changes ]`, and one-click
-  **`[ Land ]`** whenever commits exist.
+  **`[ Propose ]`** whenever commits exist.
 - **Soul learning loop:** After an issue lands, a concise post-landing digest
   returns to the implementer bot's orchestrator so durable repository lessons fold
   into `kawan://soul.md` (`06_memory.md`). See `08_v2_work_and_queue.md`.
 
-## Artifact Review & Merge Queue
+## Proposals & Merge Queue
 
 - **Repo checks & inspection:** `.kawan/checks/*` (or `.kawan/ci` / host
-  `verify_command`) runs implicitly on issue branches as commits arrive and
-  deterministically pre-land in the Merge Queue after rebase. Review focuses on
-  artifacts, diffs, and check logs (`Changes` drawer and expandable log
-  artifacts). Branches touching `.kawan/*` surface a `Modifies .kawan/ checks`
-  warning.
-- **Merge queue & `#merge-queue`:** Clicking `Approve Land` / `Land` enqueues the
-  branch into a serialized FIFO merge queue backed by a dedicated `#merge-queue`
-  conversation (`kind = 'merge_queue'`) with a pinned Merge Train header and an
+  `verify_command`) runs implicitly on branches as commits arrive and
+  deterministically pre-merge in the Merge Queue after rebase. Review focuses on
+  the proposal's rendered changelog, inline screenshots, diffs, and check logs
+  (`Changes` drawer and expandable log artifacts). Branches touching `.kawan/*`
+  surface a `Modifies .kawan/ checks` warning and never land automatically.
+- **Proposals & `#merge-queue`:** `propose_merge` posts the proposal message and a
+  `proposed` `lands` row; a human clicks **Merge**, or `default_landing_mode =
+  "auto"` accepts a clean proposal, and the branch enters a serialized FIFO merge
+  queue backed by a dedicated `#merge-queue` conversation (`kind =
+  'merge_queue'`) with a pinned Merge Train header, a `Proposed` section, and an
   assigned Queue Bot. Clean rebases with passing checks land via a deterministic
   host fast-path; any conflict or check regression pauses the queue and opens an
   incident thread in `#merge-queue` where humans and the Queue Bot reconcile
-  multi-turn before resuming. See `08_v2_work_and_queue.md`.
+  multi-turn before resuming. See `08_v2_work_and_queue.md` and
+  `09_proposals.md`.

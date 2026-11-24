@@ -6,15 +6,16 @@ repo-wide visibility, and a serialized merge queue without inventing parallel
 state machines or separating Issues from Kawan's core chat model:
 
 - **One delivery pipeline:** ad-hoc `@bot` tasks started in channels/DMs and
-  Markdown issue rooms feed the same **Status** ledger and **Merge Queue**, and
+  Markdown issue rooms both end in the same proposal path and **Merge Queue**, and
   any ad-hoc worker session can graduate into an issue (`#N`) via one-click
   **Promote to Issue** carrying its existing clone, branch, session, and artifacts.
+  Proposals are defined in `09_proposals.md`.
 - **One conversation substrate:** rather than inventing modal wizards, dedicated
   review state machines, or separate comment forms, **Issues** and **Merge
   Queue** reuse Kawan's `conversations`, `messages`, sequence replay, threads,
   `artifacts`, and composer — adding only what each surface genuinely needs (a
   central editable Markdown document + branch bar for issues, and the Merge Train
-  header for `#merge-queue`).
+  header + `Proposed` section for `#merge-queue`).
 
 ## Conversation Kinds & Routing Boundary
 
@@ -35,9 +36,9 @@ Three strict rules keep routing safe and predictable without adding premature
 heuristics:
 
 1. **Never route self:** A bot never routes messages it authored itself.
-2. **Host notices never wake bots:** Deterministic host-posted cards and notices
-   (implicit check checkpoints, land notices, `#merge-queue` incident cards) do
-   not enter `route_message`.
+2. **Host notices never wake bots:** Deterministic host-posted notices
+   (implicit check checkpoints, proposal create/amend notices, land notices,
+   `#merge-queue` incident cards) do not enter `route_message`.
 3. **Lightweight SubQ Snap anti-chatter guidance:** When the incoming author is a
    bot, the host passes `author_kind: "bot"` and instructs `route_message` to
    treat polite closings, acknowledgements, status confirmations, or bare approvals
@@ -74,20 +75,19 @@ The host enforces the gate mechanically whenever an orchestrator calls
 
 | `explicit_work_start` | `work_request` | Example | Host behavior on `spawn_session` |
 |---|---|---|---|
-| `yes` | `yes` | `"@bot fix the flaky header test"` | **Start immediately** and render an inline running task card with `[ Stop ]` and `[ Promote to Issue ]` (or bind the branch if inside an issue room without one) |
+| `yes` | `yes` | `"@bot fix the flaky header test"` | **Start immediately**; the worker appears in the bottom session strip (or the branch is bound if inside an issue room without one) |
 | `no` | `yes` | `"@bot the CI build is flaky, could you take a look?"` | Hold in `pending_approval` behind an inline `[ Start ] [ Dismiss ]` card (zero clone or worker tokens until clicked; `[ Dismiss ]` records a host back-off note in orchestrator context) |
-| `no` | `no` | `"@bot what would it take to add dark mode?"` | **Block spawn** — host tells orchestrator no work was requested so it replies conversationally without emitting a proposal card |
+| `no` | `no` | `"@bot what would it take to add dark mode?"` | **Block spawn** — host tells orchestrator no work was requested so it replies conversationally and proposes nothing |
 
 Read-only reviewer passes have no write side effects and do not hold behind
 `pending_approval`. Criteria are calibrated empirically with `routing-harness.ts`.
 
-## Navigation & Repository Status
+## Navigation
 
-The left rail adds two top-level views plus the Merge Queue above `CHANNELS`:
+The left rail shows the Merge Queue and Issues above `CHANNELS`:
 
 ```text
-Status           (badge when Needs You / Waiting to Land is non-empty)
-Merge Queue      (live pill: running count or paused alert)
+Merge Queue      (live pill: proposed/running count or paused alert)
 Issues           (open issue count)
 ──────────
 CHANNELS
@@ -96,32 +96,11 @@ CHANNELS
 ```
 
 The `36px` bottom session strip also carries a compact Merge Queue status pill on
-its right edge whenever items are queued or the queue is paused, linking directly
-to **Merge Queue** from anywhere in the app.
+its right edge whenever proposals or queued items exist or the queue is paused,
+linking directly to **Merge Queue** from anywhere in the app.
 
-**Status** is the single repo-wide delivery view across both formal issues and
-ad-hoc chat work, arranged top to bottom by attention priority:
-
-1. **Needs You** (shown only when non-empty): items with a pending `@owner`
-   `ask_owner` question, failed sessions/lands, pending spawn approvals, or a
-   paused Merge Queue banner linking into `#merge-queue`.
-2. **Waiting to Land:** finished ad-hoc sessions requesting land and Merge Queue
-   items currently `queued` / `rebasing` / `verifying`, leading with a concise
-   user-facing changelog summary (user-visible outcome, not file-level
-   implementation) plus any attached screenshot evidence, showing checks, an
-   expandable `report.md`, origin link, and one-click `Approve Land` / queue links.
-3. **In Flight:** currently running or active worker sessions and open active
-   issues (including active read-only reviewer passes), showing concrete activity
-   (working, reviewing, idle branch with commits/checks) and click-to-inspect.
-4. **Shipped:** reverse-chronological changelog of landed work centered on a
-   short user-facing outcome summary, task title, participants, timestamp, origin
-   link, screenshot evidence when attached, and an expandable `report.md`—keeping
-   raw branches and commit SHAs tucked behind on-demand inspection.
-
-Every review card is written for the person approving from the card, not for
-someone reading the diff: 1-3 sentences of plain-language change, with file
-names, markup, logs, branches, and commits left to `report.md` or the Changes
-drawer. Visual changes carry a screenshot artifact on the card.
+In-flight visibility is limited to the bottom session strip, the issue room live
+activity bar, the session drawer, and the spawn-approval row.
 
 ### Two-Tier Unread & Attention (`read_cursors`)
 
@@ -129,10 +108,12 @@ As asynchronous activity spans channels, issues, and `#merge-queue`, a lightweig
 `(user_id, conversation_id, last_read_seq)` cursor table distinguishes ambient
 updates from required action in the left rail:
 
-- **Quiet unread dot:** new messages, artifacts, or comments arrived past
-  `last_read_seq` without requiring human intervention.
-- **Loud action badge:** `@you` (`ask_owner`), `Waiting to Land`, or
-  `Merge Queue paused`.
+- **Quiet unread dot:** new messages, artifacts, proposals, or comments arrived
+  past `last_read_seq` without requiring human intervention.
+- **Loud action badge:** `@you` (`ask_owner`) or `Merge Queue paused`.
+
+The same cursor drives the "updated since you viewed" dot on proposal rows in
+`#merge-queue` (`09_proposals.md`).
 
 ## Issues: Chat-First Rooms + Central Markdown Document
 
@@ -187,8 +168,10 @@ wizard or `Start Review Cycle` modal:
      (`active_session_id`, `implementer_bot_id`).
    - If the same bot already owns the issue's branch, subsequent steering resumes
      or steers its existing persistent worker session.
-   - **No `land_request` trap:** Issue workers simply commit on their branch and
-     report progress in the room — humans decide when to click **Land**.
+   - **Propose, don't land:** committing lands nothing. When the work is ready,
+     the worker or orchestrator calls `propose_merge` and the proposal appears in
+     `#merge-queue`; humans decide when to click **Merge**
+     (`09_proposals.md`).
 3. **Reviewing (`@rev1 @rev2 review this`, or `review_issue` in 1-bot rooms):**
    - Only **one bot owns the writable branch** on an issue at a time.
    - Any **other** bot asked to review or work on an issue that already has a live
@@ -200,7 +183,7 @@ wizard or `Start Review Cycle` modal:
      fresh read-only reviewer pass against its own branch instead of reviewing in
      the same implementation context.
    - Reviewers post their findings directly into the issue room as themselves (via
-     `report(text, artifact?)` or reply). Via bot-to-bot routing, the branch
+     `report(text, artifacts?)` or reply). Via bot-to-bot routing, the branch
      owner's worker sees the critique, fixes the code/tests on its branch, pushes
      a new commit, and replies back cleanly — continuing until both sides converge
      (with polite `LGTM` / sign-offs routed as `none`).
@@ -228,7 +211,7 @@ visible whenever you glance at the issue:
 - **Worker checkpoints:** When an issue worker finishes a turn with commits, a
   concise non-routed host checkpoint note records commit count and check status.
 
-### Live Activity Bar, Landing & Other Controls
+### Live Activity Bar, Proposals & Other Controls
 
 - **Concrete Live Branch & Activity Bar (Issue Room):** One compact bar under the
   header shows concrete reality rather than abstract workflow phase names:
@@ -236,12 +219,12 @@ visible whenever you glance at the issue:
   - Working / Reviewing: `● @coder working…` / `● @rev reviewing…` + `[ Stop ]`
   - Idle with branch: `@coder idle · N commits · M behind main · Checks ✓/✗`
     (clicking `Checks ✓/✗` opens its log artifact) + `[ Changes ]`,
-    `[ Sync with main ]`, and primary **`[ Land ]`**
-  - Queued / Landed: `Queued #1 in #merge-queue` / `Landed`
-- **Direct `[ Land ]` (`issue.land`):** Available directly whenever an `open`
-  issue has a clean branch with `commits_ahead >= 1` and is not currently queued
-  or landing — no intermediate `Ready to Land` transition required. Clicking
-  `Land` enqueues onto `#merge-queue`.
+    `[ Sync with main ]`, and primary **`[ Propose ]`**
+  - Proposed / Landed: `Proposed · in Merge Queue` / `Landed`
+- **Direct `[ Propose ]`:** Available directly whenever an `open` issue has a
+  clean branch with `commits_ahead >= 1` and no open proposal. Clicking
+  `Propose` creates the issue's proposal in `#merge-queue`; proposing again
+  amends it. Merging happens in the queue, not in the room.
 - **Escape & utility controls:**
   - **`ask_owner(question)`:** Optional pause banner (`needs_input_question`)
     pinging `@owner` without trapping the issue in a rigid state machine.
@@ -256,7 +239,7 @@ visible whenever you glance at the issue:
     lessons fold into `kawan://soul.md`.
 - **Views:** The Issues list shows two clean groups — **Open** (with concrete
   live pills: `Draft`, `Working`, `Reviewing`, `N commits`, `Checks ✓/✗`,
-  `Queued`, `Modifies .kawan/`) and **Landed / Closed** — without a 4-column
+  `Proposed`, `Modifies .kawan/`) and **Landed / Closed** — without a 4-column
   waterfall Board.
 
 ## Repo-Native CI (`.kawan/checks/*`)
@@ -272,8 +255,8 @@ visible whenever you glance at the issue:
   commits/rebases (never auto-retrying), and (2) **pre-land** deterministically
   inside the Merge Queue after rebasing onto latest `default_branch`.
 - **`.kawan/` modification guard:** If a branch's diff touches `.kawan/*`, the UI
-  surfaces a **`Modifies .kawan/ checks`** warning and auto-land is never
-  bypassed without explicit human landing.
+  surfaces a **`Modifies .kawan/ checks`** warning and the proposal never lands
+  automatically; it waits for an explicit human **Merge**.
 
 ## Merge Queue & `#merge-queue`
 
@@ -289,24 +272,29 @@ A single serialized FIFO queue per host replaces uncoordinated per-session landi
   - `auto_resolve_trivial`: Queue Bot may attempt clean, unambiguous conflict fixes
     and re-run checks automatically, pausing only on semantic ambiguity or repeat
     check failure.
-- **`lands` extensions:** `queue_position`, `issue_id` (nullable for ad-hoc chat
-  tasks), `status` (`queued` | `rebasing` | `verifying` | `paused` | `landed` |
-  `failed` | `removed`), `pause_reason`, `queue_session_id`, and `trigger`
-  (`manual_approve` | `auto_land`).
+- **`lands` extensions:** `queue_position`, `message_id` (the proposal message),
+  `issue_id` (nullable for ad-hoc chat tasks), `status` (`proposed` | `queued` |
+  `rebasing` | `verifying` | `paused` | `landed` | `failed` | `withdrawn`),
+  `pause_reason`, `queue_session_id`, and `trigger` (whether a human merged it or
+  auto mode accepted it).
 
 ### Execution & Reconciliation Flow
 
-1. **Enqueue:** `Approve Land` (from chat or Status) or **`Land`** (from an issue
-   room) appends an entry to `lands` (`status = 'queued'`). Order is preserved
+1. **Propose:** `propose_merge` creates the proposal message and a `proposed`
+   `lands` row; proposing again on the same branch amends both. Order is preserved
    strictly: while the queue is paused, later entries wait rather than skipping
    ahead.
-2. **Host fast-path (quiet on success):** For the head item (`#1`), the host creates
+2. **Accept:** **`Merge`** in `#merge-queue` (`land.merge`) moves the item to
+   `queued`. With `default_landing_mode = "auto"` the host accepts a clean proposal
+   itself. Nothing else is accepted; **`Withdraw`** (`land.withdraw`, or the agent's
+   `withdraw_proposal`) ends an open proposal instead.
+3. **Host fast-path (quiet on success):** For the head item (`#1`), the host creates
    a clean landing clone of `default_branch`, fetches the candidate branch, rebases,
    and runs `.kawan/checks/*`. If rebase is clean and every check exits `0`, the host
-   fast-forwards `default_branch` immediately with zero LLM turns, writes the
-   `Shipped` record, and marks any linked issue `landed`. Clean merges do not
-   clutter `#merge-queue`.
-3. **Friction path (strict pause + Queue Bot in `#merge-queue`):** If rebase
+   fast-forwards `default_branch` immediately with zero LLM turns, posts the landed
+   notice (the proposal message is the changelog of record), and marks any linked
+   issue `landed`. Clean merges do not clutter `#merge-queue`.
+4. **Friction path (strict pause + Queue Bot in `#merge-queue`):** If rebase
    conflicts or `.kawan/checks/*` fail:
    - The queue pauses immediately (`paused`) at `#1`.
    - The Queue Bot spins up (or resumes) a landing-clone session for `#1`, inspects
@@ -315,8 +303,8 @@ A single serialized FIFO queue per host replaces uncoordinated per-session landi
      attached), and waits for humans in that incident thread.
    - Humans inspect and converse multi-turn with the Queue Bot in `#merge-queue`,
      or use deterministic controls in the Merge Train header: **Retry checks**,
-     **Send back to implementer & Resume** (ejects `#1` back to its room/owner
-     and unpauses `#2`), or **Defer / Remove**.
+     **Send back to implementer & Resume** (returns `#1` to `proposed` in its
+     origin room and unpauses `#2`), or **Defer / Remove**.
    - Once instructed, the Queue Bot applies the fix inside the landing clone and
      calls `resume_and_land` (which re-runs full `.kawan/checks/*` before pushing
      and advancing `#2`) or `eject_to_implementer`.
@@ -328,6 +316,10 @@ Opening **Merge Queue** displays a pinned **Merge Train** header above the stand
 
 - **Header:** Queue state pill (`Idle` / `Running` / `Paused`), assigned `Queue bot`
   selector, conflict policy badge, and `Pause` / `Resume` button.
+- **`Proposed (N)` section:** one row per open proposal, with author, title,
+  rendered changelog (clipped with `View full proposal`), image thumbnails, checks
+  pills, commits ahead / behind, `updated` time with the read-cursor dot, and
+  `Merge`, `Open in <origin>`, `Withdraw` (`09_proposals.md`).
 - **Head slot (`#1 · Now Landing`):** Title, origin link (`#issue` or chat thread),
   3-stage progress (`Rebase → Checks [named .kawan/checks/* pills] → Land`),
   artifact/log inspector, and quick action buttons (`Retry checks`,
