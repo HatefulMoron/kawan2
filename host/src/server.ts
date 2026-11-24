@@ -13,7 +13,7 @@ import {
   testDecisionModel,
   type DecisionMode,
 } from "./decisions.js";
-import { attachRepository, ensureHostSshKey, generateBotKeypair, getBranchHead } from "./git.js";
+import { attachRepository, ensureHostSshKey, generateBotKeypair } from "./git.js";
 import { IssueManager } from "./issues.js";
 import { MergeQueueManager } from "./merge-queue.js";
 import { serializeSession, SessionManager, type SoulHandlers } from "./sessions.js";
@@ -30,7 +30,6 @@ import type {
   ProviderSettings,
   UserRow,
 } from "./types.js";
-import { serializeLand } from "./types.js";
 import { computeSetupStatus, KawanWsServer, type CommandHandler } from "./ws.js";
 
 export interface DispatchEvent {
@@ -684,19 +683,21 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
       return sessionManager.getArtifactPayload(artifactId);
     },
 
-    "land.approve": async (req, client) => {
-      const landId = typeof req.land_id === "string" ? req.land_id : undefined;
-      const sessionId = typeof req.session_id === "string" ? req.session_id : undefined;
-      if (!landId && !sessionId) {
-        throw new Error("land_id or session_id is required");
-      }
-      return await mergeQueue.enqueueLand({
-        landId,
-        sessionId,
-        approvedBy: client.user.id,
+    "land.merge": async (req, client) => {
+      const landId = String(req.land_id ?? "").trim();
+      if (!landId) throw new Error("land_id is required");
+      return await mergeQueue.acceptProposal(landId, {
+        by: client.user.id,
         trigger: "manual_approve",
         waitForSettlement: req.async !== true,
       });
+    },
+
+    "land.withdraw": async (req, client) => {
+      const landId = String(req.land_id ?? "").trim();
+      if (!landId) throw new Error("land_id is required");
+      const reason = typeof req.reason === "string" && req.reason.trim() ? req.reason.trim() : undefined;
+      return { queue: await mergeQueue.withdrawProposal(landId, client.user.id, reason) };
     },
 
     "session.confirm": async (req) => {
@@ -810,34 +811,6 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
       return { decision: updated };
     },
 
-    "status.read": async () => {
-      const settings = db.getHostSettings();
-      let headSha: string | null = null;
-      if (settings.repo?.bare_path && settings.repo.default_branch) {
-        try {
-          headSha = await getBranchHead(
-            settings.repo.bare_path,
-            `refs/heads/${settings.repo.default_branch}`,
-          );
-        } catch {
-          headSha = null;
-        }
-      }
-      return {
-        repo: settings.repo
-          ? {
-              url: settings.repo.url,
-              default_branch: settings.repo.default_branch,
-              head_sha: headSha,
-            }
-          : null,
-        sessions: db.listSessions({ kind: "worker" }).map(serializeSession),
-        lands: db.listLands().map(serializeLand),
-        artifacts: db.listArtifacts(),
-        issues: issueManager.listIssues(),
-      };
-    },
-
     "session.diff": async (req) => {
       const sessionId = String(req.session_id ?? "").trim();
       if (!sessionId) throw new Error("session_id is required");
@@ -904,10 +877,10 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
       return await issueManager.syncWithMain(ref);
     },
 
-    "issue.land": async (req, client) => {
+    "issue.propose": async (req) => {
       const ref = (req.issue_id ?? req.number ?? "") as string | number;
       if (!ref) throw new Error("issue_id or number is required");
-      return await issueManager.landIssue(ref, client.user.id);
+      return await issueManager.proposeIssue(ref);
     },
 
     "issue.stop": async (req) => {
@@ -1117,6 +1090,7 @@ export async function startHost(opts: StartHostOptions): Promise<KawanHost> {
   });
   mergeQueue.ensureConversation();
   void mergeQueue.kickLoop();
+  void mergeQueue.refreshProposalMetrics();
 
   if (holdTimeoutMs > 0) {
     const grouped = new Map<string, { conversationId: string; botId: string; expiresAt: number }>();

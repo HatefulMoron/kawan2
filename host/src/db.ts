@@ -91,7 +91,6 @@ const SCHEMA_MIGRATIONS: Array<{ version: number; sql: string }> = [
         author_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         thread_id TEXT,
         body TEXT NOT NULL,
-        artifact_id TEXT,
         created_at INTEGER NOT NULL,
         UNIQUE (conversation_id, seq)
       );
@@ -157,6 +156,16 @@ const SCHEMA_MIGRATIONS: Array<{ version: number; sql: string }> = [
         created_at INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS message_artifacts (
+        message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (message_id, artifact_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_message_artifacts_message
+        ON message_artifacts(message_id, position);
+
       CREATE TABLE IF NOT EXISTS soul (
         id TEXT PRIMARY KEY,
         bot_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -180,7 +189,7 @@ const SCHEMA_MIGRATIONS: Array<{ version: number; sql: string }> = [
         conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
         thread_id TEXT,
         message_id TEXT,
-        status TEXT NOT NULL CHECK(status IN ('requested', 'queued', 'rebasing', 'verifying', 'paused', 'landed', 'failed', 'removed')),
+        status TEXT NOT NULL CHECK(status IN ('proposed', 'queued', 'rebasing', 'verifying', 'paused', 'landed', 'failed', 'withdrawn')),
         approved_by TEXT,
         base_sha TEXT,
         landed_sha TEXT,
@@ -191,7 +200,7 @@ const SCHEMA_MIGRATIONS: Array<{ version: number; sql: string }> = [
         pause_reason TEXT,
         queue_session_id TEXT,
         queue_thread_id TEXT,
-        trigger TEXT NOT NULL DEFAULT 'manual_approve',
+        trigger TEXT NOT NULL DEFAULT 'proposal',
         checks_json TEXT,
         touches_kawan INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
@@ -476,6 +485,109 @@ export class KawanDb {
       DROP TABLE IF EXISTS issue_reviewers;
       DROP TABLE IF EXISTS issue_reviews;
     `);
+    this.upgradeProposalSchema();
+  }
+
+  /**
+   * Forward migration onto the proposal model. A message used to carry at most
+   * one `messages.artifact_id`; attachments now live in the ordered
+   * `message_artifacts` join table. `lands.requested` became `lands.proposed`
+   * (and `removed` became `withdrawn`), which also needs the status CHECK
+   * rewritten. Both steps are idempotent and safe on a fresh database.
+   */
+  private upgradeProposalSchema(): void {
+    this.sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS message_artifacts (
+        message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (message_id, artifact_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_message_artifacts_message
+        ON message_artifacts(message_id, position);
+    `);
+
+    const msgCols = this.sqlite
+      .prepare("PRAGMA table_info(messages)")
+      .all() as Array<{ name: string }>;
+    if (msgCols.some((c) => c.name === "artifact_id")) {
+      this.sqlite.exec(`
+        INSERT OR IGNORE INTO message_artifacts (message_id, artifact_id, position)
+          SELECT m.id, m.artifact_id, 0
+          FROM messages m JOIN artifacts a ON a.id = m.artifact_id
+          WHERE m.artifact_id IS NOT NULL;
+        UPDATE artifacts
+          SET message_id = (
+            SELECT ma.message_id FROM message_artifacts ma WHERE ma.artifact_id = artifacts.id
+          )
+          WHERE message_id IS NULL
+            AND EXISTS (SELECT 1 FROM message_artifacts ma WHERE ma.artifact_id = artifacts.id);
+      `);
+      try {
+        this.sqlite.exec("ALTER TABLE messages DROP COLUMN artifact_id");
+      } catch {
+        // SQLite < 3.35 cannot drop columns; the column stays unused and null.
+      }
+    }
+
+    const landTableSql = (
+      this.sqlite
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'lands'")
+        .get() as { sql?: string } | undefined
+    )?.sql;
+    if (landTableSql && (landTableSql.includes("'requested'") || landTableSql.includes("'removed'"))) {
+      this.sqlite.exec("PRAGMA foreign_keys = OFF;");
+      try {
+        this.transaction(() => {
+          this.sqlite.exec(`
+            CREATE TABLE lands_v4 (
+              id TEXT PRIMARY KEY,
+              session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+              conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+              thread_id TEXT,
+              message_id TEXT,
+              status TEXT NOT NULL CHECK(status IN ('proposed', 'queued', 'rebasing', 'verifying', 'paused', 'landed', 'failed', 'withdrawn')),
+              approved_by TEXT,
+              base_sha TEXT,
+              landed_sha TEXT,
+              verify_output TEXT,
+              error TEXT,
+              queue_position INTEGER,
+              issue_id TEXT,
+              pause_reason TEXT,
+              queue_session_id TEXT,
+              queue_thread_id TEXT,
+              trigger TEXT NOT NULL DEFAULT 'proposal',
+              checks_json TEXT,
+              touches_kawan INTEGER NOT NULL DEFAULT 0,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+            INSERT INTO lands_v4 (
+              id, session_id, conversation_id, thread_id, message_id, status, approved_by,
+              base_sha, landed_sha, verify_output, error, queue_position, issue_id, pause_reason,
+              queue_session_id, queue_thread_id, trigger, checks_json, touches_kawan,
+              created_at, updated_at
+            )
+            SELECT
+              id, session_id, conversation_id, thread_id, message_id,
+              CASE status
+                WHEN 'requested' THEN 'proposed'
+                WHEN 'removed' THEN 'withdrawn'
+                ELSE status
+              END,
+              approved_by, base_sha, landed_sha, verify_output, error, queue_position, issue_id,
+              pause_reason, queue_session_id, queue_thread_id, trigger, checks_json, touches_kawan,
+              created_at, updated_at
+            FROM lands;
+            DROP TABLE lands;
+            ALTER TABLE lands_v4 RENAME TO lands;
+          `);
+        });
+      } finally {
+        this.sqlite.exec("PRAGMA foreign_keys = ON;");
+      }
+    }
   }
 
   // ---- Settings ----
@@ -809,13 +921,49 @@ export class KawanDb {
   }
 
   // ---- Messages ----
+  private static readonly MESSAGE_COLUMNS =
+    "id, conversation_id, seq, author_id, thread_id, body, created_at";
+
+  /**
+   * Messages hydrate their ordered attachments from `message_artifacts`. The
+   * join table is the only source of truth: an artifact is attached because a
+   * caller said so, never because it happened to be the newest worker upload.
+   */
+  private hydrateMessages(rows: Array<Omit<MessageRow, "attachments">>): MessageRow[] {
+    if (rows.length === 0) return [];
+    const placeholders = rows.map(() => "?").join(",");
+    const attachmentRows = this.sqlite
+      .prepare(
+        `SELECT ma.message_id AS _message_id, a.*
+         FROM message_artifacts ma
+         JOIN artifacts a ON a.id = ma.artifact_id
+         WHERE ma.message_id IN (${placeholders})
+         ORDER BY ma.message_id ASC, ma.position ASC, a.created_at ASC`,
+      )
+      .all(...rows.map((r) => r.id)) as unknown as Array<ArtifactRow & { _message_id: string }>;
+    const byMessage = new Map<string, ArtifactRow[]>();
+    for (const { _message_id, ...artifact } of attachmentRows) {
+      const list = byMessage.get(_message_id);
+      if (list) {
+        list.push(artifact as ArtifactRow);
+      } else {
+        byMessage.set(_message_id, [artifact as ArtifactRow]);
+      }
+    }
+    return rows.map((row) => ({ ...row, attachments: byMessage.get(row.id) ?? [] }));
+  }
+
+  private hydrateMessage(row: Omit<MessageRow, "attachments">): MessageRow {
+    return this.hydrateMessages([row])[0];
+  }
+
   appendMessage(input: {
     id?: string;
     conversationId: string;
     authorId: string;
     body: string;
     threadId?: string | null;
-    artifactId?: string | null;
+    attachmentIds?: string[];
   }): MessageRow {
     return this.transaction(() => {
       const conv = this.getConversation(input.conversationId);
@@ -830,8 +978,8 @@ export class KawanDb {
       const now = Date.now();
       this.sqlite
         .prepare(
-          `INSERT INTO messages (id, conversation_id, seq, author_id, thread_id, body, artifact_id, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO messages (id, conversation_id, seq, author_id, thread_id, body, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           id,
@@ -840,40 +988,130 @@ export class KawanDb {
           input.authorId,
           input.threadId ?? null,
           input.body,
-          input.artifactId ?? null,
           now,
         );
+      for (const artifactId of input.attachmentIds ?? []) {
+        this.attachArtifact(id, artifactId);
+      }
       return this.getMessage(id)!;
     });
   }
 
+  /**
+   * A proposal is an ordinary message in the #merge-queue conversation whose
+   * attachments are declared explicitly. The linked `lands` row owns the branch.
+   */
+  createProposalMessage(input: {
+    id?: string;
+    conversationId: string;
+    authorId: string;
+    body: string;
+    threadId?: string | null;
+    attachmentIds?: string[];
+  }): MessageRow {
+    return this.appendMessage(input);
+  }
+
+  /** Amend an existing proposal message in place: rewrite the body and replace
+   * the attachment set, preserving attachment order. */
+  updateProposalMessage(
+    messageId: string,
+    patch: { body?: string; attachmentIds?: string[] },
+  ): MessageRow {
+    return this.transaction(() => {
+      const existing = this.getMessage(messageId);
+      if (!existing) throw new Error(`Message not found: ${messageId}`);
+      if (patch.body !== undefined) {
+        this.sqlite.prepare("UPDATE messages SET body = ? WHERE id = ?").run(patch.body, messageId);
+      }
+      if (patch.attachmentIds !== undefined) {
+        this.setMessageAttachments(messageId, patch.attachmentIds);
+      }
+      return this.getMessage(messageId)!;
+    });
+  }
+
+  /** Attach one artifact to a message (appended to the end of its list). */
+  attachArtifact(messageId: string, artifactId: string): void {
+    const message = this
+      .sqlite
+      .prepare("SELECT id FROM messages WHERE id = ?")
+      .get(messageId) as { id: string } | undefined;
+    if (!message) throw new Error(`Message not found: ${messageId}`);
+    const artifact = this
+      .sqlite
+      .prepare("SELECT id FROM artifacts WHERE id = ?")
+      .get(artifactId) as { id: string } | undefined;
+    if (!artifact) throw new Error(`Artifact not found: ${artifactId}`);
+    const next = this.sqlite
+      .prepare("SELECT COALESCE(MAX(position), -1) + 1 AS next_pos FROM message_artifacts WHERE message_id = ?")
+      .get(messageId) as { next_pos: number };
+    this.sqlite
+      .prepare(
+        "INSERT OR IGNORE INTO message_artifacts (message_id, artifact_id, position) VALUES (?, ?, ?)",
+      )
+      .run(messageId, artifactId, next.next_pos);
+    this.sqlite.prepare("UPDATE artifacts SET message_id = ? WHERE id = ?").run(messageId, artifactId);
+  }
+
+  listMessageAttachments(messageId: string): ArtifactRow[] {
+    return this.sqlite
+      .prepare(
+        `SELECT a.* FROM message_artifacts ma
+         JOIN artifacts a ON a.id = ma.artifact_id
+         WHERE ma.message_id = ?
+         ORDER BY ma.position ASC, a.created_at ASC`,
+      )
+      .all(messageId) as unknown as ArtifactRow[];
+  }
+
+  /** Replace the message's attachment set with exactly `artifactIds`, in order. */
+  setMessageAttachments(messageId: string, artifactIds: string[]): void {
+    this.sqlite.prepare("DELETE FROM message_artifacts WHERE message_id = ?").run(messageId);
+    this.sqlite
+      .prepare("UPDATE artifacts SET message_id = NULL WHERE message_id = ?")
+      .run(messageId);
+    for (const artifactId of artifactIds) {
+      this.attachArtifact(messageId, artifactId);
+    }
+  }
+
   getMessage(id: string): MessageRow | null {
-    return (
-      (this.sqlite.prepare("SELECT * FROM messages WHERE id = ?").get(id) as MessageRow | undefined) ??
-      null
-    );
+    const row = this.sqlite
+      .prepare(`SELECT ${KawanDb.MESSAGE_COLUMNS} FROM messages WHERE id = ?`)
+      .get(id) as Omit<MessageRow, "attachments"> | undefined;
+    return row ? this.hydrateMessage(row) : null;
   }
 
   listMessages(conversationId: string, since = 0, limit?: number): MessageRow[] {
     if (limit !== undefined) {
-      return this.sqlite
+      const rows = this.sqlite
         .prepare(
-          `SELECT * FROM messages
+          `SELECT ${KawanDb.MESSAGE_COLUMNS} FROM messages
            WHERE conversation_id = ? AND seq > ?
            ORDER BY seq ASC LIMIT ?`,
         )
-        .all(conversationId, since, limit) as unknown as MessageRow[];
+        .all(conversationId, since, limit) as unknown as Array<Omit<MessageRow, "attachments">>;
+      return this.hydrateMessages(rows);
     }
-    return this.sqlite
-      .prepare("SELECT * FROM messages WHERE conversation_id = ? AND seq > ? ORDER BY seq ASC")
-      .all(conversationId, since) as unknown as MessageRow[];
+    const rows = this.sqlite
+      .prepare(
+        `SELECT ${KawanDb.MESSAGE_COLUMNS} FROM messages
+         WHERE conversation_id = ? AND seq > ?
+         ORDER BY seq ASC`,
+      )
+      .all(conversationId, since) as unknown as Array<Omit<MessageRow, "attachments">>;
+    return this.hydrateMessages(rows);
   }
 
   listRecentMessages(conversationId: string, limit = 20): MessageRow[] {
     const rows = this.sqlite
-      .prepare("SELECT * FROM messages WHERE conversation_id = ? ORDER BY seq DESC LIMIT ?")
-      .all(conversationId, limit) as unknown as MessageRow[];
-    return rows.reverse();
+      .prepare(
+        `SELECT ${KawanDb.MESSAGE_COLUMNS} FROM messages
+         WHERE conversation_id = ? ORDER BY seq DESC LIMIT ?`,
+      )
+      .all(conversationId, limit) as unknown as Array<Omit<MessageRow, "attachments">>;
+    return this.hydrateMessages(rows).reverse();
   }
 
   // ---- Decisions ----
@@ -1229,8 +1467,9 @@ export class KawanDb {
     );
   }
 
+  /** Link an artifact to a message (kept as a thin alias for attachArtifact). */
   linkArtifactMessage(artifactId: string, messageId: string): void {
-    this.sqlite.prepare("UPDATE artifacts SET message_id = ? WHERE id = ?").run(messageId, artifactId);
+    this.attachArtifact(messageId, artifactId);
   }
 
   listArtifacts(filter?: { sessionId?: string; conversationId?: string }): ArtifactRow[] {
@@ -1296,7 +1535,7 @@ export class KawanDb {
       .prepare(
         `INSERT INTO lands (
           id, session_id, conversation_id, thread_id, message_id, issue_id, trigger, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?)`,
       )
       .run(
         id,
@@ -1305,7 +1544,7 @@ export class KawanDb {
         input.threadId ?? null,
         input.messageId ?? null,
         input.issueId ?? null,
-        input.trigger ?? "manual_approve",
+        input.trigger ?? "proposal",
         now,
         now,
       );
@@ -1350,6 +1589,19 @@ export class KawanDb {
         `SELECT * FROM lands
          WHERE status IN ('queued', 'rebasing', 'verifying', 'paused')
          ORDER BY COALESCE(queue_position, 999999) ASC, created_at ASC`,
+      )
+      .all() as unknown as LandRow[];
+  }
+
+  /**
+   * Proposals shown in the Merge Queue: waiting for a human **Merge** (or auto
+   * mode) plus failed acceptances that still own their proposal message, so a
+   * failure before entering the train cannot silently disappear.
+   */
+  listProposedLands(): LandRow[] {
+    return this.sqlite
+      .prepare(
+        `SELECT * FROM lands WHERE status IN ('proposed', 'failed') ORDER BY updated_at DESC, created_at DESC`,
       )
       .all() as unknown as LandRow[];
   }
@@ -1402,7 +1654,7 @@ export class KawanDb {
         patch.pause_reason !== undefined ? patch.pause_reason : existing.pause_reason,
         patch.queue_session_id !== undefined ? patch.queue_session_id : existing.queue_session_id,
         patch.queue_thread_id !== undefined ? patch.queue_thread_id : existing.queue_thread_id,
-        patch.trigger ?? existing.trigger ?? "manual_approve",
+        patch.trigger ?? existing.trigger ?? "proposal",
         patch.checks_json !== undefined ? patch.checks_json : existing.checks_json,
         patch.touches_kawan !== undefined ? patch.touches_kawan : existing.touches_kawan ?? 0,
         Date.now(),

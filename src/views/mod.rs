@@ -1,4 +1,4 @@
-//! UI views for Kawan surfaces: Connect, Checklist, Status, Merge Queue, Issues, Conversations, Settings.
+//! UI views for Kawan surfaces: Connect, Checklist, Merge Queue, Issues, Conversations, Settings.
 
 pub mod checklist;
 pub mod connect;
@@ -7,7 +7,6 @@ pub mod issues;
 pub mod markdown;
 pub mod merge_queue;
 pub mod settings;
-pub mod status;
 
 use crate::theme;
 
@@ -18,11 +17,9 @@ pub fn short_id(id: &str) -> String {
 pub fn status_color_hex(status: &str) -> u32 {
     match status {
         "running" | "verifying" | "rebasing" | "open" => theme::CATEGORY_INDUSTRY,
-        "review_requested" | "requested" | "queued" | "pending_approval" => {
-            theme::CATEGORY_ACADEMIC
-        }
+        "proposed" | "queued" | "pending_approval" => theme::CATEGORY_ACADEMIC,
         "landed" | "idle" | "passed" => 0x284D32,
-        "failed" | "stopped" | "paused" => theme::CATEGORY_VALS,
+        "failed" | "stopped" | "paused" | "withdrawn" => theme::CATEGORY_VALS,
         "closed" => theme::UMBER_VIVID,
         _ => theme::UMBER_VIVID,
     }

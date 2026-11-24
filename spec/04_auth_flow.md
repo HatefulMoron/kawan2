@@ -100,8 +100,8 @@ to a bot without any extra bookkeeping.
 
 `admin` and `member`. Admins create invites and bots, change host settings
 including provider credentials, remove users, and override the merge queue.
-Members can do everything else, including steering any session and approving any
-artifact.
+Members can do everything else, including steering any session and merging or
+withdrawing any proposal.
 
 ## Session identity
 

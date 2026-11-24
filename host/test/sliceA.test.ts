@@ -4,11 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { DecisionMode } from "../src/decisions.js";
+import { getBranchHead } from "../src/git.js";
 import { startHost } from "../src/server.js";
 import { createFixtureBareRepo, TestKeyPair, WsTestClient } from "./helpers.js";
 import { startStubProvider } from "./stub-provider.js";
 
-test("Slice A: read cursors, repository status.read, and live + post-land session.diff", async () => {
+test("Slice A: read cursors, repository state, and live + post-land session.diff", async () => {
   const decisionMode: DecisionMode = "live";
   const stub = await startStubProvider();
   const repo = await createFixtureBareRepo({
@@ -38,7 +39,7 @@ test("Slice A: read cursors, repository status.read, and live + post-land sessio
               name: "spawn_session",
               arguments: {
                 title: "Add hello.txt",
-                task: "Create hello.txt containing 'hello world', commit it, and call land_request.",
+                task: "Create hello.txt containing 'hello world', commit it, and call propose_merge.",
               },
             },
           ],
@@ -65,8 +66,8 @@ test("Slice A: read cursors, repository status.read, and live + post-land sessio
       return {
         toolCalls: [
           {
-            name: "land_request",
-            arguments: { summary: "Added hello.txt cleanly." },
+            name: "propose_merge",
+            arguments: { summary_md: "Added hello.txt so the workspace greets you." },
           },
         ],
       };
@@ -188,28 +189,27 @@ test("Slice A: read cursors, repository status.read, and live + post-land sessio
     });
 
     const landRequestedPromise = alice.waitForFrame(
-      (f) => f.type === "land.update" && f.land?.status === "requested",
+      (f) => f.type === "land.update" && f.land?.status === "proposed",
       25_000,
     );
     await alice.request("message.send", {
       conversation_id: generalId,
-      body: "@kawan please add hello.txt and request land",
+      body: "@kawan please add hello.txt and propose it for merge",
     });
     const landFrame = await landRequestedPromise;
     const landId = landFrame.land.id as string;
     const workerSessionId = landFrame.land.session_id as string;
 
-    // 3. status.read reflects repo, worker session, and pending land
-    const statusBefore = await bob.request<{
-      repo: { url: string; default_branch: string; head_sha: string | null } | null;
-      sessions: Array<{ id: string; kind: string; status: string }>;
-      lands: Array<{ id: string; status: string }>;
-    }>("status.read");
-    assert.ok(statusBefore.repo);
-    assert.equal(statusBefore.repo!.default_branch, "main");
-    assert.equal(statusBefore.repo!.head_sha, repo.initialHead);
-    assert.ok(statusBefore.sessions.some((s) => s.id === workerSessionId));
-    assert.ok(statusBefore.lands.some((l) => l.id === landId && l.status === "requested"));
+    // 3. host state reflects repo, worker session, and pending proposal
+    const settings = host.db.getHostSettings();
+    assert.ok(settings.repo);
+    assert.equal(settings.repo!.default_branch, "main");
+    assert.equal(
+      await getBranchHead(settings.repo!.bare_path, `refs/heads/${settings.repo!.default_branch}`),
+      repo.initialHead,
+    );
+    assert.ok(host.db.listSessions({ kind: "worker" }).some((s) => s.id === workerSessionId));
+    assert.equal(host.db.getLand(landId)!.status, "proposed");
 
     // 4. session.diff reads pre-land diff from live worker clone
     const diffLive = await bob.request<{
@@ -229,17 +229,19 @@ test("Slice A: read cursors, repository status.read, and live + post-land sessio
     assert.equal(diffLive.diff.files[0].status, "A");
     assert.match(diffLive.diff.files[0].patch, /\+hello world/);
 
-    // 5. Approve land (removes worker clone) -> status.read shows landed & session.diff reads from bare repo
-    await alice.request("land.approve", { land_id: landId });
+    // 5. Merge the proposal (removes worker clone) -> landed row & session.diff reads from bare repo
+    await alice.request("land.merge", { land_id: landId });
 
-    const statusAfter = await bob.request<{
-      repo: { head_sha: string | null } | null;
-      lands: Array<{ id: string; status: string; landed_sha: string | null }>;
-    }>("status.read");
-    const landedRow = statusAfter.lands.find((l) => l.id === landId)!;
+    const landedRow = host.db.getLand(landId)!;
     assert.equal(landedRow.status, "landed");
     assert.ok(landedRow.landed_sha);
-    assert.equal(statusAfter.repo!.head_sha, landedRow.landed_sha);
+    assert.equal(
+      await getBranchHead(
+        settings.repo!.bare_path,
+        `refs/heads/${settings.repo!.default_branch}`,
+      ),
+      landedRow.landed_sha,
+    );
 
     const diffLanded = await bob.request<{
       diff: {

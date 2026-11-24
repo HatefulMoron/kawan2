@@ -8,6 +8,7 @@ declare module "typebox" {
     Number(opts?: Record<string, unknown>): TSchema;
     Boolean(opts?: Record<string, unknown>): TSchema;
     Optional(schema: TSchema): TSchema;
+    Array(items: TSchema, opts?: Record<string, unknown>): TSchema;
   };
 }
 

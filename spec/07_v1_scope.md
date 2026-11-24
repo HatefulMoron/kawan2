@@ -9,8 +9,9 @@ need does.
 
 The whole loop, once, for one bot, one repository, and one verify command, with a
 human at the merge seat. A human talks in a channel, the bot decides the message is
-for it, spawns a worker in a clone, the worker commits and posts evidence, a human
-approves, the host verifies and lands. When that works end to end, v1 is done.
+for it, spawns a worker in a clone, the worker commits and proposes the branch for
+merge, a human merges the proposal, the host verifies and lands. When that works
+end to end, v1 is done.
 
 The flows are in `05_flows.md`. This is what they require, and nothing more.
 
@@ -30,8 +31,11 @@ Host tools, exposed by the injected extension over the unix socket:
 ```text
 spawn_session(task)      create a worker, error if no repo or no live bot
 session_status()         what my children are doing
-report(text, artifact?)  post into the conversation, attach evidence
-land_request()           put my branch in front of a human
+report(text, artifacts?) post into the conversation, attach evidence
+propose_merge(summary_md, evidence?, title?)
+                         create or amend the branch's proposal in #merge-queue
+withdraw_proposal(reason?)
+                         pull the branch's open proposal
 soul_replace(anchor, text)   edit the soul by exact anchor; empty text deletes
 soul_write(document)         whole-document rewrite for consolidation
 ```
@@ -40,7 +44,7 @@ WebSocket, client to host: `bootstrap`, `register`, `hello`, `proof`,
 `conversation.list`, `conversation.create`, `conversation.add_member`,
 `conversation.open(since)`, `message.send`, `decision.redirect`, `bot.list`,
 `bot.create`, `bot.update`, `session.list`, `session.open`, `artifact.get`,
-`land.approve`, `settings.read`, `settings.update`, `models.test`,
+`land.merge`, `land.withdraw`, `settings.read`, `settings.update`, `models.test`,
 `invite.create`.
 
 WebSocket, host to client: `welcome`, `conversation.new`, `message.new`,
@@ -154,8 +158,8 @@ done when its scenario script passes, and each is worth committing on its own.
    worker prompt, `report` with content-addressed artifacts (`artifact.get`).
    Done when a real orchestrator, asked for a trivial change, spawns a worker
    that commits in its clone and posts an artifact row.
-4. **Land.** One verify command, rebase, fast-forward, `land.approve`. Done when a
-   passing session lands on the default branch in the bare repository and a failing
+4. **Land.** One verify command, rebase, fast-forward, `land.merge`. Done when a
+   passing proposal lands on the default branch in the bare repository and a failing
    one does not, with the failure reported in the conversation.
 5. **Memory.** Soul document, `soul_replace` and `soul_write`, context-file
    injection. Done when a fact learned by a worker is reported to the

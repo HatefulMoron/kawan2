@@ -1,5 +1,6 @@
 //! Issues surface: chat-first issue rooms (#N) anchored by a central editable Markdown
-//! document, one writable branch owner, read-only reviewers, implicit checks, and direct Land.
+//! document, one writable branch owner, read-only reviewers, implicit checks, and direct
+//! **Propose** into the Merge Queue.
 
 use gpui::prelude::*;
 use gpui::{AnyElement, Context, Div, div, px, relative};
@@ -9,8 +10,8 @@ use crate::protocol::{IssueSummary, Land, SessionSummary};
 use crate::state::{FocusTarget, KawanApp, RightPanel};
 use crate::theme::{self, Theme};
 use crate::views::conversation::{
-    conversation_stream_and_composer, left_rail, right_drawer, session_strip, short_status_label,
-    truncate_chars,
+    StreamOptions, conversation_stream_and_composer, left_rail, right_drawer, session_strip,
+    short_status_label, truncate_chars,
 };
 use crate::views::status_color_hex;
 
@@ -68,6 +69,25 @@ fn check_pill_spec(status: &str) -> Option<(&'static str, u32)> {
     }
 }
 
+/// The land that currently represents an issue: an open proposal or train item
+/// filed against the issue wins over a stale `active_session_id` lookup.
+fn issue_land<'a>(app: &'a KawanApp, issue: &IssueSummary) -> Option<&'a Land> {
+    const OPEN: [&str; 5] = ["proposed", "queued", "rebasing", "verifying", "paused"];
+    let by_issue = app
+        .lands_by_id
+        .values()
+        .filter(|l| {
+            l.issue_id.as_deref() == Some(issue.id.as_str()) && OPEN.contains(&l.status.as_str())
+        })
+        .max_by_key(|l| l.updated_at);
+    by_issue.or_else(|| {
+        issue
+            .active_session_id
+            .as_deref()
+            .and_then(|sid| app.land_for_session(sid))
+    })
+}
+
 fn issue_row_badges(
     app: &KawanApp,
     issue: &IssueSummary,
@@ -98,20 +118,20 @@ fn issue_row_badges(
     if let Some(land) = active_land
         && matches!(
             land.status.as_str(),
-            "queued" | "rebasing" | "verifying" | "paused"
+            "proposed" | "queued" | "rebasing" | "verifying" | "paused"
         )
     {
-        let lbl = if land.status == "paused" {
-            "PAUSED IN QUEUE".to_string()
+        let (lbl, col) = if land.status == "proposed" {
+            ("PROPOSED".to_string(), theme::CATEGORY_ACADEMIC)
+        } else if land.status == "paused" {
+            ("PAUSED IN QUEUE".to_string(), theme::CATEGORY_VALS)
         } else if let Some(pos) = land.queue_position {
-            format!("QUEUED #{pos}")
+            (format!("QUEUED #{pos}"), theme::CATEGORY_ACADEMIC)
         } else {
-            short_status_label(&land.status).to_uppercase()
-        };
-        let col = if land.status == "paused" {
-            theme::CATEGORY_VALS
-        } else {
-            theme::CATEGORY_ACADEMIC
+            (
+                short_status_label(&land.status).to_uppercase(),
+                theme::CATEGORY_ACADEMIC,
+            )
         };
         tags.push((lbl, col));
     } else if active_sess.is_some_and(|s| s.status == "running") {
@@ -264,7 +284,7 @@ fn main_issues_list_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanAp
                 .gap(px(4.0))
                 .child(theme::title("Issues", 26.0, theme.ink))
                 .child(theme::body(
-                    "Each issue is a room anchored by a live Markdown document. @mention bots in chat to implement or review, then click Land.",
+                    "Each issue is a room anchored by a live Markdown document. @mention bots in chat to implement or review, then propose the branch to the Merge Queue.",
                     13.0,
                     theme.fg_secondary,
                 )),
@@ -491,10 +511,7 @@ fn issue_group_section(
                         .active_session_id
                         .as_deref()
                         .and_then(|sid| app.sessions_by_id.get(sid));
-                    let active_land = issue
-                        .active_session_id
-                        .as_deref()
-                        .and_then(|sid| app.land_for_session(sid));
+                    let active_land = issue_land(app, issue);
                     let badges = issue_row_badges(app, issue, active_sess, active_land);
                     let dot_color = badges
                         .first()
@@ -603,14 +620,11 @@ fn main_issue_detail_pane(
         .and_then(|sid| app.sessions_by_id.get(sid));
     let worker_running = active_sess.is_some_and(|s| s.status == "running");
     let has_active_reviewers = !issue.active_reviewers.is_empty();
-    let matching_land = issue
-        .active_session_id
-        .as_deref()
-        .and_then(|sid| app.land_for_session(sid));
+    let matching_land = issue_land(app, issue);
     let is_queued_now = matching_land.is_some_and(|l| {
         matches!(
             l.status.as_str(),
-            "queued" | "rebasing" | "verifying" | "paused"
+            "proposed" | "queued" | "rebasing" | "verifying" | "paused"
         )
     });
 
@@ -714,7 +728,9 @@ fn main_issue_detail_pane(
             .child(kit::swatch(theme::hex(theme::UMBER_VIVID), px(6.0)))
             .child(theme::label("Closed", 12.0, theme.fg_secondary));
     } else if is_queued_now && let Some(land) = matching_land {
-        let queue_txt = if land.status == "paused" {
+        let queue_txt = if land.status == "proposed" {
+            "Proposed · in Merge Queue".to_string()
+        } else if land.status == "paused" {
             "Paused in #merge-queue".to_string()
         } else if let Some(pos) = land.queue_position {
             format!("Queued #{pos} in #merge-queue")
@@ -889,7 +905,7 @@ fn main_issue_detail_pane(
         && !is_queued_now
     {
         right_actions.push(
-            kit::small_primary_button("iss-land", "Land", theme)
+            kit::small_primary_button("iss-land", "Propose", theme)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.land_issue(&iid_land);
                     cx.notify();
@@ -1169,9 +1185,13 @@ fn main_issue_detail_pane(
     let (stream, composer) = conversation_stream_and_composer(
         app,
         &issue.conversation_id,
-        &format!("#{}", issue.number),
-        true,
-        "Discuss the document, @mention a bot to start implementing or review changes.",
+        StreamOptions {
+            title: &format!("#{}", issue.number),
+            is_channel: true,
+            empty_hint: "Discuss the document, @mention a bot to start implementing or review changes.",
+            hidden_message_ids: &[],
+            above: None,
+        },
         theme,
         cx,
     );

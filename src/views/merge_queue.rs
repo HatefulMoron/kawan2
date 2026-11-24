@@ -1,18 +1,21 @@
 //! Merge Queue surface (#merge-queue): Merge Train pipeline status, check pills,
 //! Queue Bot controls, and shared reconciliation conversation stream.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use gpui::prelude::*;
-use gpui::{AnyElement, Context, Div, div, px, relative};
+use gpui::{AnyElement, Context, Div, ObjectFit, StyledImage, div, img, px, relative};
 
 use crate::kit;
-use crate::protocol::Land;
+use crate::protocol::{Artifact, Land, ProposalCard};
 use crate::state::{KawanApp, RightPanel};
 use crate::theme::{self, Theme};
 use crate::views::conversation::{
-    conversation_stream_and_composer, left_rail, right_drawer, session_display_title,
-    session_strip, short_status_label, truncate_chars,
+    StreamOptions, conversation_stream_and_composer, inline_artifact_bytes, left_rail,
+    message_body_clipped, right_drawer, session_display_title, session_strip, short_status_label,
+    truncate_chars,
 };
-use crate::views::status_color_hex;
+use crate::views::{markdown, short_id, status_color_hex};
 
 const MERGE_MEASURE: f32 = 780.0;
 
@@ -198,15 +201,7 @@ fn main_merge_queue_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanAp
                 ),
         );
 
-    let mut train_col = div()
-        .w(relative(1.0))
-        .max_w(px(MERGE_MEASURE))
-        .px(px(24.0))
-        .pt(px(12.0))
-        .pb(px(4.0))
-        .flex()
-        .flex_col()
-        .gap(px(8.0));
+    let mut train_col = div().w_full().flex().flex_col().gap(px(8.0));
 
     if let Some(head) = head_opt {
         train_col = train_col.child(merge_train_head_card(app, head, theme, cx));
@@ -245,7 +240,7 @@ fn main_merge_queue_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanAp
                 .justify_between()
                 .gap(px(12.0))
                 .child(theme::body(
-                    "Queue is clear — approved branches land here in FIFO order.",
+                    "Queue is clear — merged branches land here in FIFO order.",
                     12.5,
                     theme.fg_secondary,
                 ))
@@ -259,19 +254,43 @@ fn main_merge_queue_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanAp
         );
     }
 
-    let train_section = div()
-        .flex_none()
+    // Proposals are rendered as cards above the train, so keep their messages out of
+    // the reconciliation stream below — including withdrawn/landed guidance whose
+    // message would otherwise pop back in as ordinary chat.
+    let mut proposal_message_ids: Vec<&str> = app
+        .proposals()
+        .iter()
+        .map(|card| card.message.id.as_str())
+        .collect();
+    proposal_message_ids.extend(
+        app.lands_by_id
+            .values()
+            .filter_map(|land| land.message_id.as_deref()),
+    );
+    proposal_message_ids.sort_unstable();
+    proposal_message_ids.dedup();
+
+    // Proposals and the train scroll with the conversation: the pinned header stays,
+    // and a tall proposal can never squeeze the stream out of view.
+    let above = div()
         .w_full()
         .flex()
-        .justify_center()
+        .flex_col()
+        .gap(px(10.0))
+        .pb(px(6.0))
+        .child(proposals_section(app, theme, cx))
         .child(train_col);
 
     let (stream, composer) = conversation_stream_and_composer(
         app,
         &mq_cid,
-        "#merge-queue",
-        true,
-        "Queue is quiet. Rebase conflicts and check failures open reconciliation threads here.",
+        StreamOptions {
+            title: "#merge-queue",
+            is_channel: true,
+            empty_hint: "Queue is quiet. Rebase conflicts and check failures open reconciliation threads here.",
+            hidden_message_ids: &proposal_message_ids,
+            above: Some(above.into_any_element()),
+        },
         theme,
         cx,
     );
@@ -283,9 +302,385 @@ fn main_merge_queue_pane(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanAp
         .flex()
         .flex_col()
         .child(header)
-        .child(train_section)
         .child(stream)
         .child(composer)
+}
+
+/// `Proposed (N)`: open proposals, each one an ordinary message awaiting **Merge**.
+fn proposals_section(app: &KawanApp, theme: &Theme, cx: &mut Context<KawanApp>) -> Div {
+    let proposals = app.proposals();
+    let mut col = div().w_full().flex().flex_col().gap(px(8.0)).child(
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(8.0))
+            .child(theme::micro(
+                format!("PROPOSED ({})", proposals.len()),
+                9.0,
+                theme.fg_tertiary,
+            ))
+            .children(
+                (!proposals.is_empty())
+                    .then(|| theme::micro("AWAITING MERGE", 8.5, theme.fg_tertiary)),
+            ),
+    );
+
+    if proposals.is_empty() {
+        col = col.child(
+            div()
+                .w_full()
+                .px(px(14.0))
+                .py(px(10.0))
+                .rounded(px(2.0))
+                .border_1()
+                .border_color(theme.border_subtle)
+                .bg(theme.strip)
+                .child(theme::body(
+                    "Nothing is proposed yet — finished branches show up here for Merge.",
+                    12.5,
+                    theme.fg_tertiary,
+                )),
+        );
+    } else {
+        col = col.children(
+            proposals
+                .iter()
+                .enumerate()
+                .map(|(pi, card)| proposal_card(app, card, pi, theme, cx)),
+        );
+    }
+
+    col
+}
+
+fn proposal_card(
+    app: &KawanApp,
+    card: &ProposalCard,
+    idx: usize,
+    theme: &Theme,
+    cx: &mut Context<KawanApp>,
+) -> Div {
+    let land = &card.land;
+    let accent = theme::hex(status_color_hex(&land.status));
+    let plain = markdown::plain_text(&card.message.body)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let title = card
+        .session_title
+        .clone()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| truncate_chars(&plain, 72));
+    let unseen = app.message_unseen(&card.message);
+    let origin = app.conversation_label(&land.conversation_id);
+    let origin_cid = land.conversation_id.clone();
+    let lid_merge = land.id.clone();
+    let lid_withdraw = land.id.clone();
+    let msg_id = card.message.id.clone();
+    let checks_failed = card.checks.iter().any(|c| !c.ok);
+    let needs_confirm = checks_failed || land.touches_kawan;
+    let confirm_armed = needs_confirm && app.confirm_merge.as_deref() == Some(land.id.as_str());
+    let lid_confirm = land.id.clone();
+    // A short proposal can still have replies; the thread drawer is their only entrance.
+    let has_replies = app
+        .messages_by_conv
+        .get(&card.message.conversation_id)
+        .is_some_and(|messages| {
+            messages
+                .iter()
+                .any(|m| m.thread_id.as_deref() == Some(msg_id.as_str()))
+        });
+
+    let (body, clipped) = message_body_clipped(app, &card.message.body, 12.5, theme, cx, Some(4));
+
+    // Thumbnails are for images the body does not already show inline.
+    let images: Vec<&Artifact> = card
+        .message
+        .attachments
+        .iter()
+        .filter(|a| {
+            a.mime_type.starts_with("image/")
+                && !card
+                    .message
+                    .body
+                    .contains(&format!("kawan://artifact/{}", a.id))
+        })
+        .collect();
+
+    let mut content = div()
+        .px(px(14.0))
+        .py(px(10.0))
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .flex_wrap()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap(px(8.0))
+                        .child(kit::bot_avatar(20.0, theme))
+                        .child(theme::label(
+                            format!("@{}", card.author.name),
+                            12.0,
+                            theme.fg_secondary,
+                        ))
+                        .child(theme::label(title, 13.5, theme.ink))
+                        .children(card.issue_number.map(|n| {
+                            kit::status_tag(format!("#{n}"), theme::CATEGORY_INDUSTRY, theme)
+                        }))
+                        .children(land.touches_kawan.then(|| {
+                            kit::status_tag("MODIFIES .kawan/", theme::UMBER_VIVID, theme)
+                        })),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .children(unseen.then(|| kit::swatch(theme.vivid, px(5.0))))
+                        .child(theme::micro(
+                            format!("updated {}", time_ago(card.updated_at)),
+                            8.5,
+                            theme.fg_tertiary,
+                        )),
+                ),
+        )
+        .child(body);
+
+    if !images.is_empty() {
+        content = content.child(
+            div()
+                .flex()
+                .items_center()
+                .flex_wrap()
+                .gap(px(6.0))
+                .children(images.into_iter().enumerate().map(|(ti, a)| {
+                    let aid = a.id.clone();
+                    let label = a.filename.clone().unwrap_or_else(|| short_id(&a.id));
+                    let thumb: AnyElement = match inline_artifact_bytes(app, &a.id) {
+                        Some(bytes) => div()
+                            .rounded(px(2.0))
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(theme.border_subtle)
+                            .child(
+                                img(bytes)
+                                    .h(px(72.0))
+                                    .max_w(px(180.0))
+                                    .object_fit(ObjectFit::Cover),
+                            )
+                            .into_any_element(),
+                        None => div()
+                            .h(px(72.0))
+                            .px(px(10.0))
+                            .rounded(px(2.0))
+                            .border_1()
+                            .border_color(theme.border_subtle)
+                            .bg(theme.strip)
+                            .flex()
+                            .items_center()
+                            .child(theme::numeric(label, 10.0, theme.fg_tertiary))
+                            .into_any_element(),
+                    };
+                    div()
+                        .id(("mq-prop-thumb", idx * 10 + ti))
+                        .cursor_pointer()
+                        .hover(|s| s.opacity(0.85))
+                        .child(thumb)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_artifact_drawer(&aid);
+                            window.focus(&this.focus_handle, cx);
+                            cx.notify();
+                        }))
+                })),
+        );
+    }
+
+    content = content.child(
+        div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap(px(6.0))
+            .children(card.checks.iter().enumerate().map(|(ci, chk)| {
+                let (bg, border, fg, mark) = if chk.ok {
+                    (
+                        theme::hex(0xEDF7EF),
+                        theme::hex(0x284D32),
+                        theme::hex(0x1C592C),
+                        "✓",
+                    )
+                } else {
+                    (
+                        theme::hex(0xFDF0EF),
+                        theme::hex(theme::CATEGORY_VALS),
+                        theme::hex(theme::CATEGORY_VALS),
+                        "✕",
+                    )
+                };
+                let art_id = chk.artifact_id.clone();
+                let pill = div()
+                    .id(("mq-prop-chk", idx * 10 + ci))
+                    .h(px(21.0))
+                    .px(px(8.0))
+                    .rounded(px(2.0))
+                    .border_1()
+                    .border_color(border)
+                    .bg(bg)
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(theme::numeric(format!("{mark} {}", chk.name), 10.5, fg));
+                match art_id {
+                    Some(aid) => {
+                        pill.cursor_pointer()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_artifact_drawer(&aid);
+                                window.focus(&this.focus_handle, cx);
+                                cx.notify();
+                            }))
+                    }
+                    None => pill,
+                }
+            }))
+            .child(theme::numeric(
+                format!(
+                    "{} commits ahead · {} behind main",
+                    card.commits_ahead, card.behind_main
+                ),
+                10.0,
+                theme.fg_tertiary,
+            )),
+    );
+
+    if let Some(err) = land.error.as_deref()
+        && !err.trim().is_empty()
+    {
+        content = content.child(theme::body(
+            err.to_string(),
+            11.0,
+            theme::hex(theme::CATEGORY_VALS),
+        ));
+    }
+
+    if clipped || has_replies {
+        content = content.child(div().flex().items_center().child(
+            kit::ghost_button(("mq-prop-full", idx), "View full proposal", theme).on_click(
+                cx.listener(move |this, _, window, cx| {
+                    this.right_panel = RightPanel::Thread(msg_id.clone());
+                    window.focus(&this.focus_handle, cx);
+                    cx.notify();
+                }),
+            ),
+        ));
+    }
+
+    div()
+        .w_full()
+        .relative()
+        .overflow_hidden()
+        .rounded(px(2.0))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.surface)
+        .child(kit::left_edge(accent))
+        .child(content)
+        .child(
+            div()
+                .min_h(px(36.0))
+                .px(px(14.0))
+                .py(px(6.0))
+                .bg(theme.strip)
+                .border_t_1()
+                .border_color(theme.border_subtle)
+                .flex()
+                .items_center()
+                .justify_between()
+                .flex_wrap()
+                .gap(px(8.0))
+                .child(
+                    kit::ghost_button(("mq-prop-open", idx), format!("Open in {origin}"), theme)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            // Issue-origin proposals belong to an issue room, not a DM.
+                            match this.issue_by_conv(&origin_cid).map(|i| i.id.clone()) {
+                                Some(iid) => this.open_issue(&iid),
+                                None => this.open_conversation(&origin_cid),
+                            }
+                            window.focus(&this.focus_handle, cx);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            kit::ghost_button(("mq-prop-withdraw", idx), "Withdraw", theme)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.withdraw_land(&lid_withdraw);
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            kit::small_primary_button(
+                                ("mq-prop-merge", idx),
+                                if confirm_armed {
+                                    "Confirm merge"
+                                } else if needs_confirm {
+                                    "Merge anyway"
+                                } else {
+                                    "Merge"
+                                },
+                                theme,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    if needs_confirm
+                                        && this.confirm_merge.as_deref() != Some(&lid_confirm)
+                                    {
+                                        this.confirm_merge = Some(lid_confirm.clone());
+                                    } else {
+                                        this.merge_land(&lid_merge);
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                        ),
+                ),
+        )
+}
+
+/// Compact `updated 3m ago` stamp for a millisecond timestamp.
+fn time_ago(timestamp_ms: u64) -> String {
+    if timestamp_ms == 0 {
+        return "just now".to_string();
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let secs = now_ms.saturating_sub(timestamp_ms) / 1000;
+    match secs {
+        0..=9 => "just now".to_string(),
+        10..=59 => format!("{secs}s ago"),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86_399 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86_400),
+    }
 }
 
 fn pipeline_stage_pill(
@@ -463,9 +858,8 @@ fn merge_train_head_card(
                                 .child(theme::numeric(format!("{mark} {}", chk.name), 10.5, fg));
                             pill.on_click(cx.listener(move |this, _, _, cx| {
                                 if let Some(aid) = &art_id {
-                                    this.toggle_artifact_view(aid);
-                                }
-                                if let Some(tid) = &thread_fallback {
+                                    this.open_artifact_drawer(aid);
+                                } else if let Some(tid) = &thread_fallback {
                                     this.open_merge_queue_thread(tid);
                                 }
                                 cx.notify();

@@ -1,6 +1,6 @@
 import { readFileSync, statSync } from "node:fs";
 import { createConnection } from "node:net";
-import { basename, resolve } from "node:path";
+import { basename, resolve, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -80,21 +80,29 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  const artifactParamSchema = Type.Optional(
-    Type.Object({
-      filename: Type.Optional(
-        Type.String({ description: "Filename for the artifact, e.g. report.md" }),
-      ),
-      mime_type: Type.Optional(
-        Type.String({ description: "MIME type, e.g. text/markdown, text/plain, or image/png" }),
-      ),
-      content: Type.Optional(Type.String({ description: "UTF-8 text content of the artifact" })),
-      base64: Type.Optional(
-        Type.String({ description: "Base64-encoded binary content of the artifact" }),
-      ),
-      path: Type.Optional(
-        Type.String({ description: "Relative or absolute path to an artifact file to attach" }),
-      ),
+  const artifactEntrySchema = Type.Object({
+    filename: Type.Optional(
+      Type.String({ description: "Filename for the artifact, e.g. report.md or screenshot.png" }),
+    ),
+    mime_type: Type.Optional(
+      Type.String({ description: "MIME type, e.g. text/markdown, text/plain, or image/png" }),
+    ),
+    content: Type.Optional(Type.String({ description: "UTF-8 text content of the artifact" })),
+    base64: Type.Optional(
+      Type.String({ description: "Base64-encoded binary content of the artifact" }),
+    ),
+    path: Type.Optional(
+      Type.String({
+        description:
+          "Path to an artifact file inside your working directory (relative, or absolute under it)",
+      }),
+    ),
+  });
+
+  const artifactsParamSchema = Type.Optional(
+    Type.Array(artifactEntrySchema, {
+      description:
+        "Evidence to attach, in order. Paths are uploaded from your working directory; screenshots render inline in the message.",
     }),
   );
 
@@ -102,7 +110,7 @@ export default function (pi: ExtensionAPI) {
     role === "orchestrator"
       ? Type.Object({
           text: Type.String({ description: "Message to post into the conversation" }),
-          artifact: artifactParamSchema,
+          artifacts: artifactsParamSchema,
           in_thread: Type.Optional(
             Type.Boolean({
               description:
@@ -115,78 +123,113 @@ export default function (pi: ExtensionAPI) {
             description:
               role === "reviewer"
                 ? "Review findings or concise approval to post directly in the issue conversation"
-                : "Report, question, or result (sent to your orchestrator, or directly to the issue room if working on an issue). A finished result becomes the review card humans approve from, so write it as a user-facing changelog entry focused on outcomes and attach screenshots for visual changes; leave file names, markup, and logs out of it.",
+                : "Report, question, or result (sent to your orchestrator, or directly to the issue room if working on an issue). Chat messages are commentary; branch work is handed back with propose_merge.",
           }),
-          artifact: artifactParamSchema,
+          artifacts: artifactsParamSchema,
         });
+
+  function toArtifactPayload(a: {
+    filename?: string;
+    mime_type?: string;
+    content?: string;
+    base64?: string;
+    path?: string;
+  }): Record<string, unknown> {
+    if (a.path) {
+      const root = resolve(process.cwd());
+      const abs = resolve(root, a.path);
+      if (abs !== root && !abs.startsWith(root + sep)) {
+        throw new Error(`Artifact path must stay inside the working directory (${root}): ${a.path}`);
+      }
+      const st = statSync(abs);
+      if (st.size > 10 * 1024 * 1024) {
+        throw new Error(`Artifact exceeds 10 MB limit (${st.size} bytes)`);
+      }
+      const bytes = readFileSync(abs);
+      const lower = abs.toLowerCase();
+      const inferredMime = lower.endsWith(".png")
+        ? "image/png"
+        : lower.endsWith(".jpg") || lower.endsWith(".jpeg")
+          ? "image/jpeg"
+          : lower.endsWith(".webp")
+            ? "image/webp"
+            : lower.endsWith(".svg")
+              ? "image/svg+xml"
+              : lower.endsWith(".gif")
+                ? "image/gif"
+                : lower.endsWith(".md") || lower.endsWith(".markdown")
+                  ? "text/markdown"
+                  : "text/plain";
+      return {
+        filename: a.filename ?? basename(abs),
+        mime_type: a.mime_type ?? inferredMime,
+        base64: bytes.toString("base64"),
+      };
+    }
+    if (typeof a.base64 === "string") {
+      return {
+        filename: a.filename ?? "artifact.bin",
+        mime_type: a.mime_type ?? "application/octet-stream",
+        base64: a.base64,
+      };
+    }
+    if (typeof a.content === "string") {
+      const fname = a.filename ?? "report.txt";
+      const lowerName = fname.toLowerCase();
+      const inferredMime =
+        lowerName.endsWith(".png")
+          ? "image/png"
+          : lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg")
+            ? "image/jpeg"
+            : lowerName.endsWith(".webp")
+              ? "image/webp"
+              : lowerName.endsWith(".svg")
+                ? "image/svg+xml"
+                : lowerName.endsWith(".gif")
+                  ? "image/gif"
+                  : lowerName.endsWith(".md") || lowerName.endsWith(".markdown")
+                    ? "text/markdown"
+                    : "text/plain";
+      return {
+        filename: fname,
+        mime_type: a.mime_type ?? inferredMime,
+        base64: Buffer.from(a.content, "utf8").toString("base64"),
+      };
+    }
+    throw new Error("Artifact needs one of: path, base64, or content");
+  }
+
+  function toArtifactPayloads(
+    entries: Array<{
+      filename?: string;
+      mime_type?: string;
+      content?: string;
+      base64?: string;
+      path?: string;
+    }> | undefined,
+  ): Record<string, unknown>[] {
+    return (entries ?? []).map(toArtifactPayload);
+  }
 
   pi.registerTool({
     name: "report",
     label: "Report",
     description:
       role === "orchestrator"
-        ? "Post a message into the active conversation and optionally attach a text, markdown, or image artifact."
+        ? "Post a message into the active conversation and optionally attach artifacts (screenshots, report.md) declared in the `artifacts` array."
         : role === "reviewer"
-          ? "Post read-only code review findings or approval directly into the issue conversation and optionally attach a markdown artifact."
-          : "Send a summary, progress note, blocking question, or artifact (to your orchestrator, or directly into the issue room when bound to an issue). Final summaries are shown in the Status view and approval cards, so describe the user-visible outcome in changelog style and attach screenshots for visual changes.",
+          ? "Post read-only code review findings or approval directly into the issue conversation and optionally attach artifacts."
+          : "Send a summary, progress note, blocking question, or evidence (to your orchestrator, or directly into the issue room when bound to an issue). Attachments are explicit: list them in `artifacts`.",
     parameters: reportParameters,
     async execute(_toolCallId, params) {
       try {
-        let artifactPayload: Record<string, unknown> | undefined;
-        if (params.artifact && typeof params.artifact === "object") {
-          const a = params.artifact as {
-            filename?: string;
-            mime_type?: string;
-            content?: string;
-            base64?: string;
-            path?: string;
-          };
-          if (a.path) {
-            const abs = resolve(process.cwd(), a.path);
-            const st = statSync(abs);
-            if (st.size > 10 * 1024 * 1024) {
-              return textResult(`Artifact exceeds 10 MB limit (${st.size} bytes)`, true);
-            }
-            const bytes = readFileSync(abs);
-            const ext = abs.toLowerCase();
-            const inferredMime = ext.endsWith(".png")
-              ? "image/png"
-              : ext.endsWith(".jpg") || ext.endsWith(".jpeg")
-                ? "image/jpeg"
-                : ext.endsWith(".webp")
-                  ? "image/webp"
-                  : ext.endsWith(".md") || ext.endsWith(".markdown")
-                    ? "text/markdown"
-                    : "text/plain";
-            artifactPayload = {
-              filename: a.filename ?? basename(abs),
-              mime_type: a.mime_type ?? inferredMime,
-              base64: bytes.toString("base64"),
-            };
-          } else if (typeof a.base64 === "string") {
-            artifactPayload = {
-              filename: a.filename ?? "artifact.bin",
-              mime_type: a.mime_type ?? "application/octet-stream",
-              base64: a.base64,
-            };
-          } else if (typeof a.content === "string") {
-            const fname = a.filename ?? "report.txt";
-            const lowerName = fname.toLowerCase();
-            const inferredMime =
-              lowerName.endsWith(".md") || lowerName.endsWith(".markdown")
-                ? "text/markdown"
-                : "text/plain";
-            artifactPayload = {
-              filename: fname,
-              mime_type: a.mime_type ?? inferredMime,
-              base64: Buffer.from(a.content, "utf8").toString("base64"),
-            };
-          }
-        }
+        const artifacts = toArtifactPayloads(
+          (params as { artifacts?: Parameters<typeof toArtifactPayloads>[0] }).artifacts,
+        );
         const inThread = (params as { in_thread?: unknown }).in_thread;
         const res = await callHost("report", {
           text: params.text,
-          ...(artifactPayload ? { artifact: artifactPayload } : {}),
+          ...(artifacts.length > 0 ? { artifacts } : {}),
           ...(role === "orchestrator" && typeof inThread === "boolean"
             ? { in_thread: inThread }
             : {}),
@@ -197,6 +240,58 @@ export default function (pi: ExtensionAPI) {
       }
     },
   });
+
+  if (role === "orchestrator" || role === "worker") {
+    pi.registerTool({
+      name: "propose_merge",
+      label: "Propose Merge",
+      description:
+        "Create or amend this branch's proposal in #merge-queue: a short user-facing changelog plus optional evidence (screenshots render inline). This is the handback — humans Merge it or ask for changes. Calling it again rewrites the same proposal instead of opening a second one.",
+      parameters: Type.Object({
+        summary_md: Type.String({
+          description:
+            "User-facing changelog of what changed and what someone can now do (1-3 sentences). Leave file names, markup, logs, and SHAs out of it.",
+        }),
+        evidence: artifactsParamSchema,
+        title: Type.Optional(
+          Type.String({ description: "Optional short proposal title (defaults to the session title)" }),
+        ),
+      }),
+      async execute(_toolCallId, params) {
+        try {
+          const artifacts = toArtifactPayloads(
+            (params as { evidence?: Parameters<typeof toArtifactPayloads>[0] }).evidence,
+          );
+          const res = await callHost("propose_merge", {
+            summary_md: params.summary_md,
+            ...(params.title ? { title: params.title } : {}),
+            ...(artifacts.length > 0 ? { artifacts } : {}),
+          });
+          return textResult(res);
+        } catch (err) {
+          return textResult(err instanceof Error ? err.message : String(err), true);
+        }
+      },
+    });
+
+    pi.registerTool({
+      name: "withdraw_proposal",
+      label: "Withdraw Proposal",
+      description:
+        "Pull this branch's open proposal back out of the Merge Queue so it can be reworked.",
+      parameters: Type.Object({
+        reason: Type.Optional(Type.String({ description: "Optional short reason for withdrawing" })),
+      }),
+      async execute(_toolCallId, params) {
+        try {
+          const res = await callHost("withdraw_proposal", { reason: params.reason ?? "" });
+          return textResult(res);
+        } catch (err) {
+          return textResult(err instanceof Error ? err.message : String(err), true);
+        }
+      },
+    });
+  }
 
   if (role === "orchestrator" || role === "worker") {
     pi.registerTool({
@@ -234,7 +329,7 @@ export default function (pi: ExtensionAPI) {
         "Spawn an isolated worker agent session with its own git clone and branch to perform repository work.",
       parameters: Type.Object({
         title: Type.Optional(
-          Type.String({ description: "Short 3-6 word human-readable title shown in the Tasks UI" }),
+          Type.String({ description: "Short 3-6 word human-readable title shown in the session list" }),
         ),
         task: Type.String({ description: "Clear, self-contained task description for the worker session" }),
         in_thread: Type.Optional(
@@ -444,29 +539,6 @@ export default function (pi: ExtensionAPI) {
       },
     });
   } else if (role !== "reviewer") {
-    pi.registerTool({
-      name: "land_request",
-      label: "Request Land",
-      description:
-        "Mark this worker session's committed changes as ready for human approval in the Tasks UI and notify your orchestrator (for ad-hoc chat tasks only; not used inside issues).",
-      parameters: Type.Object({
-        summary: Type.Optional(
-          Type.String({
-            description:
-              "User-facing changelog summary of what changed for the user and how it was verified (shown in the Status view review card); no file names, markup, logs, or git plumbing",
-          }),
-        ),
-      }),
-      async execute(_toolCallId, params) {
-        try {
-          const res = await callHost("land_request", { summary: params.summary ?? "" });
-          return textResult(res);
-        } catch (err) {
-          return textResult(err instanceof Error ? err.message : String(err), true);
-        }
-      },
-    });
-
     pi.registerTool({
       name: "ask_owner",
       label: "Ask Issue Owner",

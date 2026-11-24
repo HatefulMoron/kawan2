@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createConnection } from "node:net";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -98,6 +99,55 @@ export class TestKeyPair {
   cleanup(): void {
     rmSync(this.dir, { recursive: true, force: true });
   }
+}
+
+/**
+ * Call a host tool exactly like the pi extension does: one JSON line over the
+ * session unix socket. Lets tests exercise agent-facing tools without an LLM.
+ */
+export function callHostTool(
+  socketPath: string,
+  token: string,
+  tool: string,
+  params: Record<string, unknown> = {},
+): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const conn = createConnection(socketPath);
+    const chunks: Buffer[] = [];
+    let settled = false;
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      conn.destroy();
+      reject(err);
+    };
+    conn.on("error", fail);
+    conn.on("connect", () => {
+      conn.write(`${JSON.stringify({ id: "test-1", token, tool, params })}\n`);
+    });
+    conn.on("data", (chunk: Buffer) => {
+      chunks.push(chunk);
+      const buf = Buffer.concat(chunks);
+      const nl = buf.indexOf(0x0a);
+      if (nl === -1) return;
+      settled = true;
+      conn.end();
+      try {
+        const msg = JSON.parse(buf.subarray(0, nl).toString("utf8")) as {
+          ok: boolean;
+          result?: unknown;
+          error?: string;
+        };
+        if (!msg.ok) reject(new Error(msg.error ?? "host tool error"));
+        else resolve(msg.result);
+      } catch (err) {
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
+    conn.on("end", () => {
+      if (!settled) fail(new Error("host closed socket before replying"));
+    });
+  });
 }
 
 export interface WsFrame {

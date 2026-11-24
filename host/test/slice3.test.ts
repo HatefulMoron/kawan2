@@ -85,11 +85,13 @@ test("Slice 3: orchestrator spawns worker, worker commits signed change and post
             name: "report",
             arguments: {
               text: "Added hello.txt and committed it on branch.",
-              artifact: {
-                filename: "hello.txt",
-                mime_type: "text/plain",
-                content: "hello kawan\n",
-              },
+              artifacts: [
+                {
+                  filename: "hello.txt",
+                  mime_type: "text/plain",
+                  content: "hello kawan\n",
+                },
+              ],
             },
           },
         ],
@@ -197,7 +199,10 @@ test("Slice 3: orchestrator spawns worker, worker commits signed change and post
 
     if (!useLiveLlm) {
       const wrapMsg = await orchMsgWait;
-      assert.equal(wrapMsg.message.artifact_id, artifactId);
+      // Attachments are explicit now: the worker's upload is not auto-linked to the
+      // orchestrator's recap, so the recap carries none and the artifact stays free.
+      assert.deepEqual(wrapMsg.message.attachments, []);
+      assert.equal(host.db.getArtifact(artifactId)!.message_id, null);
       assert.equal(wrapMsg.message.thread_id, sent.message.id);
     }
 
@@ -461,11 +466,13 @@ test("Slice 3: orchestrator controls top-level vs threaded replies and report.md
                   text: isUnthreaded
                     ? "Checked README top-level."
                     : "Checked package config; details in report.",
-                  artifact: {
-                    filename: "report.md",
-                    mime_type: "text/markdown",
-                    content: "# Detailed Report\n\n- Verified cleanly.\n",
-                  },
+                  artifacts: [
+                    {
+                      filename: "report.md",
+                      mime_type: "text/markdown",
+                      content: "# Detailed Report\n\n- Verified cleanly.\n",
+                    },
+                  ],
                 },
               },
             ],
@@ -606,8 +613,8 @@ test("Slice 3: orchestrator controls top-level vs threaded replies and report.md
     assert.equal(worker3.session.thread_id, trigger3.message.id);
     assert.equal(ack3.message.thread_id, trigger3.message.id);
     assert.equal(wrap3.message.thread_id, trigger3.message.id);
-    assert.ok(wrap3.message.artifact_id, "Expected report.md artifact attached to wrap-up message");
-    const reportArt = host.db.getArtifact(wrap3.message.artifact_id)!;
+    assert.equal(wrap3.message.attachments.length, 1, "Expected report.md attached to wrap-up message");
+    const reportArt = wrap3.message.attachments[0];
     assert.equal(reportArt.filename, "report.md");
     assert.equal(reportArt.mime_type, "text/markdown");
     assert.equal(reportArt.session_id, worker3.session.id);

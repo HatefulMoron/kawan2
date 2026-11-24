@@ -112,21 +112,23 @@ quietly behind the scenes and report back to the orchestrator:
 human in #general:  @bot the CI build is flaky, look at it
 decision call:      orchestrator, dispatch — addressed and actionable
 orchestrator:       spawns worker session + clone + kawan/<id> branch (optional brief ack)
-worker:             works in isolated clone; calls report() / land_request() to orchestrator only
+worker:             works in isolated clone; calls report() / propose_merge() to orchestrator only
                     (if blocked, asks orchestrator → orchestrator asks human & relays via message_session)
-orchestrator:       posts one plain-language summary in chat (attaching artifacts & Approve Land)
-human:              replies in the thread → routed to that session (or orchestrator)
-human:              approves (in chat, bot DM tasks panel, or session drawer) → verify & land
-bot:                posts a concise landing confirmation, closes the issue if there is one
+orchestrator:       calls propose_merge with a short changelog and evidence → proposal message in #merge-queue
+human:              replies in the thread to request changes → routed to that session (or orchestrator),
+                    and the worker's next propose_merge amends the same proposal
+human:              clicks Merge in #merge-queue → verify & land
+bot:                posts a concise landing notice, closes the issue if there is one
 ```
 
 The issue variant is `@bot fix #12`, which links the spawned session and its
 artifacts to the issue instead of a bare channel thread.
 
-Live worker progress, artifacts, and pending land approvals are visible in the
-bot's left-rail indicator, bot DM tasks panel, bottom session strip, and
-session drawer without cluttering chat. Two moments need the client to be loud:
-a question relayed to the channel and a verification failure in the merge queue.
+Live worker progress and artifacts are visible in the bottom session strip, the
+session drawer, and an issue room's live activity bar without cluttering chat. The
+proposal itself is an ordinary message in `#merge-queue` (`09_proposals.md`). Two
+moments need the client to be loud: a question relayed to the channel and a
+verification failure in the merge queue.
 
 ## What this forces
 
