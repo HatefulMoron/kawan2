@@ -13,11 +13,10 @@ use crate::protocol::{
     Artifact, ArtifactGetData, BotCreateData, BotListData, BotSummary, Conversation,
     ConversationCreateData, ConversationListData, ConversationMarkReadData, ConversationOpenData,
     Decision, InviteCreateData, IssueActionData, IssueLandData, IssueListData, IssueOpenData,
-    IssuePromoteData, IssueSummary, IssueSyncData, Land, LandApproveData, Member,
-    MergeQueueReadData, MergeQueueSnapshot, Message, ModelsTestData, ServerFrame,
-    SessionActionData, SessionDiffData, SessionDiffSummary, SessionListData, SessionOpenData,
-    SessionSummary, SettingsView, SetupStatus, StatusReadData, StatusRepoInfo, UserListData,
-    UserSummary, parse_invite_link,
+    IssuePromoteData, IssueSummary, IssueSyncData, Land, LandMergeData, Member, MergeQueueReadData,
+    MergeQueueSnapshot, Message, ModelsTestData, ProposalCard, ServerFrame, SessionActionData,
+    SessionDiffData, SessionDiffSummary, SessionListData, SessionOpenData, SessionSummary,
+    SettingsView, SetupStatus, UserListData, UserSummary, parse_invite_link,
 };
 use crate::ssh::default_ssh_key_path;
 use crate::ws_client::{AuthMode, ConnectConfig, WsEvent, WsHandle};
@@ -31,7 +30,6 @@ pub enum Screen {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspacePage {
-    Status,
     MergeQueue,
     Issues,
     IssueDetail(String),
@@ -139,12 +137,13 @@ pub struct KawanApp {
     pub artifacts_by_id: HashMap<String, Artifact>,
     pub lands_by_id: HashMap<String, Land>,
     pub merge_queue: Option<MergeQueueSnapshot>,
+    /// Land armed by a first **Merge** click when checks are red or the branch
+    /// touches `.kawan/`; the second click actually accepts it.
+    pub confirm_merge: Option<String>,
     pub issues_by_id: HashMap<String, IssueSummary>,
     pub conv_errors: HashMap<String, Vec<ConversationError>>,
     pub loaded_artifacts: HashMap<String, LoadedArtifact>,
-    pub expanded_artifacts: HashSet<String>,
     pub session_entries: HashMap<String, Vec<Value>>,
-    pub status_repo: Option<StatusRepoInfo>,
 
     // Conversation interactive state
     pub composer_text: String,
@@ -259,12 +258,11 @@ impl KawanApp {
             artifacts_by_id: HashMap::new(),
             lands_by_id: HashMap::new(),
             merge_queue: None,
+            confirm_merge: None,
             issues_by_id: HashMap::new(),
             conv_errors: HashMap::new(),
             loaded_artifacts: HashMap::new(),
-            expanded_artifacts: HashSet::new(),
             session_entries: HashMap::new(),
-            status_repo: None,
 
             composer_text: String::new(),
             thread_composer_text: String::new(),
@@ -517,6 +515,7 @@ impl KawanApp {
                         role: "member".to_string(),
                     });
                 }
+                self.ingest_attachments(&message.attachments);
                 let list = self.messages_by_conv.entry(conv_id.clone()).or_default();
                 if !list.iter().any(|m| m.id == message.id) {
                     list.push(message);
@@ -722,7 +721,8 @@ impl KawanApp {
                     let cid = res.conversation.id.clone();
                     self.upsert_conversation(res.conversation);
                     self.members_by_conv.insert(cid.clone(), res.members);
-                    self.messages_by_conv.insert(cid.clone(), res.messages);
+                    self.messages_by_conv
+                        .insert(cid.clone(), res.messages.clone());
                     self.decisions_by_conv.insert(cid, res.decisions);
                     for sess in res.sessions {
                         self.sessions_by_id.insert(sess.id.clone(), sess);
@@ -733,6 +733,9 @@ impl KawanApp {
                         if !self.loaded_artifacts.contains_key(&aid) {
                             self.send_cmd("artifact.get", json!({ "artifact_id": aid }));
                         }
+                    }
+                    for msg in &res.messages {
+                        self.ingest_attachments(&msg.attachments);
                     }
                     for land in res.lands {
                         self.lands_by_id.insert(land.id.clone(), land);
@@ -774,19 +777,8 @@ impl KawanApp {
                     let mut text_preview = None;
                     let mut image = None;
                     if let Some(bytes) = decoded {
-                        if res.mime_type.starts_with("image/") {
-                            let fmt = if res.mime_type.contains("jpeg")
-                                || res.mime_type.contains("jpg")
-                            {
-                                Some(ImageFormat::Jpeg)
-                            } else if res.mime_type.contains("webp") {
-                                Some(ImageFormat::Webp)
-                            } else {
-                                Some(ImageFormat::Png)
-                            };
-                            if let Some(fmt) = fmt {
-                                image = Some(Arc::new(Image::from_bytes(fmt, bytes)));
-                            }
+                        if let Some(fmt) = image_format_for_mime(&res.mime_type) {
+                            image = Some(Arc::new(Image::from_bytes(fmt, bytes)));
                         } else if let Ok(txt) = String::from_utf8(bytes) {
                             text_preview = Some(txt);
                         }
@@ -800,11 +792,17 @@ impl KawanApp {
                     );
                 }
             }
-            "land.approve" => {
-                if let Ok(res) = serde_json::from_value::<LandApproveData>(val) {
+            "land.merge" => {
+                if let Ok(res) = serde_json::from_value::<LandMergeData>(val) {
                     self.lands_by_id.insert(res.land.id.clone(), res.land);
                     self.sessions_by_id
                         .insert(res.session.id.clone(), res.session);
+                    self.error_banner = None;
+                }
+            }
+            "land.withdraw" => {
+                if let Ok(res) = serde_json::from_value::<MergeQueueReadData>(val) {
+                    self.apply_merge_queue_snapshot(res.queue);
                     self.error_banner = None;
                 }
             }
@@ -832,35 +830,6 @@ impl KawanApp {
                     self.last_invite_link = Some(res.link);
                     self.invite_note_input.clear();
                     self.error_banner = None;
-                }
-            }
-            "status.read" => {
-                if let Ok(res) = serde_json::from_value::<StatusReadData>(val) {
-                    self.status_repo = res.repo;
-                    for s in res.sessions {
-                        self.sessions_by_id.insert(s.id.clone(), s);
-                    }
-                    for l in res.lands {
-                        self.lands_by_id.insert(l.id.clone(), l);
-                    }
-                    for art in res.artifacts {
-                        let aid = art.id.clone();
-                        let is_image = art.mime_type.starts_with("image/");
-                        let belongs_to_worker = art
-                            .session_id
-                            .as_deref()
-                            .and_then(|sid| self.sessions_by_id.get(sid))
-                            .is_some_and(|sess| sess.kind == "worker");
-                        let should_fetch = !self.loaded_artifacts.contains_key(&aid)
-                            && (!is_image || belongs_to_worker);
-                        self.artifacts_by_id.insert(aid.clone(), art);
-                        if should_fetch && !self.is_mock {
-                            self.send_cmd("artifact.get", json!({ "artifact_id": aid }));
-                        }
-                    }
-                    for issue in res.issues {
-                        self.issues_by_id.insert(issue.id.clone(), issue);
-                    }
                 }
             }
             "issue.list" => {
@@ -896,7 +865,8 @@ impl KawanApp {
                     self.issues_by_id.insert(res.issue.id.clone(), res.issue);
                     self.upsert_conversation(res.conversation);
                     self.members_by_conv.insert(cid.clone(), res.members);
-                    self.messages_by_conv.insert(cid.clone(), res.messages);
+                    self.messages_by_conv
+                        .insert(cid.clone(), res.messages.clone());
                     self.decisions_by_conv.insert(cid, res.decisions);
                     for sess in res.sessions {
                         self.sessions_by_id.insert(sess.id.clone(), sess);
@@ -907,6 +877,9 @@ impl KawanApp {
                         if !self.loaded_artifacts.contains_key(&aid) {
                             self.send_cmd("artifact.get", json!({ "artifact_id": aid }));
                         }
+                    }
+                    for msg in &res.messages {
+                        self.ingest_attachments(&msg.attachments);
                     }
                     for land in res.lands {
                         self.lands_by_id.insert(land.id.clone(), land);
@@ -932,7 +905,7 @@ impl KawanApp {
                     }
                 }
             }
-            "issue.land" => {
+            "issue.propose" => {
                 if let Ok(res) = serde_json::from_value::<IssueLandData>(val) {
                     self.issues_by_id.insert(res.issue.id.clone(), res.issue);
                     self.lands_by_id.insert(res.land.id.clone(), res.land);
@@ -1011,6 +984,28 @@ impl KawanApp {
     }
 
     fn apply_merge_queue_snapshot(&mut self, queue: MergeQueueSnapshot) {
+        // A proposal that left the list can no longer be waiting for a confirm click.
+        let confirm_still_listed = self
+            .confirm_merge
+            .as_ref()
+            .is_some_and(|id| queue.proposed.iter().any(|card| &card.land.id == id));
+        if !confirm_still_listed {
+            self.confirm_merge = None;
+        }
+        for card in &queue.proposed {
+            self.lands_by_id
+                .insert(card.land.id.clone(), card.land.clone());
+            self.ingest_attachments(&card.message.attachments);
+            let conversation_id = card.message.conversation_id.clone();
+            let messages = self.messages_by_conv.entry(conversation_id).or_default();
+            match messages.iter().position(|m| m.id == card.message.id) {
+                Some(index) => messages[index] = card.message.clone(),
+                None => {
+                    messages.push(card.message.clone());
+                    messages.sort_by_key(|m| m.seq);
+                }
+            }
+        }
         if let Some(head) = &queue.head {
             self.lands_by_id.insert(head.id.clone(), head.clone());
         }
@@ -1024,6 +1019,41 @@ impl KawanApp {
             self.lands_by_id.insert(l.id.clone(), l.clone());
         }
         self.merge_queue = Some(queue);
+    }
+
+    /// Store a message's attachments and start loading bytes for inline images.
+    ///
+    /// Artifacts another part of the same response already listed are left alone,
+    /// so an image attachment is never fetched twice.
+    fn ingest_attachments(&mut self, attachments: &[Artifact]) {
+        for artifact in attachments {
+            let id = artifact.id.clone();
+            if self.artifacts_by_id.contains_key(&id) {
+                continue;
+            }
+            let is_image = artifact.mime_type.starts_with("image/");
+            self.artifacts_by_id.insert(id.clone(), artifact.clone());
+            if is_image && !self.is_mock {
+                self.send_cmd("artifact.get", json!({ "artifact_id": id }));
+            }
+        }
+    }
+
+    /// Open proposals shown in the Merge Queue, as the host ordered them.
+    pub fn proposals(&self) -> &[ProposalCard] {
+        self.merge_queue
+            .as_ref()
+            .map(|queue| queue.proposed.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// True when a message is newer than the local read cursor, so a proposal row
+    /// can show its "updated since you viewed" dot.
+    pub fn message_unseen(&self, message: &Message) -> bool {
+        self.conversations
+            .iter()
+            .find(|c| c.id == message.conversation_id)
+            .is_some_and(|conv| message.seq > conv.last_read_seq)
     }
 
     fn upsert_conversation(&mut self, conv: Conversation) {
@@ -1050,7 +1080,6 @@ impl KawanApp {
         self.send_cmd("user.list", json!({}));
         self.send_cmd("conversation.list", json!({}));
         self.send_cmd("session.list", json!({}));
-        self.send_cmd("status.read", json!({}));
         self.send_cmd("merge_queue.read", json!({}));
         self.send_cmd("issue.list", json!({}));
     }
@@ -1068,25 +1097,6 @@ impl KawanApp {
         }
         if !self.is_mock {
             self.send_cmd("conversation.open", json!({ "conversation_id": conv_id }));
-        }
-    }
-
-    pub fn open_conversation_thread(&mut self, conv_id: &str, thread_id: Option<&str>) {
-        self.open_conversation(conv_id);
-        if let Some(tid) = thread_id {
-            self.right_panel = RightPanel::Thread(tid.to_string());
-            self.focus_target = FocusTarget::ThreadComposer;
-        }
-    }
-
-    pub fn open_status(&mut self) {
-        self.screen = Screen::Workspace(WorkspacePage::Status);
-        self.right_panel = RightPanel::None;
-        self.redirect_menu_decision_id = None;
-        self.show_add_member = false;
-        if !self.is_mock {
-            self.send_cmd("status.read", json!({}));
-            self.send_cmd("merge_queue.read", json!({}));
         }
     }
 
@@ -1387,20 +1397,123 @@ impl KawanApp {
 
     pub fn land_issue(&mut self, issue_id: &str) {
         if self.is_mock {
-            if let Some(issue) = self.issues_by_id.get_mut(issue_id) {
-                issue.status = "landed".to_string();
-                issue.behind_main = 0;
-                issue.needs_input_question = None;
-                issue.active_reviewers.clear();
-                if let Some(sid) = &issue.active_session_id
-                    && let Some(sess) = self.sessions_by_id.get_mut(sid)
-                {
-                    sess.status = "landed".to_string();
-                }
-            }
+            self.mock_propose_issue(issue_id);
             return;
         }
-        self.send_cmd("issue.land", json!({ "issue_id": issue_id }));
+        self.send_cmd("issue.propose", json!({ "issue_id": issue_id }));
+    }
+
+    /// Mock stand-in for the host's propose path: the issue's branch becomes a
+    /// `proposed` land with a message in `#merge-queue`, and the issue stays open.
+    fn mock_propose_issue(&mut self, issue_id: &str) {
+        let Some(issue) = self.issues_by_id.get(issue_id).cloned() else {
+            return;
+        };
+        let land_id = format!("mock-proposal-{issue_id}");
+        let message_id = format!("mock-proposal-msg-{issue_id}");
+        let mq_cid = self
+            .merge_queue_conversation()
+            .map(|c| c.id.clone())
+            .or_else(|| self.merge_queue.as_ref().map(|q| q.conversation_id.clone()))
+            .unwrap_or_else(|| "conv-merge-queue".to_string());
+        let session_id = issue
+            .active_session_id
+            .clone()
+            .or_else(|| Some(format!("mock-proposal-sess-{issue_id}")));
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let bot = self
+            .bots
+            .first()
+            .map(|b| (b.id.clone(), b.name.clone()))
+            .unwrap_or_else(|| (issue.owner_id.clone(), "kawan".to_string()));
+        let commits = issue.commits_ahead.max(1);
+        let branch = format!("kawan/issue-{}", issue.number);
+        let checks = if issue.checks_status == "passed" {
+            "green".to_string()
+        } else {
+            issue.checks_status.clone()
+        };
+        let body = format!(
+            "## {}\n\n{commits} commits ready to merge from `{branch}`.\n\nChecks: {checks}.",
+            issue.title
+        );
+        let seq = self
+            .messages_by_conv
+            .get(&mq_cid)
+            .and_then(|msgs| msgs.iter().map(|m| m.seq).max())
+            .unwrap_or(0)
+            + 1;
+        let message = Message {
+            id: message_id.clone(),
+            conversation_id: mq_cid.clone(),
+            seq,
+            author_id: bot.0.clone(),
+            thread_id: None,
+            body,
+            attachments: Vec::new(),
+            created_at: now_ms,
+        };
+        self.messages_by_conv
+            .entry(mq_cid.clone())
+            .or_default()
+            .push(message.clone());
+        let land = Land {
+            id: land_id.clone(),
+            session_id: session_id.clone().unwrap_or_default(),
+            conversation_id: issue.conversation_id.clone(),
+            thread_id: None,
+            message_id: Some(message_id),
+            status: "proposed".to_string(),
+            approved_by: None,
+            base_sha: None,
+            landed_sha: None,
+            verify_output: None,
+            error: None,
+            queue_position: None,
+            issue_id: Some(issue.id.clone()),
+            pause_reason: None,
+            queue_session_id: None,
+            queue_thread_id: None,
+            trigger: Some("proposal".to_string()),
+            checks: issue.checks.clone(),
+            touches_kawan: issue.touches_kawan,
+            created_at: now_ms,
+            updated_at: now_ms,
+        };
+        self.lands_by_id.insert(land.id.clone(), land.clone());
+        if let Some(mq) = &mut self.merge_queue {
+            mq.proposed.retain(|card| card.land.id != land.id);
+            mq.proposed.insert(
+                0,
+                ProposalCard {
+                    land,
+                    message,
+                    author: crate::protocol::MessageAuthor {
+                        id: bot.0,
+                        kind: "bot".to_string(),
+                        name: bot.1,
+                    },
+                    session_title: Some(issue.title.clone()),
+                    checks: issue.checks.clone(),
+                    commits_ahead: issue.commits_ahead.max(1),
+                    behind_main: issue.behind_main,
+                    issue_number: Some(issue.number),
+                    updated_at: now_ms,
+                },
+            );
+        }
+        if let Some(issue) = self.issues_by_id.get_mut(issue_id) {
+            issue.needs_input_question = None;
+            issue.active_reviewers.clear();
+        }
+        if let Some(sid) = &session_id
+            && let Some(sess) = self.sessions_by_id.get_mut(sid)
+        {
+            sess.status = "idle".to_string();
+        }
     }
 
     pub fn stop_issue(&mut self, issue_id: &str) {
@@ -1496,7 +1609,7 @@ impl KawanApp {
                     author_id: self.current_user_id.clone(),
                     thread_id: None,
                     body,
-                    artifact_id: None,
+                    attachments: Vec::new(),
                     created_at: 1_795_409_400_000,
                 });
             self.decisions_by_conv
@@ -1558,7 +1671,7 @@ impl KawanApp {
                 author_id: self.current_user_id.clone(),
                 thread_id: Some(thread_id),
                 body,
-                artifact_id: None,
+                attachments: Vec::new(),
                 created_at: 1_795_409_410_000,
             });
             return;
@@ -1640,30 +1753,49 @@ impl KawanApp {
         );
     }
 
-    pub fn approve_land(&mut self, land_id: &str) {
+    /// Human accept: a proposal (`proposed`) enters the train (`queued`).
+    pub fn merge_land(&mut self, land_id: &str) {
+        self.confirm_merge = None;
         if self.is_mock {
             if let Some(land) = self.lands_by_id.get_mut(land_id) {
-                land.status = "landed".to_string();
-                land.landed_sha = Some("d92b7f1e88c3".to_string());
+                land.status = "queued".to_string();
+                land.approved_by = Some(self.current_user_id.clone());
                 land.pause_reason = None;
                 land.error = None;
-                if let Some(sess) = self.sessions_by_id.get_mut(&land.session_id) {
-                    sess.status = "landed".to_string();
-                }
                 let updated_land = land.clone();
+                if let Some(sess) = self.sessions_by_id.get_mut(&land.session_id) {
+                    sess.status = "idle".to_string();
+                }
                 if let Some(mq) = &mut self.merge_queue {
-                    mq.queued.retain(|l| l.id != land_id);
-                    mq.head = mq.queued.first().cloned();
-                    if mq.paused_land.as_ref().is_some_and(|l| l.id == land_id) {
-                        mq.paused_land = None;
-                        mq.settings.paused = false;
+                    mq.proposed.retain(|card| card.land.id != land_id);
+                    if !mq.queued.iter().any(|l| l.id == land_id) {
+                        mq.queued.push(updated_land);
                     }
-                    mq.recent_landed.insert(0, updated_land);
+                    mq.head = mq.queued.first().cloned();
                 }
             }
             return;
         }
-        self.send_cmd("land.approve", json!({ "land_id": land_id, "async": true }));
+        self.send_cmd("land.merge", json!({ "land_id": land_id, "async": true }));
+    }
+
+    /// Pull an open proposal back: `withdrawn`, out of the train, never landed.
+    pub fn withdraw_land(&mut self, land_id: &str) {
+        self.confirm_merge = None;
+        if self.is_mock {
+            if let Some(land) = self.lands_by_id.get_mut(land_id) {
+                land.status = "withdrawn".to_string();
+                land.pause_reason = None;
+                land.queue_position = None;
+            }
+            if let Some(mq) = &mut self.merge_queue {
+                mq.proposed.retain(|card| card.land.id != land_id);
+                mq.queued.retain(|l| l.id != land_id);
+            }
+            self.sync_mock_merge_queue_head();
+            return;
+        }
+        self.send_cmd("land.withdraw", json!({ "land_id": land_id }));
     }
 
     pub fn confirm_session(&mut self, session_id: &str) {
@@ -1768,11 +1900,11 @@ impl KawanApp {
     pub fn merge_queue_remove(&mut self, land_id: &str) {
         if self.is_mock {
             if let Some(land) = self.lands_by_id.get_mut(land_id) {
-                land.status = "requested".to_string();
+                land.status = "proposed".to_string();
                 land.pause_reason = None;
                 land.queue_position = None;
                 if let Some(sess) = self.sessions_by_id.get_mut(&land.session_id) {
-                    sess.status = "review_requested".to_string();
+                    sess.status = "idle".to_string();
                 }
             }
             if let Some(mq) = &mut self.merge_queue {
@@ -1847,15 +1979,6 @@ impl KawanApp {
             "merge_queue.configure",
             json!({ "default_landing_mode": next }),
         );
-    }
-
-    pub fn toggle_artifact_view(&mut self, artifact_id: &str) {
-        if !self.expanded_artifacts.remove(artifact_id) {
-            self.expanded_artifacts.insert(artifact_id.to_string());
-            if !self.is_mock && !self.loaded_artifacts.contains_key(artifact_id) {
-                self.send_cmd("artifact.get", json!({ "artifact_id": artifact_id }));
-            }
-        }
     }
 
     pub fn save_repository_settings(&mut self) {
@@ -2077,9 +2200,8 @@ impl KawanApp {
             let prio = match s.status.as_str() {
                 "running" => 0_u8,
                 "pending_approval" => 1,
-                "review_requested" => 2,
-                "failed" => 3,
-                _ => 4,
+                "failed" => 2,
+                _ => 3,
             };
             (prio, std::cmp::Reverse(s.updated_at))
         });
@@ -2134,45 +2256,6 @@ impl KawanApp {
             .collect();
         matches.sort_by_key(|l| l.created_at);
         matches.last().copied()
-    }
-
-    pub fn status_counts(&self) -> (usize, usize, usize) {
-        let mut needs_you = 0usize;
-        let mut waiting = 0usize;
-        let mut in_flight = 0usize;
-        let mut counted_needs_sessions = HashSet::new();
-        for sess in self.all_worker_sessions() {
-            let land_status = self.land_for_session(&sess.id).map(|l| l.status.as_str());
-            if matches!(land_status, Some("failed" | "paused"))
-                || (sess.status == "failed" && land_status != Some("landed"))
-                || sess.status == "pending_approval"
-            {
-                needs_you += 1;
-                counted_needs_sessions.insert(sess.id.as_str());
-            } else if matches!(
-                land_status,
-                Some("requested" | "queued" | "rebasing" | "verifying")
-            ) || (sess.status == "review_requested" && land_status != Some("landed"))
-            {
-                waiting += 1;
-            } else if matches!(sess.status.as_str(), "running" | "idle")
-                && land_status != Some("landed")
-            {
-                in_flight += 1;
-            }
-        }
-        for issue in self.issues_by_id.values() {
-            if issue.status == "open"
-                && issue.needs_input_question.is_some()
-                && !issue
-                    .active_session_id
-                    .as_deref()
-                    .is_some_and(|sid| counted_needs_sessions.contains(sid))
-            {
-                needs_you += 1;
-            }
-        }
-        (needs_you, waiting, in_flight)
     }
 
     pub fn actor_name(&self, user_id: &str) -> String {
@@ -2388,6 +2471,17 @@ impl KawanApp {
             self.focus_target = *first;
         }
     }
+}
+
+/// Decoded-image format for an artifact mime type, when it is an image.
+fn image_format_for_mime(mime_type: &str) -> Option<ImageFormat> {
+    let mime = mime_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    ImageFormat::from_mime_type(&mime)
 }
 
 fn sanitize_paste(target: FocusTarget, text: &str) -> String {

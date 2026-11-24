@@ -26,7 +26,6 @@ impl Render for KawanApp {
         let body = match &self.screen {
             Screen::Connect => views::connect::render(self, &theme, cx),
             Screen::Checklist => views::checklist::render(self, &theme, cx),
-            Screen::Workspace(WorkspacePage::Status) => views::status::render(self, &theme, cx),
             Screen::Workspace(WorkspacePage::MergeQueue) => {
                 views::merge_queue::render(self, &theme, cx)
             }

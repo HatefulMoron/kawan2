@@ -59,7 +59,10 @@ pub struct Message {
     pub author_id: String,
     pub thread_id: Option<String>,
     pub body: String,
-    pub artifact_id: Option<String>,
+    /// Artifacts attached to this message, in the author's order. A message is the
+    /// changelog of record; a proposal is just a message like any other.
+    #[serde(default)]
+    pub attachments: Vec<Artifact>,
     pub created_at: u64,
 }
 
@@ -219,6 +222,9 @@ pub struct MergeQueueSnapshot {
     pub conversation_id: String,
     #[serde(default)]
     pub settings: MergeQueueSettingsView,
+    /// Open proposals waiting for a human **Merge** (or auto mode).
+    #[serde(default)]
+    pub proposed: Vec<ProposalCard>,
     #[serde(default)]
     pub head: Option<Land>,
     #[serde(default)]
@@ -227,6 +233,28 @@ pub struct MergeQueueSnapshot {
     pub paused_land: Option<Land>,
     #[serde(default)]
     pub recent_landed: Vec<Land>,
+}
+
+/// One open proposal row in the Merge Queue's `Proposed (N)` section.
+///
+/// The proposal body lives on `message`; `land` owns the branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalCard {
+    pub land: Land,
+    pub message: Message,
+    pub author: MessageAuthor,
+    #[serde(default)]
+    pub session_title: Option<String>,
+    #[serde(default)]
+    pub checks: Vec<CheckRunItem>,
+    #[serde(default)]
+    pub commits_ahead: u64,
+    #[serde(default)]
+    pub behind_main: u64,
+    #[serde(default)]
+    pub issue_number: Option<u64>,
+    #[serde(default)]
+    pub updated_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -384,8 +412,9 @@ pub struct ArtifactGetData {
     pub mime_type: String,
 }
 
+/// `land.merge` response: the accepted land plus its (now idle) worker session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LandApproveData {
+pub struct LandMergeData {
     pub land: Land,
     pub session: SessionSummary,
 }
@@ -396,13 +425,6 @@ pub struct InviteCreateData {
     pub link: String,
     pub expires_at: u64,
     pub note: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StatusRepoInfo {
-    pub url: String,
-    pub default_branch: String,
-    pub head_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -501,19 +523,6 @@ pub struct IssueOpenData {
     pub sessions: Vec<SessionSummary>,
     pub artifacts: Vec<Artifact>,
     pub lands: Vec<Land>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StatusReadData {
-    pub repo: Option<StatusRepoInfo>,
-    #[serde(default)]
-    pub sessions: Vec<SessionSummary>,
-    #[serde(default)]
-    pub lands: Vec<Land>,
-    #[serde(default)]
-    pub artifacts: Vec<Artifact>,
-    #[serde(default)]
-    pub issues: Vec<IssueSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -643,6 +652,7 @@ pub fn parse_invite_link(raw: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::path::PathBuf;
 
     #[derive(Deserialize)]
@@ -728,8 +738,11 @@ mod tests {
                         "artifact.get" => {
                             let _: ArtifactGetData = serde_json::from_value(data).unwrap();
                         }
-                        "land.approve" => {
-                            let _: LandApproveData = serde_json::from_value(data).unwrap();
+                        "land.merge" => {
+                            let _: LandMergeData = serde_json::from_value(data).unwrap();
+                        }
+                        "land.withdraw" => {
+                            let _: MergeQueueReadData = serde_json::from_value(data).unwrap();
                         }
                         "settings.read" | "settings.update" => {
                             let _: SettingsView = serde_json::from_value(data).unwrap();
@@ -748,6 +761,91 @@ mod tests {
 
         assert!(total_c2s > 20, "expected recorded c2s frames");
         assert!(total_s2c > 30, "expected recorded s2c frames");
+    }
+
+    #[test]
+    fn parses_proposals_and_message_attachments() {
+        let artifact = json!({
+            "id": "art-1",
+            "sha256": "aa11",
+            "mime_type": "image/svg+xml",
+            "byte_size": 2048,
+            "filename": "chart.svg",
+            "session_id": "sess-1",
+            "conversation_id": "conv-mq",
+            "message_id": "msg-proposed",
+            "created_at": 10,
+        });
+        let message = json!({
+            "id": "msg-proposed",
+            "conversation_id": "conv-mq",
+            "seq": 3,
+            "author_id": "bot-1",
+            "thread_id": null,
+            "body": "Proposed: ![chart](kawan://artifact/art-1)",
+            "attachments": [artifact],
+            "created_at": 11,
+        });
+        let parsed: Message = serde_json::from_value(message).unwrap();
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].id, "art-1");
+
+        let land = json!({
+            "id": "land-1",
+            "session_id": "sess-1",
+            "conversation_id": "conv-mq",
+            "thread_id": null,
+            "message_id": "msg-proposed",
+            "status": "proposed",
+            "approved_by": null,
+            "base_sha": null,
+            "landed_sha": null,
+            "verify_output": null,
+            "error": null,
+            "created_at": 9,
+            "updated_at": 11,
+        });
+        let snapshot: MergeQueueSnapshot = serde_json::from_value(json!({
+            "conversation_id": "conv-mq",
+            "proposed": [{
+                "land": land,
+                "message": {
+                    "id": "msg-proposed",
+                    "conversation_id": "conv-mq",
+                    "seq": 3,
+                    "author_id": "bot-1",
+                    "thread_id": null,
+                    "body": "Proposed",
+                    "attachments": [artifact],
+                    "created_at": 11,
+                },
+                "author": { "id": "bot-1", "kind": "bot", "name": "kawan" },
+                "session_title": "Proposal session",
+                "checks": [],
+                "commits_ahead": 2,
+                "behind_main": 0,
+                "issue_number": null,
+                "updated_at": 11,
+            }],
+            "head": null,
+            "queued": [],
+            "paused_land": null,
+            "recent_landed": [],
+        }))
+        .unwrap();
+        assert_eq!(snapshot.proposed.len(), 1);
+        let card = &snapshot.proposed[0];
+        assert_eq!(card.land.status, "proposed");
+        assert_eq!(card.message.attachments.len(), 1);
+        assert_eq!(card.author.name, "kawan");
+        assert_eq!(card.commits_ahead, 2);
+
+        // Older snapshots have no `proposed` key at all; they must still parse.
+        let legacy: MergeQueueSnapshot = serde_json::from_value(json!({
+            "conversation_id": "conv-mq",
+        }))
+        .unwrap();
+        assert!(legacy.proposed.is_empty());
     }
 
     #[test]

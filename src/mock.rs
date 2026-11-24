@@ -1,14 +1,22 @@
 //! Static mock dataset (`KAWAN_MOCK=1`) for headless layout & styling inspection.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use gpui::{Image, ImageFormat};
 
 use crate::protocol::{
     ActiveReviewer, Artifact, BotSummary, CheckRunItem, Conversation, Decision, DecisionRoleView,
     DefaultRoleView, IssueSummary, Land, Member, MergeQueueSettingsView, MergeQueueSnapshot,
-    Message, ModelDefView, ProviderView, RepoSettingsView, RolesView, SessionDiffFile,
-    SessionDiffSummary, SessionSummary, SettingsView, SetupStatus, StatusRepoInfo, UserSummary,
+    Message, MessageAuthor, ModelDefView, ProposalCard, ProviderView, RepoSettingsView, RolesView,
+    SessionDiffFile, SessionDiffSummary, SessionSummary, SettingsView, SetupStatus, UserSummary,
 };
 use crate::state::{FocusTarget, KawanApp, LoadedArtifact, Screen, WorkspacePage};
+
+/// Inline chart used by the mock proposal's Markdown image.
+const TOKEN_BUDGET_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="720" height="380" viewBox="0 0 720 380"><rect width="720" height="380" fill="#f6f3ec"/><rect x="64" y="300" width="592" height="2" fill="#c9c2b4"/><rect x="96" y="196" width="84" height="104" fill="#2a63d9"/><rect x="228" y="140" width="84" height="160" fill="#2a63d9"/><rect x="360" y="88" width="84" height="212" fill="#2a63d9"/><rect x="492" y="220" width="84" height="80" fill="#1c592c"/><rect x="64" y="64" width="220" height="6" fill="#4a453c"/><rect x="64" y="84" width="140" height="6" fill="#a8a196"/></svg>"##;
+/// Second mock image: the 80%/100% budget gauge attached to the proposal.
+const BUDGET_GAUGE_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="240" height="120" viewBox="0 0 240 120"><rect width="240" height="120" fill="#f6f3ec"/><rect x="16" y="52" width="208" height="16" rx="8" fill="#e3ded2"/><rect x="16" y="52" width="166" height="16" rx="8" fill="#2a63d9"/><rect x="16" y="84" width="146" height="8" rx="4" fill="#1c592c"/><rect x="168" y="36" width="2" height="48" fill="#9b2c27"/><circle cx="182" cy="60" r="5" fill="#9b2c27"/></svg>"##;
 
 pub fn populate_mock(app: &mut KawanApp) {
     let alice_id = "human-alice".to_string();
@@ -29,12 +37,6 @@ pub fn populate_mock(app: &mut KawanApp) {
         has_bot: true,
         ready: true,
     };
-    app.status_repo = Some(StatusRepoInfo {
-        url: "git@github.com:kawan-dev/kawan.git".to_string(),
-        default_branch: "main".to_string(),
-        head_sha: Some("c8a41f001122aabb".to_string()),
-    });
-
     let mut providers = HashMap::new();
     providers.insert(
         "lithosai".to_string(),
@@ -247,7 +249,7 @@ pub fn populate_mock(app: &mut KawanApp) {
             thread_id: Some("msg-2".to_string()),
             title: Some("Fix WorkerPty teardown FD leak".to_string()),
             task: Some("Fix WorkerPty teardown FD leak and add verification test".to_string()),
-            status: "review_requested".to_string(),
+            status: "idle".to_string(),
             branch: Some(format!("kawan/{sess_1}")),
             clone_path: Some("/var/lib/kawan/workspaces/8f2a9c41".to_string()),
             agent_dir: None,
@@ -358,7 +360,6 @@ pub fn populate_mock(app: &mut KawanApp) {
             image: None,
         },
     );
-    app.expanded_artifacts.insert(art_1.clone());
 
     app.lands_by_id.insert(
         land_0.clone(),
@@ -479,6 +480,7 @@ pub fn populate_mock(app: &mut KawanApp) {
             conflict_policy: "pause_on_issue".to_string(),
             paused: true,
         },
+        proposed: Vec::new(),
         head: Some(paused_head.clone()),
         queued: vec![paused_head, queued_second],
         paused_land: Some(app.lands_by_id.get("land-verify-sigs").unwrap().clone()),
@@ -519,7 +521,7 @@ pub fn populate_mock(app: &mut KawanApp) {
                 author_id: maya_id.clone(),
                 thread_id: None,
                 body: "Grabbing coffee before reviewing the timeout logs — did staging recover after the sweep?".to_string(),
-                artifact_id: None,
+                attachments: Vec::new(),
                 created_at: 1_795_400_000_000,
             },
             Message {
@@ -529,7 +531,7 @@ pub fn populate_mock(app: &mut KawanApp) {
                 author_id: alice_id.clone(),
                 thread_id: None,
                 body: "@kawan fix the WorkerPty teardown FD leak and add an integration stress check.".to_string(),
-                artifact_id: None,
+                attachments: Vec::new(),
                 created_at: 1_795_400_120_000,
             },
             Message {
@@ -539,7 +541,7 @@ pub fn populate_mock(app: &mut KawanApp) {
                 author_id: maya_id.clone(),
                 thread_id: Some("msg-2".to_string()),
                 body: "Make sure we kill the whole process group (-pgid), not just the top-level pi pid.".to_string(),
-                artifact_id: None,
+                attachments: Vec::new(),
                 created_at: 1_795_400_240_000,
             },
             Message {
@@ -548,8 +550,8 @@ pub fn populate_mock(app: &mut KawanApp) {
                 seq: 4,
                 author_id: bot_id.clone(),
                 thread_id: Some("msg-2".to_string()),
-                body: "Finished WorkerPty teardown fix in worker clone and verified across 200 simulated timeouts. Ready for human approval to land.".to_string(),
-                artifact_id: Some(art_1),
+                body: "Finished WorkerPty teardown fix in worker clone and verified across 200 simulated timeouts. Proposed for merge: Fix WorkerPty teardown FD leak → Merge Queue.".to_string(),
+                attachments: vec![artifact_obj],
                 created_at: 1_795_400_360_000,
             },
         ],
@@ -621,20 +623,19 @@ pub fn populate_mock(app: &mut KawanApp) {
         ],
     );
 
-    app.artifacts_by_id.insert(
-        art_mq.clone(),
-        Artifact {
-            id: art_mq.clone(),
-            sha256: "e104ab7711223344".to_string(),
-            mime_type: "text/plain".to_string(),
-            byte_size: 98,
-            filename: Some("merge-failure.log".to_string()),
-            session_id: Some("3b71d20e-0002-4000-8000-000000000002".to_string()),
-            conversation_id: Some(conv_mq.clone()),
-            message_id: Some("mq-msg-1".to_string()),
-            created_at: 222,
-        },
-    );
+    let mq_failure = Artifact {
+        id: art_mq.clone(),
+        sha256: "e104ab7711223344".to_string(),
+        mime_type: "text/plain".to_string(),
+        byte_size: 98,
+        filename: Some("merge-failure.log".to_string()),
+        session_id: Some("3b71d20e-0002-4000-8000-000000000002".to_string()),
+        conversation_id: Some(conv_mq.clone()),
+        message_id: Some("mq-msg-1".to_string()),
+        created_at: 222,
+    };
+    app.artifacts_by_id
+        .insert(art_mq.clone(), mq_failure.clone());
     app.loaded_artifacts.insert(
         art_mq.clone(),
         LoadedArtifact {
@@ -655,7 +656,7 @@ pub fn populate_mock(app: &mut KawanApp) {
                 author_id: bot_id.clone(),
                 thread_id: None,
                 body: "Paused Merge Queue on \"Verify SSH commit signatures\" (#runtime · post-rebase verification failed).".to_string(),
-                artifact_id: Some(art_mq),
+                attachments: vec![mq_failure],
                 created_at: 1_795_401_000_000,
             },
             Message {
@@ -665,7 +666,7 @@ pub fn populate_mock(app: &mut KawanApp) {
                 author_id: bot_id.clone(),
                 thread_id: Some("mq-msg-1".to_string()),
                 body: "03-test failed because allowed_signers does not include the new signing fixture key. Reply to regenerate allowed_signers or send back to implementer.".to_string(),
-                artifact_id: None,
+                attachments: Vec::new(),
                 created_at: 1_795_401_020_000,
             },
         ],
@@ -1055,7 +1056,7 @@ pub fn populate_mock(app: &mut KawanApp) {
                 author_id: alice_id.clone(),
                 thread_id: None,
                 body: "@kawan please implement check runner exit-code isolation per the document above.".to_string(),
-                artifact_id: None,
+                attachments: Vec::new(),
                 created_at: 1_795_401_120_000,
             },
             Message {
@@ -1065,7 +1066,7 @@ pub fn populate_mock(app: &mut KawanApp) {
                 author_id: bot_id.clone(),
                 thread_id: None,
                 body: "@Alice: Should killed timeout checks still flush partial stderr before exit code 124?".to_string(),
-                artifact_id: None,
+                attachments: Vec::new(),
                 created_at: 1_795_401_200_000,
             },
         ],
@@ -1080,7 +1081,7 @@ pub fn populate_mock(app: &mut KawanApp) {
                 author_id: maya_id,
                 thread_id: None,
                 body: "@kawan wire up the token budget ledger; check the document above for telemetry fields.".to_string(),
-                artifact_id: None,
+                attachments: Vec::new(),
                 created_at: 1_795_401_060_000,
             },
             Message {
@@ -1090,7 +1091,7 @@ pub fn populate_mock(app: &mut KawanApp) {
                 author_id: bot_id.clone(),
                 thread_id: None,
                 body: "Committed token budget tracking and telemetry events across 3 commits. Checks are green.".to_string(),
-                artifact_id: None,
+                attachments: Vec::new(),
                 created_at: 1_795_401_150_000,
             },
         ],
@@ -1104,7 +1105,7 @@ pub fn populate_mock(app: &mut KawanApp) {
             author_id: alice_id.clone(),
             thread_id: None,
             body: "Document drafted — @mention a bot whenever ready to implement.".to_string(),
-            artifact_id: None,
+            attachments: Vec::new(),
             created_at: 1_795_400_800_000,
         }],
     );
@@ -1119,7 +1120,7 @@ pub fn populate_mock(app: &mut KawanApp) {
                 thread_id: None,
                 body: "Added .kawan/checks/00-fmt.sh cleanly; ready whenever you click Land."
                     .to_string(),
-                artifact_id: None,
+                attachments: Vec::new(),
                 created_at: 1_795_401_285_000,
             },
             Message {
@@ -1129,11 +1130,209 @@ pub fn populate_mock(app: &mut KawanApp) {
                 author_id: alice_id,
                 thread_id: None,
                 body: "Looks good — landed onto main.".to_string(),
-                artifact_id: None,
+                attachments: Vec::new(),
                 created_at: 1_795_401_290_000,
             },
         ],
     );
+
+    // A proposal is a message: Markdown body with an inline `kawan://artifact/<id>`
+    // image plus an extra attachment, linked to a `proposed` land.
+    let session_bot = "bot-kawan".to_string();
+    let conv_merge_queue = "conv-merge-queue".to_string();
+    let sess_prop = "7b88d100-0007-4000-8000-000000000007".to_string();
+    let conv_issue_2 = "conv-issue-2".to_string();
+    app.sessions_by_id.insert(
+        sess_prop.clone(),
+        SessionSummary {
+            id: sess_prop.clone(),
+            bot_id: session_bot.clone(),
+            parent_session_id: None,
+            kind: "worker".to_string(),
+            conversation_id: Some(conv_issue_2.clone()),
+            thread_id: None,
+            title: Some("Wire per-session token budgets & auto-pause".to_string()),
+            task: Some("Implement Issue #2 token budget ledger".to_string()),
+            status: "idle".to_string(),
+            branch: Some("kawan/issue-2-7b88d100".to_string()),
+            clone_path: Some("/var/lib/kawan/workspaces/issue-2".to_string()),
+            agent_dir: None,
+            pi_session_file: None,
+            last_entry_id: None,
+            last_report: Some(
+                "Token budgets, the 80% warning, and the 100% pause all work.".to_string(),
+            ),
+            soul_snapshot: None,
+            created_at: 245,
+            updated_at: 1_795_401_300_000,
+        },
+    );
+
+    let art_prop_chart = Artifact {
+        id: "art-proposal-chart".to_string(),
+        sha256: "7c3a91d5b1104a2c".to_string(),
+        mime_type: "image/svg+xml".to_string(),
+        byte_size: TOKEN_BUDGET_SVG.len() as u64,
+        filename: Some("token-budget-chart.svg".to_string()),
+        session_id: Some(sess_prop.clone()),
+        conversation_id: Some(conv_issue_2.clone()),
+        message_id: Some("mq-msg-3".to_string()),
+        created_at: 1_795_401_280_000,
+    };
+    app.artifacts_by_id
+        .insert(art_prop_chart.id.clone(), art_prop_chart.clone());
+    app.loaded_artifacts.insert(
+        art_prop_chart.id.clone(),
+        LoadedArtifact {
+            text_preview: None,
+            image: Some(Arc::new(Image::from_bytes(
+                ImageFormat::Svg,
+                TOKEN_BUDGET_SVG.to_vec(),
+            ))),
+        },
+    );
+
+    let art_prop_checks = Artifact {
+        id: "art-proposal-checks".to_string(),
+        sha256: "4d20a11f9b7c".to_string(),
+        mime_type: "text/plain".to_string(),
+        byte_size: 132,
+        filename: Some("checks-4d20a11.log".to_string()),
+        session_id: Some(sess_prop.clone()),
+        conversation_id: Some(conv_issue_2.clone()),
+        message_id: Some("mq-msg-3".to_string()),
+        created_at: 1_795_401_285_000,
+    };
+    app.artifacts_by_id
+        .insert(art_prop_checks.id.clone(), art_prop_checks.clone());
+    app.loaded_artifacts.insert(
+        art_prop_checks.id.clone(),
+        LoadedArtifact {
+            text_preview: Some(
+                "[PASS exit=0] 01-fmt (121ms)\n\n[PASS exit=0] 02-budget-test (838ms)\n24 passed, 0 failed"
+                    .to_string(),
+            ),
+            image: None,
+        },
+    );
+
+    // An extra image the body does not reference, so the proposal thumbnail strip
+    // has something to show (and chat still renders it inline).
+    let art_prop_strip = Artifact {
+        id: "art-proposal-budget-gauge".to_string(),
+        sha256: "b7f0c221aa48".to_string(),
+        mime_type: "image/svg+xml".to_string(),
+        byte_size: BUDGET_GAUGE_SVG.len() as u64,
+        filename: Some("budget-gauge.svg".to_string()),
+        session_id: Some(sess_prop.clone()),
+        conversation_id: Some(conv_issue_2.clone()),
+        message_id: Some("mq-msg-3".to_string()),
+        created_at: 1_795_401_287_000,
+    };
+    app.artifacts_by_id
+        .insert(art_prop_strip.id.clone(), art_prop_strip.clone());
+    app.loaded_artifacts.insert(
+        art_prop_strip.id.clone(),
+        LoadedArtifact {
+            text_preview: None,
+            image: Some(Arc::new(Image::from_bytes(
+                ImageFormat::Svg,
+                BUDGET_GAUGE_SVG.to_vec(),
+            ))),
+        },
+    );
+
+    let proposal_checks = vec![
+        CheckRunItem {
+            name: "01-fmt".to_string(),
+            ok: true,
+            exit_code: Some(0),
+            duration_ms: 121,
+            output: String::new(),
+            artifact_id: None,
+        },
+        CheckRunItem {
+            name: "02-budget-test".to_string(),
+            ok: true,
+            exit_code: Some(0),
+            duration_ms: 838,
+            output: String::new(),
+            artifact_id: Some(art_prop_checks.id.clone()),
+        },
+    ];
+
+    let proposal_message = Message {
+        id: "mq-msg-3".to_string(),
+        conversation_id: conv_merge_queue.clone(),
+        seq: 3,
+        author_id: session_bot.clone(),
+        thread_id: None,
+        body: "## Per-session token budgets\n\nSessions now track prompt and completion tokens, warn at 80%, and pause before a runaway tool loop burns the rest.\n\n![token budget chart](kawan://artifact/art-proposal-chart)\n\n- ledger row per session\n- pause at 100%\n- `session.update` carries usage\n\nChecks pass; 3 commits ahead of `main`."
+            .to_string(),
+        attachments: vec![
+            art_prop_chart.clone(),
+            art_prop_strip.clone(),
+            art_prop_checks.clone(),
+        ],
+        created_at: 1_795_401_290_000,
+    };
+    app.messages_by_conv
+        .entry(conv_merge_queue.clone())
+        .or_default()
+        .push(proposal_message.clone());
+    if let Some(conv) = app
+        .conversations
+        .iter_mut()
+        .find(|c| c.id == conv_merge_queue)
+    {
+        conv.last_seq = 3;
+        conv.next_seq = 4;
+        conv.unread_count = 2;
+    }
+
+    let land_prop = Land {
+        id: "land-proposal-token-budget".to_string(),
+        session_id: sess_prop.clone(),
+        conversation_id: conv_issue_2.clone(),
+        thread_id: None,
+        message_id: Some(proposal_message.id.clone()),
+        status: "proposed".to_string(),
+        approved_by: None,
+        base_sha: Some("c8a41f001122".to_string()),
+        landed_sha: None,
+        verify_output: Some("24 passed, 0 failed".to_string()),
+        error: None,
+        queue_position: None,
+        issue_id: Some(issue_2.clone()),
+        pause_reason: None,
+        queue_session_id: None,
+        queue_thread_id: None,
+        trigger: Some("proposal".to_string()),
+        checks: proposal_checks.clone(),
+        touches_kawan: false,
+        created_at: 1_795_401_280_000,
+        updated_at: 1_795_401_300_000,
+    };
+    app.lands_by_id
+        .insert(land_prop.id.clone(), land_prop.clone());
+
+    if let Some(mq) = &mut app.merge_queue {
+        mq.proposed = vec![ProposalCard {
+            land: land_prop,
+            message: proposal_message,
+            author: MessageAuthor {
+                id: session_bot,
+                kind: "bot".to_string(),
+                name: "kawan".to_string(),
+            },
+            session_title: Some("Wire per-session token budgets & auto-pause".to_string()),
+            checks: proposal_checks,
+            commits_ahead: 3,
+            behind_main: 0,
+            issue_number: Some(2),
+            updated_at: 1_795_401_300_000,
+        }];
+    }
 
     app.screen = Screen::Workspace(WorkspacePage::Conversation);
     app.focus_target = FocusTarget::Composer;

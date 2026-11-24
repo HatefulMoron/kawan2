@@ -4,19 +4,48 @@
 //! shown as raw text. This module parses CommonMark/GFM syntax with
 //! `pulldown-cmark` and renders a compact subset that fits the Instrument Panel:
 //! headings, paragraphs, emphasis, inline code, links, fenced code, lists,
-//! block quotes, tables, and horizontal rules.
+//! block quotes, tables, horizontal rules, and inline artifact images.
+//!
+//! `![alt](kawan://artifact/<artifact_id>)` renders the artifact's bytes at column
+//! width (capped height) and opens the artifact drawer on click. One renderer
+//! serves chat messages and merge-queue proposals.
 
 use std::iter::Peekable;
 use std::ops::Range;
+use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Div, FontStyle, FontWeight, HighlightStyle, Hsla, SharedString, StrikethroughStyle,
-    StyledText, UnderlineStyle, div, px,
+    AnyElement, App, ClickEvent, Div, FontStyle, FontWeight, HighlightStyle, Hsla, Image,
+    ObjectFit, SharedString, StrikethroughStyle, StyledImage, StyledText, UnderlineStyle, Window,
+    div, img, px,
 };
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 use crate::theme::{self, Theme};
+
+/// Tallest an inline image may render inside a message column.
+const INLINE_IMAGE_MAX_HEIGHT: f32 = 260.0;
+
+/// A click handler bound to the artifact drawer.
+pub type ArtifactClick = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+
+/// Resolves inline image references against already-loaded artifact bytes and
+/// opens the artifact lightbox when one is clicked.
+pub struct InlineImages<'a> {
+    /// Decoded bytes for an artifact id, when they have already arrived.
+    pub resolve: &'a dyn Fn(&str) -> Option<Arc<Image>>,
+    /// Click handler that opens the artifact drawer for an artifact id.
+    pub open: &'a dyn Fn(&str) -> ArtifactClick,
+}
+
+impl InlineImages<'_> {
+    fn image(&self, dest: &str) -> Option<(String, Arc<Image>)> {
+        let id = artifact_dest_id(dest)?;
+        let bytes = (self.resolve)(id)?;
+        Some((id.to_string(), bytes))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct SpanStyle {
@@ -31,6 +60,8 @@ struct SpanStyle {
 struct Span {
     text: String,
     style: SpanStyle,
+    /// `kawan://artifact/<id>` destination when this span is an inline image.
+    image: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -67,8 +98,53 @@ fn options() -> Options {
 }
 
 /// Render a Markdown chat message body into a vertical block of styled elements.
-pub fn render(markdown: &str, size: f32, color: Hsla, theme: &Theme) -> Div {
+pub fn render(
+    markdown: &str,
+    size: f32,
+    color: Hsla,
+    theme: &Theme,
+    images: Option<&InlineImages<'_>>,
+) -> Div {
+    render_block_list(
+        &parse_blocks(&mut Parser::new_ext(markdown, options()).peekable()),
+        size,
+        color,
+        theme,
+        images,
+    )
+}
+
+/// Render a Markdown body clipped after `max_blocks` top-level blocks.
+///
+/// Returns the element plus whether anything was dropped, so the caller can offer
+/// a `View full …` link. Proposal rows in the Merge Queue use this to keep a long
+/// changelog to a readable preview.
+pub fn render_clipped(
+    markdown: &str,
+    size: f32,
+    color: Hsla,
+    theme: &Theme,
+    images: Option<&InlineImages<'_>>,
+    max_blocks: usize,
+) -> (Div, bool) {
     let blocks = parse_blocks(&mut Parser::new_ext(markdown, options()).peekable());
+    let truncated = blocks.len() > max_blocks;
+    let shown = if truncated {
+        &blocks[..max_blocks]
+    } else {
+        &blocks[..]
+    };
+    let col = render_block_list(shown, size, color, theme, images);
+    (col, truncated)
+}
+
+fn render_block_list(
+    blocks: &[Block],
+    size: f32,
+    color: Hsla,
+    theme: &Theme,
+    images: Option<&InlineImages<'_>>,
+) -> Div {
     let mut col = div()
         .w_full()
         .min_w(px(0.0))
@@ -76,13 +152,31 @@ pub fn render(markdown: &str, size: f32, color: Hsla, theme: &Theme) -> Div {
         .flex_col()
         .gap(px((size * 0.42).max(4.0)));
 
-    for block in &blocks {
-        if let Some(element) = render_block(block, size, color, theme) {
+    for block in blocks {
+        if let Some(element) = render_block(block, size, color, theme, images) {
             col = col.child(element);
         }
     }
 
     col
+}
+
+/// The artifact id of a `kawan://artifact/<id>` link destination.
+fn artifact_dest_id(dest: &str) -> Option<&str> {
+    let id = dest.trim().strip_prefix("kawan://artifact/")?.trim();
+    (!id.is_empty()).then_some(id)
+}
+
+/// Alt text to show when an inline image has no bytes yet, or is not an artifact.
+fn image_fallback_label(alt: &str, dest: &str) -> String {
+    let alt = alt.trim();
+    if !alt.is_empty() {
+        return alt.to_string();
+    }
+    match artifact_dest_id(dest) {
+        Some(id) => id.chars().take(8).collect(),
+        None => dest.to_string(),
+    }
 }
 
 /// Flatten Markdown to plain text, for one-line previews and search.
@@ -249,11 +343,12 @@ fn parse_table_row<'a>(events: &mut Peekable<Parser<'a>>) -> Vec<Vec<Span>> {
 }
 
 fn parse_inline<'a>(events: &mut Peekable<Parser<'a>>, end: InlineEnd) -> Vec<Span> {
-    let mut spans = Vec::new();
+    let mut spans: Vec<Span> = Vec::new();
     let mut bold = 0u32;
     let mut italic = 0u32;
     let mut strike = 0u32;
     let mut link = 0u32;
+    let mut image_start: Option<(String, usize)> = None;
 
     loop {
         match events.peek() {
@@ -298,8 +393,27 @@ fn parse_inline<'a>(events: &mut Peekable<Parser<'a>>, end: InlineEnd) -> Vec<Sp
             Event::End(TagEnd::Emphasis) => italic = italic.saturating_sub(1),
             Event::Start(Tag::Strikethrough) => strike += 1,
             Event::End(TagEnd::Strikethrough) => strike = strike.saturating_sub(1),
-            Event::Start(Tag::Link { .. }) | Event::Start(Tag::Image { .. }) => link += 1,
-            Event::End(TagEnd::Link | TagEnd::Image) => link = link.saturating_sub(1),
+            Event::Start(Tag::Link { .. }) => link += 1,
+            Event::End(TagEnd::Link) => link = link.saturating_sub(1),
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                link += 1;
+                image_start = Some((dest_url.to_string(), spans.len()));
+            }
+            Event::End(TagEnd::Image) => {
+                link = link.saturating_sub(1);
+                if let Some((dest, start)) = image_start.take() {
+                    // The alt text of an image arrives as ordinary text events;
+                    // fold it into one image span so the renderer can place an
+                    // actual image (or fall back to the link-styled alt text).
+                    let alt: String = spans[start..].iter().map(|s| s.text.as_str()).collect();
+                    spans.truncate(start);
+                    spans.push(Span {
+                        text: alt,
+                        style,
+                        image: Some(dest),
+                    });
+                }
+            }
             Event::Text(text) => push_span(&mut spans, &text, style),
             Event::Code(code) => push_span(
                 &mut spans,
@@ -341,12 +455,14 @@ fn push_span(spans: &mut Vec<Span>, text: &str, style: SpanStyle) {
     }
     if let Some(last) = spans.last_mut()
         && last.style == style
+        && last.image.is_none()
     {
         last.text.push_str(text);
     } else {
         spans.push(Span {
             text: text.to_string(),
             style,
+            image: None,
         });
     }
 }
@@ -393,11 +509,23 @@ fn consume_end<'a>(events: &mut Peekable<Parser<'a>>, matches_end: impl Fn(&TagE
     }
 }
 
-fn render_block(block: &Block, size: f32, color: Hsla, theme: &Theme) -> Option<AnyElement> {
+fn render_block(
+    block: &Block,
+    size: f32,
+    color: Hsla,
+    theme: &Theme,
+    images: Option<&InlineImages<'_>>,
+) -> Option<AnyElement> {
     match block {
-        Block::Paragraph(spans) => {
-            render_inline(spans, size, size * 1.45, color, FontWeight::NORMAL, theme)
-        }
+        Block::Paragraph(spans) => render_inline(
+            spans,
+            size,
+            size * 1.45,
+            color,
+            FontWeight::NORMAL,
+            theme,
+            images,
+        ),
         Block::Heading(level, spans) => {
             let heading_size = match level {
                 1 => size + 7.0,
@@ -413,6 +541,7 @@ fn render_block(block: &Block, size: f32, color: Hsla, theme: &Theme) -> Option<
                 theme.ink,
                 FontWeight::SEMIBOLD,
                 theme,
+                images,
             )
         }
         Block::Code { lang, text } => {
@@ -462,7 +591,7 @@ fn render_block(block: &Block, size: f32, color: Hsla, theme: &Theme) -> Option<
                 .flex_col()
                 .gap(px((size * 0.36).max(3.0)));
             for child in children {
-                if let Some(element) = render_block(child, size, color, theme) {
+                if let Some(element) = render_block(child, size, color, theme, images) {
                     quote = quote.child(element);
                 }
             }
@@ -488,7 +617,7 @@ fn render_block(block: &Block, size: f32, color: Hsla, theme: &Theme) -> Option<
                     .flex_col()
                     .gap(px((size * 0.3).max(2.0)));
                 for child in item {
-                    if let Some(element) = render_block(child, size, color, theme) {
+                    if let Some(element) = render_block(child, size, color, theme, images) {
                         content = content.child(element);
                     }
                 }
@@ -528,10 +657,10 @@ fn render_block(block: &Block, size: f32, color: Hsla, theme: &Theme) -> Option<
                 .flex_col();
 
             if !headers.is_empty() {
-                table = table.child(table_row(headers, size, color, theme, true, false));
+                table = table.child(table_row(headers, size, color, theme, true, false, images));
             }
             for (index, row) in rows.iter().enumerate() {
-                table = table.child(table_row(row, size, color, theme, false, index > 0));
+                table = table.child(table_row(row, size, color, theme, false, index > 0, images));
             }
 
             Some(table.into_any_element())
@@ -553,6 +682,7 @@ fn table_row(
     theme: &Theme,
     header: bool,
     separated: bool,
+    images: Option<&InlineImages<'_>>,
 ) -> Div {
     let mut row = div()
         .w_full()
@@ -588,6 +718,7 @@ fn table_row(
                     color,
                     weight,
                     theme,
+                    images,
                 )),
         );
     }
@@ -596,6 +727,88 @@ fn table_row(
 }
 
 fn render_inline(
+    spans: &[Span],
+    size: f32,
+    line_height: f32,
+    color: Hsla,
+    weight: FontWeight,
+    theme: &Theme,
+    images: Option<&InlineImages<'_>>,
+) -> Option<AnyElement> {
+    let mut elements: Vec<AnyElement> = Vec::new();
+    let mut run: Vec<Span> = Vec::new();
+
+    for span in spans {
+        let Some(dest) = span.image.as_deref() else {
+            run.push(span.clone());
+            continue;
+        };
+
+        match resolve_image_span(&span.text, dest, images) {
+            ResolvedImage::Image { artifact_id, bytes } => {
+                if let Some(element) =
+                    render_text_run(&run, size, line_height, color, weight, theme)
+                {
+                    elements.push(element);
+                }
+                run.clear();
+                let open = images.map(|images| (images.open)(&artifact_id));
+                elements.push(inline_image_element(&artifact_id, bytes, open, theme));
+            }
+            // Unknown artifact ids, non-image artifacts, and bytes that have not
+            // arrived yet keep the old link-styled alt text.
+            ResolvedImage::AltText(text) => run.push(Span {
+                text,
+                style: SpanStyle {
+                    link: true,
+                    ..span.style
+                },
+                image: None,
+            }),
+        }
+    }
+
+    if let Some(element) = render_text_run(&run, size, line_height, color, weight, theme) {
+        elements.push(element);
+    }
+
+    match elements.len() {
+        0 => None,
+        1 => elements.pop(),
+        _ => Some(
+            div()
+                .w_full()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap(px((size * 0.42).max(4.0)))
+                .children(elements)
+                .into_any_element(),
+        ),
+    }
+}
+
+/// What an inline image span renders as.
+#[derive(Debug)]
+enum ResolvedImage {
+    /// Bytes are loaded: draw the image and open the drawer on click.
+    Image {
+        artifact_id: String,
+        bytes: Arc<Image>,
+    },
+    /// No bytes (unknown id, non-image artifact, still loading): alt text link.
+    AltText(String),
+}
+
+fn resolve_image_span(alt: &str, dest: &str, images: Option<&InlineImages<'_>>) -> ResolvedImage {
+    match images.and_then(|images| images.image(dest)) {
+        Some((artifact_id, bytes)) => ResolvedImage::Image { artifact_id, bytes },
+        None => ResolvedImage::AltText(image_fallback_label(alt, dest)),
+    }
+}
+
+/// A run of styled text as one `StyledText` element.
+fn render_text_run(
     spans: &[Span],
     size: f32,
     line_height: f32,
@@ -677,10 +890,57 @@ fn render_inline(
     )
 }
 
+/// An inline artifact image: column width, capped height, aspect preserved, and
+/// a click that opens the artifact drawer.
+fn inline_image_element(
+    artifact_id: &str,
+    image: Arc<Image>,
+    open: Option<ArtifactClick>,
+    theme: &Theme,
+) -> AnyElement {
+    let mut frame = div()
+        .id(format!("md-image-{artifact_id}"))
+        .w_full()
+        .min_w(px(0.0))
+        .max_h(px(INLINE_IMAGE_MAX_HEIGHT))
+        .rounded(px(2.0))
+        .border_1()
+        .border_color(theme.border_subtle)
+        .overflow_hidden();
+    if open.is_some() {
+        frame = frame.cursor_pointer().hover(|s| s.opacity(0.9));
+    }
+    frame = frame.child(
+        img(image)
+            .w_full()
+            .max_h(px(INLINE_IMAGE_MAX_HEIGHT))
+            .object_fit(ObjectFit::Contain),
+    );
+    if let Some(open) = open {
+        frame = frame.on_click(open);
+    }
+    frame.into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{plain_text, render};
+    use std::sync::Arc;
+
+    use gpui::{Image, ImageFormat};
+
+    use super::{
+        ArtifactClick, InlineImages, ResolvedImage, plain_text, render, render_clipped,
+        resolve_image_span,
+    };
     use crate::theme::Theme;
+
+    fn fake_image(tag: &str) -> Arc<Image> {
+        Arc::new(Image::from_bytes(ImageFormat::Svg, tag.as_bytes().to_vec()))
+    }
+
+    fn no_click(_: &str) -> ArtifactClick {
+        Box::new(|_, _, _| {})
+    }
 
     #[test]
     fn plain_text_drops_inline_syntax() {
@@ -706,6 +966,83 @@ Fixed **teardown** and `WorkerPty` cleanup — see [the report](https://example.
 ```rust\nfn main() {\n    println!(\"ok\");\n}\n```\n\n\
 | check | result |\n| --- | --- |\n| fmt | pass |\n\n\
 ---\n";
-        let _ = render(markdown, 13.5, theme.ink, &theme);
+        let _ = render(markdown, 13.5, theme.ink, &theme, None);
+    }
+
+    #[test]
+    fn renders_resolvable_inline_artifact_image() {
+        let theme = Theme::green();
+        let bytes = fake_image("chart");
+        let resolve = |id: &str| (id == "art-1").then(|| bytes.clone());
+        let images = InlineImages {
+            resolve: &resolve,
+            open: &no_click,
+        };
+        let markdown =
+            "Proposed: ![token budget chart](kawan://artifact/art-1)\n\nReady for review.";
+
+        let _ = render(markdown, 13.5, theme.ink, &theme, Some(&images));
+
+        match resolve_image_span(
+            "token budget chart",
+            "kawan://artifact/art-1",
+            Some(&images),
+        ) {
+            ResolvedImage::Image {
+                artifact_id,
+                bytes: resolved,
+            } => {
+                assert_eq!(artifact_id, "art-1");
+                assert_eq!(resolved.as_ref(), bytes.as_ref());
+            }
+            ResolvedImage::AltText(text) => panic!("expected image bytes, got alt text {text:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_artifact_image_falls_back_to_alt_text() {
+        let theme = Theme::green();
+        let resolve = |_: &str| None;
+        let images = InlineImages {
+            resolve: &resolve,
+            open: &no_click,
+        };
+        let markdown = "Before ![missing chart](kawan://artifact/gone) after";
+
+        let _ = render(markdown, 13.5, theme.ink, &theme, Some(&images));
+
+        match resolve_image_span("missing chart", "kawan://artifact/gone", Some(&images)) {
+            ResolvedImage::AltText(text) => assert_eq!(text, "missing chart"),
+            ResolvedImage::Image { .. } => panic!("expected the alt-text fallback"),
+        }
+        // Non-artifact images and ids without alt text also fall back cleanly.
+        match resolve_image_span("", "https://example.com/x.png", Some(&images)) {
+            ResolvedImage::AltText(text) => assert_eq!(text, "https://example.com/x.png"),
+            ResolvedImage::Image { .. } => panic!("expected the alt-text fallback"),
+        }
+        // Without a resolver inline images never render bytes.
+        assert!(matches!(
+            resolve_image_span("missing chart", "kawan://artifact/gone", None),
+            ResolvedImage::AltText(_)
+        ));
+    }
+
+    #[test]
+    fn plain_text_ignores_inline_image_urls() {
+        let text = plain_text("Before ![chart](kawan://artifact/art-1) after");
+        assert_eq!(text, "Before chart after");
+        assert!(!text.contains("kawan://"));
+    }
+
+    #[test]
+    fn clipped_render_reports_dropped_blocks() {
+        let theme = Theme::green();
+        let long = "# Title\n\nOne.\n\nTwo.\n\nThree.\n\nFour.\n";
+        let (_el, truncated) = render_clipped(long, 13.0, theme.ink, &theme, None, 2);
+        assert!(truncated, "expected the preview to drop trailing blocks");
+
+        let (_el, truncated) =
+            render_clipped("# Title\n\nOne.\n", 13.0, theme.ink, &theme, None, 2);
+        assert!(!truncated, "a short body must render whole");
     }
 }
